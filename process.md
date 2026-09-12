@@ -3090,3 +3090,18 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 302
+
+- 用户指令：“已填入（GITHUB_TOKEN），另外仍保持第一次读取保存 readme，直到该项目已投递到草稿箱”。
+- 影响范围：`.env`（用户自行填入 `GITHUB_TOKEN`，未读取其值）、`app/api/routes.py`（审核/投递两处快照处理）、`app/services/auto_delivery.py`（新增 `release_source_snapshot_after_delivery` 并在三条投递路径调用）、新增 `tests/test_source_snapshot_lifecycle.py`；重建 app/worker。**未发起付费调用**（GitHub 请求免费）。
+- 事实①（令牌生效）：`.env` 中已填（`github_pat_` 前缀、93 字符）；重建容器后容器内可见，`GET /rate_limit` 显示 **5000/小时（剩余 5000）**，`GET /repos/.../readme` 返回 200。此前容器未重建所以仍是匿名 60/小时。
+- 事实②（顺带印证“构造 vs 获取”）：带令牌调用 `/readme` 返回了**权威字段** `name=README.md`、`path=README.md`、`size=36001`，以及 **`download_url=https://raw.githubusercontent.com/bilawalsidhu/gods-eye-view/main/README.md`** —— 注意默认分支是 `main`，而我此前是用 `HEAD` 占位拼的。可见“获取”比“构造”更准。
+- 处理结论（快照生命周期）：按用户要求改为“**首次读取并保存 → 保留到该项目投递进公众号草稿箱**”。具体：①人工审核通过时**不再删除**（仅 `discard` 时删除）；②自动审核通过分支**不再删除**；③新增 `release_source_snapshot_after_delivery()`，在投递成功（新建草稿、原地覆盖、覆盖失败后重建三条路径）与发布页手动创建草稿之后调用；清理失败只记日志，不影响投递结果。
+- 验证：后端 **291 项通过、0 失败**（新增 4 项：审核通过不删、自动审核通过不删、投递三条路径都释放、手动投递也释放）；容器内复核令牌生效与配额 5000/小时、`review_draft` 仅在 `discard` 时删除、自动审核分支 `delete_after_approval` 出现 0 次。
+- 遗留：①README 获取顺序仍是“API 优先（现已有令牌，配额充足）→ 无 raw 兜底”，是否补 raw 候选链兜底待用户决定；②快照会在投递后释放，因此**投递之后**的重写将无法复用来源正文（与用户要求一致）。
+- 授权状态：已确认并完成
+
+-->

@@ -53,6 +53,7 @@ from app.services.wechat_official import WechatOfficialAccountError, render_wech
 from app.services.generator import build_generator
 from app.services.auto_delivery import (
     prepare_agent_selected_wechat_assets,
+    release_source_snapshot_after_delivery,
     retry_agent_selected_wechat_draft,
 )
 from app.tools.auto_review import AutoReviewTool
@@ -1588,7 +1589,8 @@ def review_draft(
 ) -> dict[str, Any]:
     repository = ContentRepository(session)
     row = repository.review_draft(draft_id, command)
-    if command.action == "approve":
+    if command.action == "discard":
+        # 废弃后不再需要来源快照；审核通过**不删**——快照要保留到真正投递进草稿箱。
         DraftSourceSnapshotStore(settings, repository).delete_after_approval(draft_id)
     session.commit()
     return draft_to_dict(row, settings)
@@ -2084,6 +2086,8 @@ async def create_wechat_draft(
         logger.warning("wechat_draft_create_failed job_id=%s", job_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     job = repository.mark_wechat_draft_created(job_id, media_id)
+    # 投递完成即释放来源快照（快照保留到“已投递进草稿箱”为止）。
+    release_source_snapshot_after_delivery(settings, repository, job.draft_id)
     session.commit()
     logger.info("wechat_draft_created job_id=%s", job_id)
     return wechat_publication_to_dict(job, repository)

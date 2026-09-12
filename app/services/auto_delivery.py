@@ -183,6 +183,21 @@ async def prepare_agent_selected_wechat_assets(
     )
 
 
+def release_source_snapshot_after_delivery(settings: Settings, repository: ContentRepository, draft_id: str) -> bool:
+    """投递进公众号草稿箱后释放来源快照。
+
+    快照的生命周期是“首次读取 → 保存 → **直到该项目投递进草稿箱**”。此前在审核通过时就删除，
+    导致通过之后的重写/重审/换图无法再复用来源正文。清理失败只记日志，不影响投递结果。
+    """
+    try:
+        deleted = DraftSourceSnapshotStore(settings, repository).delete_after_approval(draft_id)
+        logger.info("source_snapshot_released_after_delivery draft_id=%s deleted=%s", draft_id, deleted)
+        return deleted
+    except Exception as exc:
+        logger.warning("source_snapshot_release_failed draft_id=%s error_type=%s", draft_id, type(exc).__name__)
+        return False
+
+
 async def retry_agent_selected_wechat_draft(
     settings: Settings, repository: ContentRepository, draft_id: str,
 ):
@@ -228,9 +243,13 @@ async def retry_agent_selected_wechat_draft(
                 repository.mark_wechat_status(job.id, "draft_failed", error_message=str(create_exc))
                 raise
             logger.info("wechat_draft_recreated draft_id=%s job_id=%s", draft_id, job.id)
-            return repository.mark_wechat_draft_created(job.id, media_id)
+            created = repository.mark_wechat_draft_created(job.id, media_id)
+            release_source_snapshot_after_delivery(settings, repository, draft_id)
+            return created
         logger.info("wechat_draft_updated draft_id=%s job_id=%s media_id=%s", draft_id, job.id, job.wechat_draft_media_id)
-        return repository.mark_wechat_draft_updated(job.id)
+        updated = repository.mark_wechat_draft_updated(job.id)
+        release_source_snapshot_after_delivery(settings, repository, draft_id)
+        return updated
     try:
         async with WechatOfficialAccountTool(settings) as client:
             media_id = await client.create_draft(
@@ -242,7 +261,9 @@ async def retry_agent_selected_wechat_draft(
         logger.warning("wechat_draft_retry_failed draft_id=%s job_id=%s", draft_id, job.id)
         raise
     logger.info("wechat_draft_retry_succeeded draft_id=%s job_id=%s", draft_id, job.id)
-    return repository.mark_wechat_draft_created(job.id, media_id)
+    created = repository.mark_wechat_draft_created(job.id, media_id)
+    release_source_snapshot_after_delivery(settings, repository, draft_id)
+    return created
 
 
 async def auto_review_and_create_wechat_draft(
@@ -397,7 +418,8 @@ async def auto_review_and_create_wechat_draft(
             reviewer="AI 审核", action="approve", note="自动审核通过，允许创建公众号草稿", idempotency_key=f"auto-review:{run.id}",
         ),
     )
-    DraftSourceSnapshotStore(settings, repository).delete_after_approval(draft_id)
+    # 审核通过**不删**来源快照：README 快照要保留到真正投递进公众号草稿箱，
+    # 这样审核通过后的重写/重审/换图仍能复用第一次读到的来源正文。
     if not deliver:
         repository.finish_auto_review_run(
             run.id, "approved_no_delivery", review.rule_report, review.model_report, "本次仅运行审核，未创建公众号草稿"
