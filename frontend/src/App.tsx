@@ -359,7 +359,7 @@ function GeneratedIllustrationList({
   return <section className="illustration-record"><div className="panel-heading"><b>生成图片</b><span>{illustrations.length}</span></div>{illustrations.length ? illustrations.map((item) => <article className="illustration-item" key={item.id}><img src={item.asset.download_url} alt={item.asset.original_name} /><div><b>{item.purpose === "cover" ? "封面图" : "正文插图"}</b><small>{item.purpose === "inline" ? `插入第 ${item.placement_after_paragraph} 段后` : "文章封面"}</small>{item.purpose === "inline" && <label>插入位置<select disabled={busy} value={item.placement_after_paragraph} onChange={(event) => onMove(item, Number(event.target.value))}>{Array.from({ length: Math.min(20, Math.max(paragraphCount - 1, 0)) + 1 }, (_, position) => <option value={position} key={position}>{position === 0 ? "正文开头" : `第 ${position} 段后`}</option>)}</select></label>}</div><button className="danger-button" disabled={busy} onClick={() => onRemove(item)}>移除</button></article>) : <p className="muted">尚无生成图片。</p>}</section>;
 }
 
-function GenerationRecordPage() {
+function GenerationRecordPage({ onAgentCommand }: { onAgentCommand: (content: string) => Promise<void> }) {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [runs, setRuns] = useState<AgentRun[]>([]);
   const [selectedDraftId, setSelectedDraftId] = useState<string | null>(null);
@@ -441,21 +441,16 @@ function GenerationRecordPage() {
 
   async function review(action: "approve" | "reject" | "revoke" | "discard") {
     if (!selectedDraft) return;
-    setBusy(true); setNotice("");
-    try { await api.reviewDraft(selectedDraft.id, action, action === "approve" ? "审核通过" : action === "revoke" ? "撤销审核后继续改进文案" : action === "discard" ? "废弃文案" : "重写文案"); await reload(); setNotice(action === "approve" ? "已审核通过。" : action === "revoke" ? "审核已撤销，当前文案已恢复为可编辑状态。" : action === "discard" ? "文案已废弃，来源与审核记录仍可追溯。" : "当前文案已保留，可在可编辑状态下重写。"); }
-    catch (error) { setNotice(error instanceof Error ? error.message : "审核失败"); }
-    finally { setBusy(false); }
+    const command = action === "approve" ? "审核通过" : action === "revoke" ? "撤销审核" : action === "discard" ? "废弃文案" : "重写文案";
+    setNotice("");
+    // 审核决定与重写都作为命令交给 Agent 执行，对话里会留下这条消息与它的回复。
+    await onAgentCommand(`${command}｜draft=${selectedDraft.id}`);
   }
 
   async function rewrite() {
     if (!selectedDraft) return;
-    setBusy(true); setNotice("");
-    try {
-      const result = await api.rewriteDraft(selectedDraft.id);
-      await reload();
-      setNotice(result.execution?.id ? "已用已保存的来源证据开始重写，完成后会更新原草稿版本（可在生成记录查看进度）。" : "已开始重写文案。");
-    } catch (error) { setNotice(error instanceof Error ? error.message : "重写失败"); }
-    finally { setBusy(false); }
+    setNotice("");
+    await onAgentCommand(`重写文案｜draft=${selectedDraft.id}`);
   }
 
 
@@ -675,7 +670,7 @@ function PublicationArticlePreview({ draft, job, illustrations }: { draft: Draft
   </article>;
 }
 
-function PublishingPage() {
+function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) => Promise<void> }) {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [jobs, setJobs] = useState<WechatPublicationJob[]>([]);
   const [selectedDraftId, setSelectedDraftId] = useState("");
@@ -724,18 +719,11 @@ function PublishingPage() {
 
   async function runReview(deliver: boolean) {
     if (!selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)) return;
-    setBusy(true); setReviewNotice(""); setDeliveryNotice("");
-    try {
-      const result = await api.runAutoReview(selectedDraft.id, deliver);
-      await reload();
-      const [nextReviews, nextIllustrations] = await Promise.all([api.listAutoReviews(selectedDraft.id), api.listDraftIllustrations(selectedDraft.id)]);
-      setAutoReviews(nextReviews); setIllustrations(nextIllustrations);
-      if (result.status === "queued") setReviewNotice(deliver
-        ? "已加入后台队列：审核 → 按意见改稿一轮 → 复审，通过后创建公众号草稿。"
-        : "已加入后台队列：仅审核与按意见改稿一轮，不会创建公众号草稿。");
-      else setReviewNotice(result.error || "自动审核未通过，请查看完整审核意见。");
-    } catch (error) { setReviewNotice(error instanceof Error ? error.message : "自动审核失败"); }
-    finally { setBusy(false); }
+    setReviewNotice(""); setDeliveryNotice("");
+    // 审核同样作为命令交给 Agent：对话里出现命令消息，执行进度在生成记录可见。
+    await onAgentCommand(
+      deliver ? `运行自动审核并创建公众号草稿｜draft=${selectedDraft.id}` : `运行自动审核｜draft=${selectedDraft.id}`
+    );
   }
 
   async function syncRemoteDrafts() {
@@ -775,5 +763,22 @@ function PublishingPage() {
 
 export function App() {
   const [view, setView] = useState<View>("chat");
-  return <PageErrorBoundary><AppShell view={view} setView={setView}>{view === "chat" ? <ChatPage /> : view === "review" ? <GenerationRecordPage /> : <PublishingPage />}</AppShell></PageErrorBoundary>;
+  // 界面按钮不再直连专用接口：统一把一条明确命令发给会话 Agent，并跳到对话页让消息可见。
+  async function dispatchAgentCommand(content: string) {
+    const sessions = await api.listChatSessions();
+    const savedId = localStorage.getItem("news-agent-active-session");
+    const target = sessions.find((item) => item.id === savedId) || sessions[0];
+    if (!target) {
+      window.alert("请先在“与 Agent 对话”里新建一个对话，再使用这个操作。");
+      return;
+    }
+    localStorage.setItem("news-agent-active-session", target.id);
+    try {
+      await api.sendMessage(target.id, content);
+      setView("chat");
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "命令发送失败");
+    }
+  }
+  return <PageErrorBoundary><AppShell view={view} setView={setView}>{view === "chat" ? <ChatPage /> : view === "review" ? <GenerationRecordPage onAgentCommand={dispatchAgentCommand} /> : <PublishingPage onAgentCommand={dispatchAgentCommand} />}</AppShell></PageErrorBoundary>;
 }

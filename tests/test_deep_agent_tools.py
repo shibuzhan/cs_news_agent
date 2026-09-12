@@ -138,6 +138,7 @@ def test_deep_agent_returns_structured_decision_with_session_checkpoint(monkeypa
     monkeypatch.setattr(content_deep_agent, "PostgresSaver", FakePostgresSaver)
     monkeypatch.setattr(content_deep_agent, "build_conversation_context_tools", lambda _session_id: ["context-tool"])
     monkeypatch.setattr(content_deep_agent, "build_draft_asset_tools", lambda _session_id: ["asset-tool"])
+    monkeypatch.setattr(content_deep_agent, "build_draft_action_tools", lambda _session_id: ["action-tool"])
     monkeypatch.setattr(
         content_deep_agent,
         "get_conversation_context_snapshot",
@@ -162,7 +163,7 @@ def test_deep_agent_returns_structured_decision_with_session_checkpoint(monkeypa
 
     kwargs = captured["agent_kwargs"]
     assert decision.reply == "已读取当前会话上下文。"
-    assert kwargs["tools"] == ["context-tool", "asset-tool"]
+    assert kwargs["tools"] == ["context-tool", "asset-tool", "action-tool"]
     assert "middleware" not in kwargs
     assert kwargs["subagents"] == []
     assert kwargs["skills"] == ["/skills"]
@@ -210,6 +211,7 @@ def test_deep_agent_json_mode_omits_structured_tool(monkeypatch) -> None:
     monkeypatch.setattr(content_deep_agent, "PostgresSaver", FakePostgresSaver)
     monkeypatch.setattr(content_deep_agent, "build_conversation_context_tools", lambda _session_id: ["context-tool"])
     monkeypatch.setattr(content_deep_agent, "build_draft_asset_tools", lambda _session_id: ["asset-tool"])
+    monkeypatch.setattr(content_deep_agent, "build_draft_action_tools", lambda _session_id: ["action-tool"])
     monkeypatch.setattr(
         content_deep_agent,
         "get_conversation_context_snapshot",
@@ -236,7 +238,7 @@ def test_deep_agent_json_mode_omits_structured_tool(monkeypatch) -> None:
     assert decision.reply == "已读取当前会话上下文。"
     assert "response_format" not in kwargs
     assert "JSON 文本模式" in kwargs["system_prompt"]
-    assert kwargs["tools"] == ["context-tool", "asset-tool"]
+    assert kwargs["tools"] == ["context-tool", "asset-tool", "action-tool"]
 
 
 @pytest.mark.asyncio

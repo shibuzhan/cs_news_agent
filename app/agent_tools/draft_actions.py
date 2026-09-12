@@ -1,0 +1,253 @@
+"""草稿动作 Tool：审核、重写、审核决定、配图都由会话 Agent 调用，而不是前端直连专用接口。
+
+设计边界：
+- 只允许操作**本会话的当前文章**，或本会话生成过的草稿（用 `draft_id` 显式指定并校验归属）；
+- 长任务只负责入队（ARQ），不在工具里同步等待模型；
+- 对外副作用（创建公众号草稿）不在这里，留在受控投递接口与开关之后。
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from langchain_core.tools import tool
+
+from app.config import Settings, get_settings
+from app.domain.models import ReviewCommand, ReviewStatus
+from app.jobs import (
+    enqueue_auto_review_job,
+    enqueue_draft_regeneration_job,
+    enqueue_image_generation_job,
+)
+from app.storage.database import SessionLocal
+from app.storage.repositories import ContentRepository
+
+
+logger = logging.getLogger("news_agent.draft_actions")
+
+EDITABLE_STATUSES = {ReviewStatus.PENDING_REVIEW.value, ReviewStatus.NEEDS_REVISION.value}
+REVIEWABLE_STATUSES = EDITABLE_STATUSES | {ReviewStatus.READY_TO_PUBLISH.value}
+MAX_PLACEMENT = 20
+
+
+def _draft_belongs_to_session(repository: ContentRepository, session_id: str, draft_id: str) -> bool:
+    """草稿归属校验：只能操作本会话生成过的草稿。"""
+    run = repository.find_generation_run_for_draft(draft_id)
+    return bool(run is not None and run.session_id == session_id)
+
+
+def _resolve_draft(
+    repository: ContentRepository, session_id: str, draft_id: str = "", *, allowed: set[str] | None = None
+) -> tuple[Any | None, str]:
+    """解析目标草稿：显式 id 需校验归属；未给 id 时用本会话当前文章。"""
+    if draft_id:
+        try:
+            draft = repository.get_draft(draft_id)
+        except Exception:
+            return None, "找不到这篇草稿。"
+        if not _draft_belongs_to_session(repository, session_id, draft_id):
+            return None, "该草稿不属于本会话，不能在这里操作。"
+    else:
+        memory = repository.get_chat_session_memory(session_id)
+        if not memory.active_draft_id:
+            return None, "本会话还没有当前文章：请先明确指定要操作的草稿。"
+        draft = repository.get_draft(memory.active_draft_id)
+    if allowed is not None and draft.status not in allowed:
+        return None, f"当前状态（{draft.status}）不支持这个操作。"
+    return draft, ""
+
+
+def _draft_label(draft: Any) -> str:
+    return (draft.title_options_json or ["当前草稿"])[0]
+
+
+async def _start_review(
+    settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *, deliver: bool
+) -> dict[str, Any]:
+    repository.expire_stale_auto_review_run(draft.id, settings.collection_job_timeout_seconds)
+    existing = repository.find_active_auto_review_run(draft.id)
+    if existing is not None:
+        return {"status": "already_running", "message": "这篇的自动审核已经在处理中。", "draft_id": draft.id}
+    review_run = repository.create_auto_review_run(draft.id, None, status="queued")
+    chat_run = repository.create_chat_agent_run(session_id, None, "run_auto_review", False, False)
+    repository.add_chat_agent_event(
+        chat_run.id, "自动审核中",
+        "正在按规则与模型审核当前文案与配图，并按意见改稿一轮。",
+        "running",
+        metadata={"phase": "review", "state": "running", "draft_ids": [draft.id], "review_id": review_run.id},
+    )
+    job_id = await enqueue_auto_review_job(settings, draft.id, review_run.id, deliver, chat_run.id)
+    repository.add_chat_agent_event(
+        chat_run.id, "审核任务已创建", f"任务编号：{job_id}",
+        metadata={"phase": "review", "state": "running", "job_id": job_id, "draft_ids": [draft.id]},
+    )
+    return {
+        "status": "started",
+        "draft_id": draft.id,
+        "draft_title": _draft_label(draft),
+        "deliver": deliver,
+        "review_id": review_run.id,
+        "chat_run_id": chat_run.id,
+        "message": f"已开始审核《{_draft_label(draft)}》"
+        + ("（通过后会创建公众号草稿，不会发表）" if deliver else "（仅审核，不投递）"),
+    }
+
+
+async def _start_rewrite(
+    settings: Settings, repository: ContentRepository, session_id: str, draft: Any
+) -> dict[str, Any]:
+    origin_run = repository.find_generation_run_for_draft(draft.id)
+    if origin_run is None:
+        return {"status": "rejected", "message": "这篇缺少可回溯的原生成记录，无法按已保存证据重写。"}
+    assistant_message = repository.create_chat_message(
+        session_id, "assistant", f"正在用已保存的 README 与证据包重写《{_draft_label(draft)}》…"
+    )
+    repository.reopen_generation_run(origin_run, assistant_message.id, False, False)
+    origin_run.summary = "正在重写文案"
+    repository.add_chat_agent_event(
+        origin_run.id, "重写文案",
+        f"使用已保存的 README 与证据包重写正文，目标草稿版本 {draft.version}；不重新采集、不新建草稿。",
+        "running",
+        metadata={"phase": "text", "state": "running", "draft_ids": [draft.id], "regeneration": True, "rewrite": True},
+    )
+    job_id = await enqueue_draft_regeneration_job(
+        settings, origin_run.id, session_id, assistant_message.id, draft.id,
+        origin_run.auto_review_requested, origin_run.auto_illustration_requested,
+    )
+    repository.add_chat_agent_event(
+        origin_run.id, "正在重写文案", f"任务编号：{job_id}；完成后会覆盖为新的草稿版本。",
+        metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [draft.id], "rewrite": True},
+    )
+    return {
+        "status": "started",
+        "draft_id": draft.id,
+        "draft_title": _draft_label(draft),
+        "run_id": origin_run.id,
+        "message": f"已开始用已保存的来源证据重写《{_draft_label(draft)}》，完成后覆盖为新版本。",
+    }
+
+
+def build_draft_action_tools(session_id: str):
+    """构造只作用于本会话草稿的动作 Tool。"""
+
+    @tool("run_auto_review")
+    async def run_auto_review(draft_id: str = "", deliver: bool = False) -> dict[str, Any]:
+        """对当前文章发起自动审核（规则 + 模型审核，并按意见改稿一轮）。
+
+        deliver=true 表示审核通过后创建公众号草稿箱记录（不会发表）；默认 false 仅审核。
+        """
+        settings = get_settings()
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=REVIEWABLE_STATUSES)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            result = await _start_review(settings, repository, session_id, draft, deliver=deliver)
+            session.commit()
+        logger.info("agent_tool_run_auto_review session_id=%s draft_id=%s status=%s", session_id, draft_id or "-", result.get("status"))
+        return result
+
+    @tool("rewrite_draft")
+    async def rewrite_draft(draft_id: str = "") -> dict[str, Any]:
+        """用已保存的来源证据重写当前文案正文（不重新采集、不新建草稿），覆盖为新版本。"""
+        settings = get_settings()
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=EDITABLE_STATUSES)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            result = await _start_rewrite(settings, repository, session_id, draft)
+            session.commit()
+        logger.info("agent_tool_rewrite_draft session_id=%s draft_id=%s status=%s", session_id, draft_id or "-", result.get("status"))
+        return result
+
+    def _review_decision(draft_id: str, action: str, note: str, allowed: set[str]) -> dict[str, Any]:
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=allowed)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            row = repository.review_draft(
+                draft.id,
+                ReviewCommand(
+                    reviewer="会话 Agent",
+                    action=action,
+                    note=note or f"由会话 Agent 执行 {action}",
+                    idempotency_key=f"agent-{draft.id}-{action}",
+                ),
+            )
+            session.commit()
+            label = {"approve": "审核通过", "discard": "废弃文案", "revoke": "撤销审核"}.get(action, action)
+            return {"status": "done", "draft_id": row.id, "draft_status": row.status, "draft_title": _draft_label(row),
+                    "message": f"已对《{_draft_label(row)}》执行：{label}。"}
+
+    @tool("approve_draft")
+    def approve_draft(draft_id: str = "", note: str = "") -> dict[str, Any]:
+        """把当前文章标记为审核通过（不会自动发表，也不会创建公众号草稿）。"""
+        return _review_decision(draft_id, "approve", note, EDITABLE_STATUSES)
+
+    @tool("discard_draft")
+    def discard_draft(draft_id: str = "", note: str = "") -> dict[str, Any]:
+        """废弃当前文章；来源与审核记录仍可追溯。"""
+        return _review_decision(draft_id, "discard", note, REVIEWABLE_STATUSES)
+
+    @tool("revoke_approval")
+    def revoke_approval(draft_id: str = "", note: str = "") -> dict[str, Any]:
+        """撤销已通过的审核，使文案回到可编辑状态。"""
+        return _review_decision(draft_id, "revoke", note, {ReviewStatus.READY_TO_PUBLISH.value})
+
+    @tool("generate_draft_illustration")
+    async def generate_draft_illustration(
+        purpose: str = "cover", placement_after_paragraph: int = 0, draft_id: str = ""
+    ) -> dict[str, Any]:
+        """为当前文章生成一张配图：purpose 为 cover 或 inline，inline 需给段位。
+
+        只生成并私有保存，不上传公众号、不发表。
+        """
+        settings = get_settings()
+        resolved = purpose if purpose in {"cover", "inline"} else "cover"
+        placement = 0 if resolved == "cover" else max(0, min(int(placement_after_paragraph), MAX_PLACEMENT))
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=REVIEWABLE_STATUSES)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            chat_run = repository.create_chat_agent_run(session_id, None, "generate_draft_image", False, True)
+            from app.tools.illustration_planner import style_for, subject_for
+
+            task = repository.create_image_generation_job(
+                chat_run.id, draft.id, resolved, placement,
+                subject_for(draft, resolved), style_for(draft, resolved),
+            )
+            repository.add_chat_agent_event(
+                chat_run.id, "图片任务已入队",
+                f"正在生成{'封面图' if resolved == 'cover' else f'第 {placement} 段后的正文插图'}。",
+                "running",
+                metadata={"phase": "image", "state": "queued", "draft_ids": [draft.id], "task_id": task.id},
+            )
+            session.commit()
+        arq_job_id = await enqueue_image_generation_job(settings, task.id)
+        with SessionLocal() as session:
+            ContentRepository(session).update_image_generation_job(task.id, "queued", arq_job_id=arq_job_id)
+            session.commit()
+        logger.info("agent_tool_generate_illustration session_id=%s draft_id=%s purpose=%s", session_id, draft.id, resolved)
+        return {
+            "status": "started",
+            "draft_id": draft.id,
+            "draft_title": _draft_label(draft),
+            "purpose": resolved,
+            "placement_after_paragraph": placement,
+            "task_id": task.id,
+            "chat_run_id": chat_run.id,
+            "message": f"已开始为《{_draft_label(draft)}》生成{'封面图' if resolved == 'cover' else '正文插图'}。",
+        }
+
+    return [
+        run_auto_review,
+        rewrite_draft,
+        approve_draft,
+        discard_draft,
+        revoke_approval,
+        generate_draft_illustration,
+    ]

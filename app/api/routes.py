@@ -18,6 +18,7 @@ from app.config import Settings, get_settings
 from app.agents.content_main_agent import AgentCommandError, ContentMainAgent
 from app.agents.content_deep_agent import ContentDeepAgent
 from app.agents.chat_agent import ChatAgent
+from app.agent_tools.draft_actions import build_draft_action_tools
 from app.domain.models import (
     AgentCollectCommand,
     AttachmentStatus,
@@ -43,7 +44,9 @@ from app.services.attachments import (
     PrivateAttachmentStore,
     validate_image_attachment,
 )
+from app.services.agent_commands import parse_agent_command
 from app.services.plain_text import normalize_wechat_description
+from app.services.task_narration import compose_task_reply
 from app.services.review_feedback import normalized_review_report
 from app.services.source_snapshots import DraftSourceSnapshotStore
 from app.services.wechat_official import WechatOfficialAccountError, render_wechat_html
@@ -1000,6 +1003,12 @@ async def send_chat_message(
     decision = None
     resolution = None
     if not attachment_extraction_requested:
+        # 界面按钮发来的明确命令：先确定性解析并交给 Agent 工具执行，不消耗模型意图识别。
+        command_response = await _run_agent_command(
+            settings, repository, session, session_id, user_message, command
+        )
+        if command_response is not None:
+            return command_response
         # 先提交用户消息，前端可立即显示；后续由同一 session_id 的 DeepAgent 恢复 checkpoint 决策。
         session.commit()
         resolution = await ContentDeepAgent(settings).resolve(
@@ -1583,6 +1592,101 @@ def review_draft(
         DraftSourceSnapshotStore(settings, repository).delete_after_approval(draft_id)
     session.commit()
     return draft_to_dict(row, settings)
+
+
+async def _run_agent_command(
+    settings: Settings,
+    repository: ContentRepository,
+    session,
+    session_id: str,
+    user_message,
+    command,
+) -> dict[str, Any] | None:
+    """把界面命令交给 Agent 工具执行；不是命令时返回 None，交给模型意图识别。
+
+    长任务（审核/重写/配图）由工具自己创建可见运行并入队；即时动作（审核决定、复用配图）
+    在这里建一条运行并当场结束，两种情况的回复都由模型按真实结果生成。
+    """
+    parsed = parse_agent_command(command.content)
+    if parsed is None:
+        return None
+    tools = {item.name: item for item in build_draft_action_tools(session_id)}
+    facts: dict[str, Any]
+    run = None
+    if parsed.name in tools:
+        arguments: dict[str, Any] = {}
+        if parsed.draft_id:
+            arguments["draft_id"] = parsed.draft_id
+        if parsed.name == "run_auto_review":
+            arguments["deliver"] = parsed.deliver
+        if parsed.name == "generate_draft_illustration":
+            arguments.update(purpose=parsed.purpose, placement_after_paragraph=parsed.placement)
+        if parsed.name in {"approve_draft", "discard_draft", "revoke_approval"}:
+            # 即时动作：先建运行，执行后立即结束，保证对话与生成记录里都看得到。
+            run = repository.create_chat_agent_run(
+                session_id, user_message.id, parsed.name, command.auto_review, command.auto_illustration
+            )
+            repository.add_chat_agent_event(
+                run.id, "识别对话命令", f"已按命令执行：{parsed.label}",
+                metadata={"phase": "text", "state": "running", "command": parsed.name, "draft_ids": [parsed.draft_id] if parsed.draft_id else []},
+            )
+            session.commit()
+        result = await tools[parsed.name].ainvoke(arguments)
+        facts = {"command": parsed.name, "label": parsed.label, **(result or {})}
+        if run is not None:
+            result_run = result.get("chat_run_id") if isinstance(result, dict) else None
+            execution_run = repository.get_chat_agent_run(result_run) if result_run else run
+        else:
+            execution_run = repository.get_chat_agent_run(result["chat_run_id"]) if result.get("chat_run_id") else None
+    elif parsed.name == "reuse_draft_assets":
+        draft = _current_editable_draft(repository, session_id) if not parsed.draft_id else repository.get_draft(parsed.draft_id)
+        if draft is None:
+            result = {"status": "rejected", "message": "没有找到要复用配图的草稿。"}
+        else:
+            illustrations = repository.list_draft_illustrations(draft.id)
+            if not illustrations:
+                result = {"status": "rejected", "message": "这篇目前没有可复用的配图；需要的话我可以按当前正文重新生成配图。"}
+            else:
+                cover = next((item for item in illustrations if item.purpose == "cover"), illustrations[0])
+                inline = [item for item in illustrations if item.id != cover.id]
+                repository.save_wechat_asset_selection(draft.id, cover.asset_id, [item.asset_id for item in inline])
+                result = {
+                    "status": "done",
+                    "draft_id": draft.id,
+                    "draft_title": (draft.title_options_json or ["当前草稿"])[0],
+                    "inline_count": len(inline),
+                    "message": f"已复用当前草稿的配图：封面 1 张、正文插图 {len(inline)} 张。",
+                }
+        facts = {"command": parsed.name, "label": parsed.label, **result}
+        execution_run = None
+    else:  # pragma: no cover - 解析器不会产生未知命令
+        return None
+    reply = await run_in_threadpool(
+        compose_task_reply,
+        settings,
+        task=f"执行界面命令：{parsed.label}",
+        facts=facts,
+        fallback=str(facts.get("message") or "命令已执行。"),
+        run_id=session_id,
+    )
+    assistant_message = repository.create_chat_message(session_id, "assistant", reply)
+    if execution_run is not None:
+        repository.add_chat_agent_event(
+            execution_run.id, "已汇报执行结果", reply[:500],
+            metadata={"phase": "text", "state": result.get("status", "done") if isinstance(result, dict) else "done"},
+        )
+        if run is not None:
+            repository.finish_chat_agent_run(
+                run.id, assistant_message.id, ConversationRunStatus.COMPLETED,
+                str(facts.get("message") or "命令已执行"), [facts],
+            )
+        else:
+            execution_run.response_message_id = assistant_message.id
+    user_message.response_message_id = assistant_message.id
+    session.commit()
+    execution_payload = chat_agent_run_to_dict(execution_run, repository) if execution_run is not None else None
+    logger.info("chat_agent_command_executed session_id=%s command=%s status=%s", session_id, parsed.name, facts.get("status"))
+    return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": execution_payload}
 
 
 @router.post("/drafts/{draft_id}/rewrite")
