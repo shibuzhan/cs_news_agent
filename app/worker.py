@@ -592,6 +592,84 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
         session.commit()
 
 
+async def process_wechat_delivery_job(_ctx: dict, draft_id: str, chat_run_id: str | None = None) -> None:
+    """后台完成公众号草稿的创建或原地覆盖，并在对话里汇报结果。
+
+    投递要上传封面与正文图片、再调用微信写接口，耗时远超对话请求时限，因此独立成后台任务。
+    """
+    logger.info("wechat_delivery_job_started draft_id=%s chat_run_id=%s", draft_id, chat_run_id or "-")
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        draft = repository.get_draft(draft_id)
+        existing = repository.get_wechat_publication_for_draft(draft_id)
+        updating = bool(existing is not None and existing.wechat_draft_media_id)
+        if chat_run_id:
+            repository.add_chat_agent_event(
+                chat_run_id, "正在投递公众号草稿",
+                "正在上传封面与正文图片并写入公众号草稿箱；已存在远端草稿时会原地覆盖。",
+                "running",
+                metadata={"phase": "text", "state": "running", "draft_ids": [draft_id], "delivery": True},
+            )
+        session.commit()
+    try:
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft = repository.get_draft(draft_id)
+            from app.services.auto_delivery import retry_agent_selected_wechat_draft
+
+            job = await retry_agent_selected_wechat_draft(settings, repository, draft_id)
+            session.commit()
+        logger.info("wechat_delivery_job_finished draft_id=%s state=%s", draft_id, job.state)
+        if chat_run_id:
+            await _report_wechat_delivery_result(chat_run_id, draft_id, updating=updating, error="")
+    except asyncio.CancelledError:
+        if chat_run_id:
+            await _report_wechat_delivery_result(chat_run_id, draft_id, updating=updating, error="投递任务超时，已停止。")
+        raise
+    except Exception as exc:
+        logger.exception("wechat_delivery_job_failed draft_id=%s error_type=%s", draft_id, type(exc).__name__)
+        if chat_run_id:
+            await _report_wechat_delivery_result(chat_run_id, draft_id, updating=updating, error=str(exc)[:200])
+        raise
+
+
+async def _report_wechat_delivery_result(chat_run_id: str, draft_id: str, *, updating: bool, error: str) -> None:
+    """投递结束：结束运行，并让模型按真实结果写汇报。"""
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        chat_run = repository.get_chat_agent_run(chat_run_id)
+        draft = repository.get_draft(draft_id)
+        job = repository.get_wechat_publication_for_draft(draft_id)
+        state = getattr(job, "state", "unknown")
+        title = (draft.title_options_json or ["当前草稿"])[0]
+        fallback = (
+            f"投递失败：{error}" if error
+            else f"{'已更新' if updating else '已创建'}公众号草稿（{title}），未提交发表。"
+        )
+        reply = await asyncio.to_thread(
+            compose_task_reply,
+            settings,
+            task="投递到微信公众号草稿箱",
+            facts={
+                "draft_title": title,
+                "updated_remote_draft": updating,
+                "job_state": state,
+                "error": error,
+                "note": "只创建或更新草稿箱内容，绝不发表",
+            },
+            fallback=fallback,
+            run_id=chat_run_id,
+        )
+        if chat_run.response_message_id:
+            repository.update_chat_message(chat_run.response_message_id, reply)
+        repository.finish_chat_agent_run(
+            chat_run_id, chat_run.response_message_id,
+            ConversationRunStatus.FAILED if error else ConversationRunStatus.COMPLETED,
+            reply[:300], [],
+        )
+        session.commit()
+
+
 async def process_image_generation_job(_ctx: dict, image_task_id: str) -> None:
     """一张图片一个 ARQ Job，采用独立长超时，不阻塞采集任务。"""
     with SessionLocal() as session:
@@ -761,6 +839,7 @@ class WorkerSettings:
         func(process_draft_regeneration_job, timeout=settings.collection_job_timeout_seconds),
         func(process_general_chat_job, timeout=settings.conversation_agent_timeout_seconds + 15),
         func(process_auto_review_job, timeout=settings.collection_job_timeout_seconds),
+        func(process_wechat_delivery_job, timeout=settings.collection_job_timeout_seconds),
         func(process_image_generation_job, timeout=settings.image_generation_job_timeout_seconds),
         func(process_collection_finalizer, timeout=settings.collection_job_timeout_seconds),
     ]

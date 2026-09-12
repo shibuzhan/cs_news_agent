@@ -260,25 +260,38 @@ def build_draft_action_tools(session_id: str):
                 return {"status": "rejected", "message": "公众号草稿投递开关未启用（AUTO_WECHAT_DRAFT_ENABLED=false）。"}
             existing = repository.get_wechat_publication_for_draft(draft.id)
             updating = bool(existing is not None and existing.wechat_draft_media_id)
-            try:
-                from app.services.auto_delivery import retry_agent_selected_wechat_draft
+            # 投递要上传图片并调用微信写接口，耗时远超对话请求时限：只入队，由后台完成并汇报。
+            chat_run = repository.create_chat_agent_run(session_id, None, "publish_to_wechat_draft", False, False)
+            repository.add_chat_agent_event(
+                chat_run.id, "投递任务已入队",
+                f"将{'原地覆盖' if updating else '创建'}公众号草稿（{_draft_label(draft)}），不会发表。",
+                "running",
+                metadata={"phase": "text", "state": "queued", "draft_ids": [draft.id]},
+            )
+            session.commit()
+        try:
+            from app.jobs import enqueue_wechat_delivery_job
 
-                job = await retry_agent_selected_wechat_draft(settings, repository, draft.id)
-                session.commit()
-            except Exception as exc:
-                session.rollback()
-                logger.warning("agent_tool_publish_failed draft_id=%s error_type=%s", draft.id, type(exc).__name__)
-                return {"status": "failed", "draft_id": draft.id, "message": f"投递失败：{exc}"}
-            action = "已更新公众号草稿" if updating else "已创建公众号草稿"
-            logger.info("agent_tool_publish_done draft_id=%s updated=%s job_id=%s", draft.id, updating, job.id)
-            return {
-                "status": "done",
-                "draft_id": draft.id,
-                "draft_title": _draft_label(draft),
-                "updated_remote": updating,
-                "job_state": job.state,
-                "message": f"{action}（{_draft_label(draft)}），未提交发表。",
-            }
+            job_id = await enqueue_wechat_delivery_job(settings, draft.id, chat_run.id)
+        except Exception as exc:
+            logger.warning("agent_tool_publish_enqueue_failed draft_id=%s error_type=%s", draft.id, type(exc).__name__)
+            return {"status": "failed", "draft_id": draft.id, "message": f"投递任务未能入队：{exc}"}
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            repository.add_chat_agent_event(
+                chat_run.id, "投递任务已创建", f"任务编号：{job_id}",
+                metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [draft.id]},
+            )
+            session.commit()
+        logger.info("agent_tool_publish_enqueued draft_id=%s updating=%s job_id=%s", draft.id, updating, job_id)
+        return {
+            "status": "started",
+            "draft_id": draft.id,
+            "draft_title": _draft_label(draft),
+            "updated_remote": updating,
+            "chat_run_id": chat_run.id,
+            "message": f"已开始{'更新' if updating else '创建'}公众号草稿（{_draft_label(draft)}），完成后我会汇报；不会发表。",
+        }
 
     # 会话 Agent 以同步方式执行工具：异步实现必须配同步外壳，否则 LangChain 抛
     # NotImplementedError（真实故障：对话模型报“暂时不可用”，failure_stage=agent_invoke）。

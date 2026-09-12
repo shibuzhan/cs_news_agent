@@ -111,6 +111,21 @@ async def enqueue_image_generation_job(settings: Settings, image_task_id: str) -
         await pool.aclose()
 
 
+async def enqueue_wechat_delivery_job(
+    settings: Settings, draft_id: str, chat_run_id: str | None = None,
+) -> str:
+    """公众号草稿投递/更新入队：上传图片与创建或覆盖草稿都很慢，不能占着对话请求。"""
+    pool = await create_pool(redis_settings(settings))
+    try:
+        job = await pool.enqueue_job("process_wechat_delivery_job", draft_id, chat_run_id)
+        if job is None:
+            raise RuntimeError("公众号投递任务未能入队")
+        logger.info("wechat_delivery_enqueue_finished draft_id=%s chat_run_id=%s job_id=%s", draft_id, chat_run_id, job.job_id)
+        return job.job_id
+    finally:
+        await pool.aclose()
+
+
 async def enqueue_auto_review_job(
     settings: Settings, draft_id: str, review_id: str, deliver: bool = True,
     chat_run_id: str | None = None,

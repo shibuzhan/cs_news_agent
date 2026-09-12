@@ -2967,3 +2967,19 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 295
+
+- 用户指令：再次给出对话截图“还是超时”（同一句请求第二次尝试报“对话模型请求超时”）。
+- 影响范围：`.env`（`CONVERSATION_AGENT_TIMEOUT_SECONDS` 45→120）、`app/jobs.py`（新增 `enqueue_wechat_delivery_job`）、`app/worker.py`（新增 `process_wechat_delivery_job` 与 `_report_wechat_delivery_result`、注册任务）、`app/agent_tools/draft_actions.py`（投递工具改为只入队）、`app/agent_tools/source_media_tools.py`（下载超时收紧）、新增 `tests/test_slow_actions_are_queued.py`；重建 app/worker。**未发起付费调用**。
+- 根因（与上次的 NotImplementedError 不同）：**慢操作被放在对话请求内同步执行**。投递要上传封面与正文图片、再调用微信写接口，而对话决策的时限是 45 秒——必然超时；来源图片下载的读超时本身还设成了 60 秒。
+- 处理结论①（慢操作入队）：新增 ARQ 任务 `process_wechat_delivery_job`（上传 + 创建或原地覆盖草稿 + 结束时由模型按真实结果汇报并结束会话运行）；Agent 工具 `publish_to_wechat_draft` 改为**只创建可见运行并入队**，立即返回“已开始更新/创建公众号草稿”，与审核、改稿、配图一致。
+- 处理结论②（超时预算）：来源图片下载改为 `connect=10s / read=15s`；`CONVERSATION_AGENT_TIMEOUT_SECONDS` 45 → **120**（对话要跑“模型决策 + 多次工具调用”，45 秒过紧；这是本次唯一改动的用户配置项）。
+- 处理结论③（防复发测试）：新增 `tests/test_slow_actions_are_queued.py`——断言投递工具只入队（不得在工具内调用投递实现）、`process_wechat_delivery_job` 已注册、投递任务结束时使用 `compose_task_reply` 汇报、来源图片下载预算保持短超时。
+- 验证：后端 **265 项通过、0 失败**（新增 4 项）；重建前确认无活动任务；容器内确认对话超时 120 秒、worker 已注册 7 个任务、投递实现里只含入队调用且不含内联投递；`/api/health` 正常。
+- 遗留：用户那条请求需要再试一次（1 次会话模型调用 + 后台投递任务），未擅自触发。
+- 授权状态：已确认并完成
+
+-->

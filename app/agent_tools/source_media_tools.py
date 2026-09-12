@@ -38,6 +38,8 @@ EDITABLE_STATUSES = {
 }
 MAX_PLACEMENT = 20
 SOURCE_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+# 下载必须短：这些工具在对话请求内执行，不能占满请求时限。
+SOURCE_IMAGE_TIMEOUT = httpx.Timeout(10, read=15)
 
 
 def _resolve_draft(repository: ContentRepository, session_id: str, draft_id: str) -> tuple[Any | None, str]:
@@ -145,7 +147,7 @@ def build_source_media_tools(session_id: str):
                     "reason": "只允许使用来源 README 或官方页面里的图片；该链接不在候选里。",
                 }
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=60), follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=15), follow_redirects=True) as client:
                 downloaded = await _download_image(client, SourceImage(url=url, alt="", origin="readme"))
         except SourceImageError as exc:
             return {"status": "rejected", "reason": str(exc)}
