@@ -561,7 +561,8 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
         draft = repository.get_draft(draft_id)
         status = str(result.get("status") or "")
         issues = result.get("issues") or []
-        passed = status in {"approved", "delivered", "draft_created"}
+        # 审核结果的状态值有多个：仅审核通过与已投递都算通过，别把 approved_no_delivery 误报成未通过。
+        passed = status.startswith("approved") or status in {"delivered", "draft_created", "wechat_draft_created"}
         summary = (
             f"自动审核{'通过' if passed else '未通过'}：版本 {draft.version}；"
             f"共 {len(issues)} 条意见。"

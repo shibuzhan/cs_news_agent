@@ -88,6 +88,17 @@ def test_task_reply_falls_back_on_empty_model_output(monkeypatch: pytest.MonkeyP
     assert reply == "回退文案"
 
 
+def test_review_result_marks_skip_delivery_approval_as_passed() -> None:
+    """approved_no_delivery（仅审核通过）必须算通过，不能被报成“未通过”。"""
+    import inspect
+
+    from app import worker
+
+    source = inspect.getsource(worker._report_auto_review_result)
+    assert 'status.startswith("approved")' in source
+    assert '"wechat_draft_created"' in source
+
+
 def test_worker_reports_task_result_through_the_model() -> None:
     import inspect
 
