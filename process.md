@@ -3121,3 +3121,19 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 305
+
+- 用户指令：截图公众号“素材库（图片 11 条）”并询问“图片必须要上传素材库才能使用吗？”，确认后要求修掉重复上传封面造成素材库堆积的问题。
+- 影响范围：`app/storage/repositories.py`（`mark_wechat_publication_stale`、`save_wechat_asset_selection`）、`app/services/auto_delivery.py`（`ensure_agent_selected_wechat_assets`、`prepare_agent_selected_wechat_assets`）、新增 `tests/test_cover_upload_reuse.py`；重建 app/worker。**未发起付费调用**（微信素材接口免费）。
+- 事实（回答“必须上传吗”）：**正文插图与封面都必须先上传给微信**，因为正文 `<img>` 只认微信域名地址。但两者走不同接口：封面 `/cgi-bin/material/add_material`（**永久素材，进素材库、占配额**），正文图 `/cgi-bin/media/uploadimg`（图文内图片，**不进素材库、不占永久素材配额**）。所以素材库里看到的都是各篇草稿的封面。
+- 事实（素材库为何堆积）：每次覆盖投递都会把封面**重新上传一份永久素材**，同一张图因此出现多份（截图里 `youtube-popular-vide…` 4 份）；永久素材配额有限（图片类通常 5000 张）。
+- 处理结论①（复用 media_id）：`save_wechat_asset_selection` 比较新旧选择——**封面 asset 未变则保留已上传的 `cover_media_id`**，正文图列表未变则保留已上传的图片 URL；`prepare_agent_selected_wechat_assets` 据此只上传“缺的部分”，并在全部可复用时直接返回（新增 `wechat_assets_reused` 日志）。
+- 处理结论②（保留旧选择以支持复用）：`mark_wechat_publication_stale` 不再清空旧封面/正文选择（保留才能判断“是否仍是同一张”）；同时 `ensure_agent_selected_wechat_assets` 的提前返回条件加入 `delivery_stale`，确保“重新选择配图/改图后重投”仍会真正重新选择（否则会退化成空操作）。
+- 验证（数据库层确定性验证，不依赖模型选择）：同一选择再保存 → **cover_media 复用 True、inline_urls 复用 True**；标过期后换封面 → **cover_media 正确清空（需重传）**、inline_urls 仍复用；随后已恢复原封面选择。后端 **303 项通过、0 失败**（新增 4 项）。
+- 遗留：①素材库里已存在的重复封面不会被自动清理——微信支持 `material/del_material` 删除永久素材，我们尚未实现，需要的话可以补（含“清理重复封面”脚本）；②本轮验证过程中该草稿的封面 media_id 已被清空，下次投递会重新上传一次封面（内容不变，仅素材库多一份）。
+- 授权状态：已确认并完成
+
+-->

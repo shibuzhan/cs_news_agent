@@ -110,9 +110,17 @@ def _record_review_event(
 async def ensure_agent_selected_wechat_assets(
     settings: Settings, repository: ContentRepository, draft_id: str,
 ):
-    """审核开始前确定一次投递图片；之后只复用持久化选择，不再重新选择。"""
+    """审核开始前确定一次投递图片；之后只复用持久化选择，不再重新选择。
+
+    `delivery_stale`（用户改过文案/配图或点了“重新选择配图”）必须重新选择——
+    否则“重新选择配图”会变成空操作。
+    """
     existing = repository.get_wechat_publication_for_draft(draft_id)
-    if existing is not None and existing.cover_asset_id and existing.state != "superseded":
+    if (
+        existing is not None
+        and existing.cover_asset_id
+        and existing.state not in {"superseded", "delivery_stale"}
+    ):
         return existing
     draft = repository.get_draft(draft_id)
     illustrations = repository.list_draft_illustrations(draft_id)
@@ -147,9 +155,19 @@ def _selected_publication_illustrations(repository: ContentRepository, draft_id:
 async def prepare_agent_selected_wechat_assets(
     settings: Settings, repository: ContentRepository, draft_id: str,
 ):
-    """上传审核前已确定的封面和插图；绝不在投递或重投时再次选择图片。"""
+    """上传已确定的封面与正文插图；已上传过且未变化的部分**复用**，不重复占用永久素材配额。
+
+    封面是永久素材（计入素材库配额），重复上传会让同一张图在素材库里堆成多份；
+    正文图走 uploadimg 不占配额，但同样没必要重复上传。
+    """
     job = await ensure_agent_selected_wechat_assets(settings, repository, draft_id)
-    if job.cover_media_id:
+    needs_cover = not job.cover_media_id
+    needs_inline = bool(job.inline_asset_ids_json) and not job.inline_image_urls_json
+    if not needs_cover and not needs_inline:
+        logger.info(
+            "wechat_assets_reused draft_id=%s cover_media_id_set=%s inline_ready=%s",
+            draft_id, bool(job.cover_media_id), bool(job.inline_image_urls_json),
+        )
         return job
 
     cover, inline = _selected_publication_illustrations(repository, draft_id, job)
@@ -159,17 +177,22 @@ async def prepare_agent_selected_wechat_assets(
         repository.bind_publication_asset(draft_id, asset.id)
     try:
         store = PrivateAttachmentStore(settings)
-        cover_content = store.read(cover_asset.object_key)
-        inline_contents = [store.read(asset.object_key) for asset in inline_assets]
+        cover_content = store.read(cover_asset.object_key) if needs_cover else b""
+        inline_contents = [store.read(asset.object_key) for asset in inline_assets] if needs_inline else []
     except AttachmentError as exc:
         raise RuntimeError("自动草稿无法读取私有图片素材") from exc
     try:
         async with WechatOfficialAccountTool(settings) as client:
-            cover_media_id = await client.upload_cover(cover_content, cover_asset.original_name)
-            inline_urls = [
-                await client.upload_inline_image(content, asset.original_name)
-                for asset, content in zip(inline_assets, inline_contents, strict=True)
-            ]
+            # 封面未变化时复用已有 media_id：永久素材会计入素材库配额，不能每投递一次就多一份。
+            cover_media_id = job.cover_media_id or await client.upload_cover(cover_content, cover_asset.original_name)
+            inline_urls = (
+                [
+                    await client.upload_inline_image(content, asset.original_name)
+                    for asset, content in zip(inline_assets, inline_contents, strict=True)
+                ]
+                if needs_inline
+                else [entry.get("url") for entry in (job.inline_image_urls_json or [])]
+            )
     except (WechatOfficialAccountError, RuntimeError) as exc:
         repository.mark_wechat_status(job.id, "draft_failed", error_message=str(exc))
         logger.warning("wechat_asset_prepare_failed draft_id=%s job_id=%s error_type=%s", draft_id, job.id, type(exc).__name__)

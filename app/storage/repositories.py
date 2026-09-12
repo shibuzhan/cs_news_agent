@@ -1433,10 +1433,16 @@ class ContentRepository:
             # 已投递且未标记过期：不接受新的图片选择（历史不变式）。
             # 标记为 delivery_stale 时说明用户在改已投递的草稿，必须允许重新选择。
             return row
+        # 封面/正文插图都没变时保留已上传的 media_id 与图片 URL：
+        # 永久素材计入素材库配额，重复上传会让同一张图堆成多份。
+        same_cover = row.cover_asset_id == cover_asset_id
+        same_inline = list(row.inline_asset_ids_json or []) == list(inline_asset_ids)
+        reused_cover_media_id = row.cover_media_id if same_cover else None
+        reused_inline_urls = list(row.inline_image_urls_json or []) if same_inline else []
         row.cover_asset_id = cover_asset_id
-        row.cover_media_id = None
+        row.cover_media_id = reused_cover_media_id
         row.inline_asset_ids_json = list(inline_asset_ids)
-        row.inline_image_urls_json = []
+        row.inline_image_urls_json = reused_inline_urls
         row.state = "assets_selected"
         row.error_message = None
         self.session.flush()
@@ -1445,18 +1451,14 @@ class ContentRepository:
     def mark_wechat_publication_stale(self, draft_id: str, reason: str) -> bool:
         """文案或配图在投递后又被修改：标记为“投递已过期”，下次投递原地覆盖远端草稿。
 
-        远端草稿不会被删除，media_id 保留，重新投递时用 `draft/update` 覆盖内容。
+        远端草稿不会被删除，media_id 保留；**旧的封面选择也保留**——重新选择后若封面仍是同一张，
+        就复用它已上传的永久素材 media_id，避免每次覆盖都在素材库里多堆一份。
         """
         row = self.get_wechat_publication_for_draft(draft_id)
         if row is None or not row.wechat_draft_media_id:
             return False
         row.state = "delivery_stale"
         row.error_message = reason
-        # 图片可能已变：清空旧选择，重新投递时按当前图片重新确定并重新上传。
-        row.cover_asset_id = None
-        row.cover_media_id = None
-        row.inline_asset_ids_json = []
-        row.inline_image_urls_json = []
         self.session.flush()
         return True
 
