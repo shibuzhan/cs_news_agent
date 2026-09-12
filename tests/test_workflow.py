@@ -223,8 +223,10 @@ def test_github_single_draft_is_not_marked_introduced_before_publication(monkeyp
         title="Published later",
         url="https://github.com/example/published-later",
         summary="A detailed project description suitable for a standalone draft.",
-        content="A detailed project README suitable for a standalone draft with source-backed facts.",
+        content="A detailed project README suitable for a standalone draft with source-backed facts." * 8,
         source_name="GitHub Trending",
+        # 生成前必须确认 README 已取到，否则流水线会拒绝生成。
+        metadata={"readme_fetch_status": "success"},
     )
 
     result = ContentPipeline(FakeSession(), DeterministicDraftGenerator()).process_github_single(
@@ -233,3 +235,114 @@ def test_github_single_draft_is_not_marked_introduced_before_publication(monkeyp
 
     assert result["created"] == 1
     assert FakeRepository.instance.introduction_calls == 0
+
+
+def test_github_item_without_readme_is_not_generated(monkeypatch):
+    """只有 Trending 简介时必须直接失败并给出原因，而不是靠空话凑满字数。"""
+    from app.services.model_errors import README_UNAVAILABLE_REASON
+
+    class NestedTransaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeSession:
+        def begin_nested(self):
+            return NestedTransaction()
+
+    class FakeRepository:
+        def __init__(self, _session) -> None:
+            pass
+
+        def save_source(self, _item):
+            raise AssertionError("缺少 README 时不应保存来源或生成草稿")
+
+    monkeypatch.setattr(content_workflow, "ContentRepository", FakeRepository)
+    raw = RawSourceItem(
+        source_kind=SourceKind.GITHUB,
+        external_id="owner/thin",
+        title="owner/thin",
+        url="https://github.com/owner/thin",
+        summary="The agent harness performance optimization system.",
+        content="The agent harness performance optimization system.",
+        source_name="GitHub Trending",
+        metadata={"readme_fetch_status": "failed", "readme_fetch_error": "rate_limited"},
+    )
+
+    result = ContentPipeline(FakeSession(), DeterministicDraftGenerator()).process_github_single(
+        [raw], candidate_count=1
+    )
+
+    assert result["created"] == 0
+    assert result["errors"] == [{"external_id": "owner/thin", "error": README_UNAVAILABLE_REASON}]
+    assert "README" in result["errors"][0]["error"]
+
+
+class _ProviderRejection(Exception):
+    """替身：思考模式模型拒绝 tool_choice 的 400 响应。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Error code: 400 - {'error': {'message': 'The tool_choice parameter does not support being "
+            "set to required or object in thinking mode'}, 'id': 'chatcmpl-b140990b'}"
+        )
+        self.status_code = 400
+        self.body = {
+            "error": {
+                "code": "invalid_parameter_error",
+                "message": "The tool_choice parameter does not support being set to required or object "
+                "in thinking mode",
+            }
+        }
+
+
+def test_pipeline_stores_a_sanitized_failure_reason(monkeypatch):
+    """落库与审计里的失败原因只能是分类短句，不能是供应商原始响应。"""
+
+    class FakeSession:
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+    class FakeRepository:
+        instance = None
+
+        def __init__(self, _session) -> None:
+            FakeRepository.instance = self
+
+        def save_source(self, _item):
+            return SimpleNamespace(is_duplicate=False, row=SimpleNamespace(id="source-1"))
+
+        def get_deduplicating_draft_for_source(self, _source_id):
+            return None
+
+        def create_draft(self, *_args):
+            raise AssertionError("生成失败时不应创建草稿")
+
+    class RejectingGenerator:
+        def generate(self, _item):
+            raise _ProviderRejection()
+
+    monkeypatch.setattr(content_workflow, "ContentRepository", FakeRepository)
+    raw = RawSourceItem(
+        source_kind=SourceKind.RSS,
+        external_id="provider-rejection",
+        title="Provider rejects the structured output request",
+        url="https://example.com/provider-rejection",
+        source_name="Example RSS",
+        summary="A source item that triggers a provider rejection during generation.",
+        content="A source item that triggers a provider rejection during generation.",
+    )
+
+    result = ContentPipeline(FakeSession(), RejectingGenerator()).process([raw])
+
+    assert result["created"] == 0
+    assert len(result["errors"]) == 1
+    stored = result["errors"][0]["error"]
+    assert "思考模式" in stored
+    assert "chatcmpl" not in stored
+    assert "Error code" not in stored

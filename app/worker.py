@@ -16,11 +16,19 @@ from app.jobs import enqueue_collection_finalizer, enqueue_image_generation_job
 from app.observability import configure_observability
 from app.services.auto_delivery import auto_review_and_create_wechat_draft
 from app.services.generator import GenerationError, build_generator
+from app.services.model_errors import sanitize_failure_text
 from app.services.source_snapshots import DraftSourceSnapshotStore
+from app.services.task_narration import compose_task_reply
 from app.storage.database import SessionLocal
 from app.storage.repositories import ContentRepository
 from app.storage.tables import ChatAgentRunRow
-from app.tools.illustration_planner import IllustrationPlanner, _paragraphs, visual_direction_for
+from app.tools.illustration_planner import (
+    IllustrationPlanner,
+    _paragraphs,
+    style_for,
+    subject_for,
+    visual_direction_for,
+)
 from app.tools.image_generation import ImageGenerationError, ImageGenerationTool
 from app.tools.source_tools import build_source_tools
 from app.workflows.content_workflow import ContentPipeline
@@ -39,16 +47,31 @@ def collection_completion(result) -> tuple[ConversationRunStatus, str, str]:
         if isinstance(error, dict)
     ]
     if result.created == 0 and item_errors:
-        detail = item_errors[0]
-        if "Insufficient Balance" in detail or "402" in detail:
-            detail = "内容模型服务返回额度不足，未生成草稿。请补充额度后重试。"
+        # 兜底脱敏：历史审计里可能仍存有供应商原始响应，这里绝不回显。
+        detail = sanitize_failure_text(item_errors[0]) or "内容模型调用失败，请查看生成记录"
         return ConversationRunStatus.FAILED, f"生成失败：{detail}", "failed"
     if result.status.value == "failed":
         first_error = result.source_errors[0] if result.source_errors else {}
         source = first_error.get("source", "资讯来源")
-        detail = first_error.get("error", "未返回具体失败原因")
+        detail = sanitize_failure_text(first_error.get("error", "")) or "未返回具体失败原因"
         return ConversationRunStatus.FAILED, f"采集失败：{source} 来源请求失败。{detail}", "failed"
     prefix = "部分采集完成" if result.status.value == "partial" else "采集完成"
+    targeted = [
+        run.get("selection", {}).get("target")
+        for run in getattr(result, "runs", [])
+        if isinstance(run.get("selection"), dict) and run["selection"].get("target")
+    ]
+    if targeted:
+        name = targeted[0]
+        if result.created:
+            return ConversationRunStatus.COMPLETED, f"已按指定项目 {name} 生成 1 条待审核草稿", "completed"
+        summary = (
+            f"指定项目 {name} 未生成草稿：该项目已有草稿或已发布，请用“重新生成”更新原有草稿。"
+            if not item_errors
+            else f"指定项目 {name} 生成失败，详情见执行摘要。"
+        )
+        status = ConversationRunStatus.FAILED if item_errors else ConversationRunStatus.COMPLETED
+        return status, summary, "failed" if item_errors else "completed"
     summary = f"{prefix}：新增 {result.created} 条待审核草稿"
     if result.source_errors:
         failed_sources = "、".join(item.get("source", "未知来源") for item in result.source_errors)
@@ -118,6 +141,12 @@ def _generation_failure_detail(exc: Exception, *, preserved_draft: bool = False)
     return f"{detail}；{suffix}"
 
 
+def _regenerate_draft_in_thread(settings: Settings, draft_id: str, raw) -> dict:
+    """在线程里用独立会话重新生成草稿，避免阻塞事件循环与嵌套事件循环。"""
+    with SessionLocal() as session:
+        return ContentPipeline(session, build_generator(settings), settings).regenerate_draft(draft_id, raw)
+
+
 async def process_collection_job(
     _ctx: dict,
     chat_run_id: str,
@@ -127,16 +156,29 @@ async def process_collection_job(
     limit: int,
     auto_review_requested: bool = False,
     auto_illustration_requested: bool = False,
+    target: str | None = None,
 ) -> None:
     """只生成文字与建立图片子任务，不等待慢速生图。"""
-    logger.info("collection_job_started chat_run_id=%s sources=%s limit=%s", chat_run_id, source_names, limit)
+    logger.info(
+        "collection_job_started chat_run_id=%s sources=%s limit=%s target=%s",
+        chat_run_id,
+        source_names,
+        limit,
+        target or "-",
+    )
     try:
         timeout = httpx.Timeout(settings.request_timeout_seconds)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             agent = ContentMainAgent(
                 build_source_tools(client, settings), build_generator(settings), settings=settings
             )
-            result = await agent.run(AgentCollectCommand(sources=[SourceKind(name) for name in source_names], limit=limit))
+            result = await agent.run(
+                AgentCollectCommand(
+                    sources=[SourceKind(name) for name in source_names],
+                    limit=limit,
+                    target=target,
+                )
+            )
         conversation_status, summary, event_status = collection_completion(result)
         draft_ids = [draft_id for source_run in getattr(result, "runs", []) for draft_id in source_run.get("created_draft_ids", [])]
         image_task_ids: list[str] = []
@@ -179,12 +221,24 @@ async def process_collection_job(
                 for draft_id in draft_ids:
                     draft = repository.get_draft(draft_id)
                     plan = IllustrationPlanner(settings).decide(draft)
-                    for position in plan.placements:
-                        image_task_ids.append(repository.create_image_generation_job(chat_run_id, draft_id, "inline", position).id)
+                    for index, position in enumerate(plan.placements):
+                        subject = plan.subjects[index] if index < len(plan.subjects) else ""
+                        style = plan.styles[index] if index < len(plan.styles) else ""
+                        image_task_ids.append(
+                            repository.create_image_generation_job(
+                                chat_run_id, draft_id, "inline", position, subject, style
+                            ).id
+                        )
             # 自动审核需要封面时预先在私有库生成，仍不会发表或上传公众号。
             if auto_review_requested:
                 for draft_id in draft_ids:
-                    image_task_ids.append(repository.create_image_generation_job(chat_run_id, draft_id, "cover", 0).id)
+                    draft = repository.get_draft(draft_id)
+                    image_task_ids.append(
+                        repository.create_image_generation_job(
+                            chat_run_id, draft_id, "cover", 0,
+                            subject_for(draft, "cover"), style_for(draft, "cover"),
+                        ).id
+                    )
             if image_task_ids:
                 repository.add_chat_agent_event(chat_run_id, "配图任务已入队", f"已创建 {len(image_task_ids)} 个独立图片任务；文字草稿可先在生成记录中查看。", "running", metadata={"phase": "image", "state": "queued", "task_ids": image_task_ids})
             else:
@@ -192,6 +246,35 @@ async def process_collection_job(
                     repository.add_chat_agent_event(chat_run_id, "未创建图片任务", "本次采集没有新增草稿，因此未创建图片任务。", metadata={"phase": "image", "state": "skipped"})
                 else:
                     repository.add_chat_agent_event(chat_run_id, "未启用自动配图", "本次任务未勾选自动配图。", metadata={"phase": "image", "state": "disabled"})
+            if draft_ids or image_task_ids:
+                # 任务结果交给模型写汇报与追问；模型不可用时回落到确定性文案。
+                facts = {
+                    "task": "采集并生成草稿",
+                    "drafts_created": len(draft_ids),
+                    "draft_ids": draft_ids,
+                    "auto_review_requested": auto_review_requested,
+                    "auto_review_state": "未勾选，尚未运行" if not auto_review_requested else "已勾选，将由后台继续",
+                    "image_tasks_created": len(image_task_ids),
+                    "auto_illustration_requested": auto_illustration_requested,
+                    "conversation_status": conversation_status.value,
+                    "summary": summary,
+                }
+                fallback = (
+                    f"草稿已生成（{len(draft_ids)} 条待审核）。要现在运行一次自动审核吗？回复“审核”即可；也可以先看文案再说。"
+                    if draft_ids and not auto_review_requested
+                    else summary
+                )
+                reply = await asyncio.to_thread(
+                    compose_task_reply, settings, task="采集并生成草稿", facts=facts,
+                    fallback=fallback, run_id=chat_run_id,
+                )
+                repository.create_chat_message(session_id, "assistant", reply)
+                repository.add_chat_agent_event(
+                    chat_run_id, "已汇报任务结果",
+                    "已根据任务结果生成对话汇报（是否追问由模型按结果决定）。",
+                    "completed",
+                    metadata={"phase": "review", "state": "pending" if draft_ids and not auto_review_requested else "reported", "draft_ids": draft_ids},
+                )
             session.commit()
         for image_task_id in image_task_ids:
             arq_job_id = await enqueue_image_generation_job(settings, image_task_id)
@@ -248,7 +331,11 @@ async def process_draft_regeneration_job(
                 raw = refreshed[0] if refreshed else raw
         with SessionLocal() as session:
             repository = ContentRepository(session)
-            regenerated = ContentPipeline(session, build_generator(settings), settings).regenerate_draft(draft_id, raw)
+            # 与采集任务保持一致：同步生成放到线程里执行，避免阻塞事件循环（否则生成期间的
+            # 健康检查、图片任务与 ARQ 超时都会被卡住），并让内部检索在独立线程的循环里运行。
+            regenerated = await asyncio.to_thread(
+                _regenerate_draft_in_thread, settings, draft_id, raw
+            )
             repository.update_chat_session_memory(
                 session_id, active_draft_id=draft_id,
                 summary="本会话当前草稿已在原生成记录内重新生成。",
@@ -277,14 +364,56 @@ async def process_draft_regeneration_job(
                         metadata={"phase": "delivery", "state": "superseded", "regeneration": True},
                     )
                 updated = repository.get_draft(draft_id)
-                for position in IllustrationPlanner(settings).decide(updated).placements:
-                    image_task_ids.append(repository.create_image_generation_job(chat_run_id, draft_id, "inline", position).id)
+                plan = IllustrationPlanner(settings).decide(updated)
+                for index, position in enumerate(plan.placements):
+                    subject = plan.subjects[index] if index < len(plan.subjects) else ""
+                    style = plan.styles[index] if index < len(plan.styles) else ""
+                    image_task_ids.append(
+                        repository.create_image_generation_job(
+                            chat_run_id, draft_id, "inline", position, subject, style
+                        ).id
+                    )
             if auto_review_requested and not any(item.purpose == "cover" for item in repository.list_draft_illustrations(draft_id)):
-                image_task_ids.append(repository.create_image_generation_job(chat_run_id, draft_id, "cover", 0).id)
+                cover_draft = repository.get_draft(draft_id)
+                image_task_ids.append(
+                    repository.create_image_generation_job(
+                        chat_run_id, draft_id, "cover", 0,
+                        subject_for(cover_draft, "cover"), style_for(cover_draft, "cover"),
+                    ).id
+                )
             if image_task_ids:
                 repository.add_chat_agent_event(chat_run_id, "配图任务已入队", f"原记录已创建 {len(image_task_ids)} 个图片任务。", "running", metadata={"phase": "image", "state": "queued", "task_ids": image_task_ids, "regeneration": True})
             else:
                 repository.add_chat_agent_event(chat_run_id, "复用既有配图", "本次未请求新配图，原草稿图片保持不变。", metadata={"phase": "image", "state": "completed", "regeneration": True})
+            if not image_task_ids:
+                # 重新生成会作废旧投递素材选择：把结果交给模型，由它决定怎么说明与是否追问。
+                existing = repository.list_draft_illustrations(draft_id)
+                facts = {
+                    "task": "按已保存证据重写/重新生成正文",
+                    "draft_id": draft_id,
+                    "new_version": repository.get_draft(draft_id).version,
+                    "existing_illustrations": len(existing),
+                    "new_image_tasks": 0,
+                    "publication_asset_selection": "已作废，需要重新确定或复用",
+                    "auto_review_requested": auto_review_requested,
+                }
+                fallback = (
+                    f"正文已更新为版本 {facts['new_version']}，原有 {len(existing)} 张配图仍保留。"
+                    "要直接复用这些配图，还是按新正文重新生成配图？回复“复用”或“重新生成配图”即可。"
+                    if existing
+                    else f"正文已更新为版本 {facts['new_version']}；当前没有配图，需要的话我可以按新正文生成配图。"
+                )
+                reply = await asyncio.to_thread(
+                    compose_task_reply, settings, task="按已保存证据重写正文", facts=facts,
+                    fallback=fallback, run_id=chat_run_id,
+                )
+                repository.create_chat_message(session_id, "assistant", reply)
+                repository.add_chat_agent_event(
+                    chat_run_id, "已汇报任务结果",
+                    "已根据重写结果生成对话汇报（是否追问由模型按结果决定）。",
+                    "completed",
+                    metadata={"phase": "image", "state": "pending" if existing else "reported", "draft_ids": [draft_id], "regeneration": True},
+                )
             session.commit()
         for image_task_id in image_task_ids:
             arq_job_id = await enqueue_image_generation_job(settings, image_task_id)
@@ -369,9 +498,14 @@ async def process_general_chat_job(
     logger.info("general_chat_job_finished run_id=%s status=%s", chat_run_id, status.value)
 
 
-async def process_auto_review_job(_ctx: dict, draft_id: str, review_id: str) -> None:
-    """在 Worker 中完成耗时审核、一次自动改稿及受控草稿箱投递。"""
-    logger.info("auto_review_job_started draft_id=%s review_id=%s", draft_id, review_id)
+async def process_auto_review_job(
+    _ctx: dict, draft_id: str, review_id: str, deliver: bool = True, chat_run_id: str | None = None,
+) -> None:
+    """在 Worker 中完成耗时审核、一轮自动改稿，并按需受控投递草稿箱。"""
+    logger.info(
+        "auto_review_job_started draft_id=%s review_id=%s deliver=%s chat_run_id=%s",
+        draft_id, review_id, deliver, chat_run_id or "-",
+    )
     with SessionLocal() as session:
         repository = ContentRepository(session)
         run = repository.get_auto_review_run(review_id)
@@ -379,19 +513,32 @@ async def process_auto_review_job(_ctx: dict, draft_id: str, review_id: str) -> 
             logger.info("auto_review_job_skipped draft_id=%s review_id=%s status=%s", draft_id, review_id, run.status)
             return
         repository.mark_auto_review_run_running(review_id)
+        if chat_run_id:
+            # 让这次审核在“生成记录”里有可见的运行条目与阶段状态。
+            repository.add_chat_agent_event(
+                chat_run_id, "自动审核中",
+                "正在按规则与模型审核当前文案与配图，并按意见改稿一轮。",
+                "running",
+                metadata={"phase": "review", "state": "running", "draft_ids": [draft_id], "review_id": review_id},
+            )
         session.commit()
     try:
         with SessionLocal() as session:
             repository = ContentRepository(session)
             result = await auto_review_and_create_wechat_draft(
-                settings, repository, draft_id, review_run_id=review_id,
+                settings, repository, draft_id, chat_agent_run_id=chat_run_id,
+                review_run_id=review_id, deliver=deliver,
             )
             session.commit()
         logger.info("auto_review_job_finished draft_id=%s review_id=%s status=%s", draft_id, review_id, result.get("status"))
+        if chat_run_id:
+            await _report_auto_review_result(chat_run_id, draft_id, result)
     except asyncio.CancelledError:
         with SessionLocal() as session:
             repository = ContentRepository(session)
             repository.finish_auto_review_run(review_id, "failed", {}, {}, "自动审核后台任务超时，已停止。")
+            if chat_run_id:
+                repository.finish_chat_agent_run(chat_run_id, None, ConversationRunStatus.FAILED, "自动审核超时，已停止。", [])
             session.commit()
         logger.warning("auto_review_job_timed_out draft_id=%s review_id=%s", draft_id, review_id)
         raise
@@ -399,9 +546,49 @@ async def process_auto_review_job(_ctx: dict, draft_id: str, review_id: str) -> 
         with SessionLocal() as session:
             repository = ContentRepository(session)
             repository.finish_auto_review_run(review_id, "failed", {}, {}, "自动审核后台任务失败，请稍后重试。")
+            if chat_run_id:
+                repository.finish_chat_agent_run(chat_run_id, None, ConversationRunStatus.FAILED, "自动审核失败，请稍后重试。", [])
             session.commit()
         logger.exception("auto_review_job_failed draft_id=%s review_id=%s error_type=%s", draft_id, review_id, type(exc).__name__)
         raise
+
+
+async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: dict) -> None:
+    """审核结束：结束运行，并让模型根据真实审核结果写汇报（含是否追问）。"""
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        chat_run = repository.get_chat_agent_run(chat_run_id)
+        draft = repository.get_draft(draft_id)
+        status = str(result.get("status") or "")
+        issues = result.get("issues") or []
+        passed = status in {"approved", "delivered", "draft_created"}
+        summary = (
+            f"自动审核{'通过' if passed else '未通过'}：版本 {draft.version}；"
+            f"共 {len(issues)} 条意见。"
+        )
+        fallback = f"自动审核{'通过' if passed else '未通过'}：当前文案版本 {draft.version}，共 {len(issues)} 条意见。"
+        reply = await asyncio.to_thread(
+            compose_task_reply,
+            settings,
+            task="自动审核（含一轮按意见改稿）",
+            facts={
+                "draft_title": (draft.title_options_json or ["当前文案"])[0],
+                "draft_version": draft.version,
+                "review_status": status or "unknown",
+                "passed": passed,
+                "issue_count": len(issues),
+                "issues": [str(item)[:120] for item in issues[:5]],
+                "delivery": "已按要求投递" if result.get("delivery") else "未投递",
+            },
+            fallback=fallback,
+            run_id=chat_run_id,
+        )
+        if chat_run.response_message_id:
+            repository.update_chat_message(chat_run.response_message_id, reply)
+        repository.finish_chat_agent_run(
+            chat_run_id, chat_run.response_message_id, ConversationRunStatus.COMPLETED, summary, [result]
+        )
+        session.commit()
 
 
 async def process_image_generation_job(_ctx: dict, image_task_id: str) -> None:
@@ -424,6 +611,8 @@ async def process_image_generation_job(_ctx: dict, image_task_id: str) -> None:
                 task.placement_after_paragraph,
                 context,
                 visual_direction_for(task.purpose, task.placement_after_paragraph),
+                task.subject or "",
+                task.style or "",
             )
             repository.update_image_generation_job(task.id, "completed", illustration_id=generated.illustration_id)
             repository.add_chat_agent_event(task.chat_agent_run_id, "图片生成完成", f"图片任务 {task.id} 已私有保存。", metadata={"phase": "image", "state": "completed", "task_id": task.id, "draft_id": task.draft_id, "illustration_id": generated.illustration_id})
@@ -539,7 +728,27 @@ async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_me
             else ConversationRunStatus.COMPLETED
         )
         if message_id:
-            repository.update_chat_message(message_id, summary)
+            # 全流程结束：把配图与审核的真实结果交给模型写最终汇报（是否追问由模型按结果决定）。
+            reply = await asyncio.to_thread(
+                compose_task_reply,
+                settings,
+                task="采集→配图→自动审核全流程结束",
+                facts={
+                    "draft_ids": draft_ids,
+                    "auto_review_requested": run.auto_review_requested,
+                    "auto_review_results": auto_results,
+                    "images": {
+                        "total": len(tasks),
+                        "failed": sum(1 for task in tasks if task.status in {"failed", "timed_out"}),
+                        "completed": sum(1 for task in tasks if task.status == "completed"),
+                    },
+                    "has_failed_images": has_failed_images,
+                    "summary": summary,
+                },
+                fallback=summary,
+                run_id=chat_run_id,
+            )
+            repository.update_chat_message(message_id, reply)
             repository.finish_chat_agent_run(chat_run_id, message_id, final_status, summary, [*image_results, *auto_results])
         session.commit()
     logger.info("collection_finalized chat_run_id=%s", chat_run_id)

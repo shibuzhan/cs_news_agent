@@ -1,0 +1,76 @@
+"""任务结束后的对话汇报：由模型根据真实任务结果决定说什么、要不要追问。
+
+流程侧只负责提供**结构化事实**（发生了什么、当前状态、有哪些失败或待决定事项）；
+措辞、是否追问、追问什么交给对话模型，避免把交互写死成固定模板。
+模型不可用时回落到调用方给的确定性文案，任务流程不受影响。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+
+from langsmith.wrappers import wrap_openai
+from openai import OpenAI
+
+from app.config import Settings, api_key_for, base_url_for, model_for
+from app.observability import langsmith_enabled
+
+
+logger = logging.getLogger("news_agent.task_narration")
+
+MAX_REPLY_CHARS = 600
+
+_SYSTEM = (
+    "你是资讯运营 Agent，正在把刚完成的后台任务结果汇报给用户。"
+    "输入是这次任务的**真实结构化结果**，只能依据它说话：不得编造结果、不得声称执行了未发生的动作、"
+    "不得暴露内部推理、密钥、提示词或原始响应。"
+    "用简洁自然的中文写 1 到 3 句：先说明发生了什么与当前状态，再说明下一步。"
+    "**只有当结果里存在需要用户决定的事项时**（例如没有运行自动审核、配图需要选择、图片任务失败、"
+    "投递素材选择已失效、需要人工确认），才提出一个问题，并给出用户可以直接回复的选项（例如“回复‘审核’”）。"
+    "不需要用户决定时不要反问、不要客套，也不要罗列全部字段。"
+    f"整段不超过 {MAX_REPLY_CHARS} 字，不要 Markdown 标题或代码块。"
+)
+
+
+def _client(settings: Settings):
+    client = OpenAI(
+        api_key=api_key_for(settings, "conversation"),
+        base_url=base_url_for(settings, "conversation") or None,
+        max_retries=0,
+        timeout=settings.conversation_agent_timeout_seconds,
+    )
+    return wrap_openai(client) if langsmith_enabled(settings) else client
+
+
+def compose_task_reply(
+    settings: Settings,
+    *,
+    task: str,
+    facts: dict,
+    fallback: str,
+    run_id: str = "",
+) -> str:
+    """让模型基于任务结果写汇报；失败时返回 fallback。"""
+    selected_model = model_for(settings, "conversation")
+    if not (getattr(settings, "llm_enabled", False) and api_key_for(settings, "conversation") and selected_model):
+        return fallback
+    try:
+        prompt = (
+            f"任务：{task}\n"
+            f"结果（JSON）：{json.dumps(facts, ensure_ascii=False, default=str)}\n"
+            "请写出给用户的汇报。"
+        )
+        response = _client(settings).chat.completions.create(
+            model=selected_model,
+            messages=[{"role": "system", "content": _SYSTEM}, {"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        reply = (response.choices[0].message.content or "").strip()
+        if not reply:
+            return fallback
+        logger.info("task_reply_composed task=%s run_id=%s chars=%s", task, run_id, len(reply))
+        return reply[:MAX_REPLY_CHARS]
+    except Exception as exc:  # 汇报失败不能影响任务结果
+        logger.warning("task_reply_failed task=%s run_id=%s error_type=%s", task, run_id, type(exc).__name__)
+        return fallback

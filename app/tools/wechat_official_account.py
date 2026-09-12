@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.paths import resolve_asset
 from app.services.wechat_official import (
     WechatOfficialAccountError,
     WechatRemoteDraft,
@@ -29,13 +30,15 @@ logger = logging.getLogger("news_agent.wechat_official_account")
 _WECHAT_INVALID_IP_RE = re.compile(r"\binvalid ip\s+((?:\d{1,3}\.){3}\d{1,3})\b", re.IGNORECASE)
 
 _SKILL_MODULE_NAME = "news_agent_wechat_official_account_skill"
-_SKILL_SCRIPT = (
-    Path(__file__).resolve().parents[2]
-    / "agent_skills"
-    / "wechat-official-account"
-    / "scripts"
-    / "wechat_official_api.py"
-)
+_SKILL_SCRIPT_RELATIVE = "wechat-official-account/scripts/wechat_official_api.py"
+
+
+def _skill_script_path() -> Path:
+    """定位本地 Skill 脚本；容器内可能从 site-packages 导入，因此按候选资源根解析。"""
+    script = resolve_asset(_SKILL_SCRIPT_RELATIVE)
+    if script is None:
+        raise RuntimeError("微信公众号本地 Skill 脚本不存在")
+    return script
 
 
 def _load_skill_module() -> ModuleType:
@@ -43,7 +46,7 @@ def _load_skill_module() -> ModuleType:
     loaded = sys.modules.get(_SKILL_MODULE_NAME)
     if isinstance(loaded, ModuleType):
         return loaded
-    spec = importlib.util.spec_from_file_location(_SKILL_MODULE_NAME, _SKILL_SCRIPT)
+    spec = importlib.util.spec_from_file_location(_SKILL_MODULE_NAME, _skill_script_path())
     if spec is None or spec.loader is None:
         raise RuntimeError("微信公众号本地 Skill 脚本不可加载")
     module = importlib.util.module_from_spec(spec)

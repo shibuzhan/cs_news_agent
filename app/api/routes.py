@@ -31,7 +31,9 @@ from app.domain.models import (
     PlanConfirmationCommand,
     RawSourceItem,
     ReviewCommand,
+    ReviewStatus,
     SourceKind,
+    normalize_github_target,
 )
 from app.services.attachments import (
     AttachmentAccessError,
@@ -314,6 +316,15 @@ def chat_agent_run_to_dict(
         return {"state": state, "label": latest.title}
 
     image_jobs = repository.list_image_generation_jobs(row.id)
+    # 事件元数据里的 draft_ids 是运行与草稿的唯一关联；前端据此在草稿条目上显示“审核中/重写中”。
+    draft_ids: list[str] = []
+    for event in events:
+        values = event.metadata_json.get("draft_ids", [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, str) and value not in draft_ids:
+                draft_ids.append(value)
     return {
         "id": row.id,
         "request_message_id": row.request_message_id,
@@ -329,6 +340,7 @@ def chat_agent_run_to_dict(
         "finished_at": row.finished_at,
         "tool_results": row.tool_results_json,
         "image_jobs": [image_generation_job_to_dict(job) for job in image_jobs],
+        "draft_ids": draft_ids[:20],
         "progress": {
             "text": phase_progress("text", "等待文字生成"),
             "image": phase_progress("image", "等待配图规划"),
@@ -1083,7 +1095,7 @@ async def send_chat_message(
                 origin_run.auto_review_requested, origin_run.auto_illustration_requested,
             )
             repository.add_chat_agent_event(
-                origin_run.id, "原记录重生成任务已创建", f"任务编号：{job_id}",
+                origin_run.id, "正在重新生成文案", f"任务编号：{job_id}；将用来源快照重建正文并覆盖为新版本。",
                 metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [target_draft.id], "regeneration": True},
             )
             session.commit()
@@ -1094,33 +1106,129 @@ async def send_chat_message(
             session.commit()
         return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": chat_agent_run_to_dict(origin_run, repository)}
 
+    target_draft = _current_editable_draft(repository, session_id)
+    if decision and decision.intent == ConversationIntent.RUN_AUTO_REVIEW and target_draft is not None:
+        # 先清理超时/被重启打断的僵死审核记录，否则它会一直挡住新的审核。
+        repository.expire_stale_auto_review_run(target_draft.id, settings.collection_job_timeout_seconds)
+        session.commit()
+        existing_review = repository.find_active_auto_review_run(target_draft.id)
+        if existing_review is not None:
+            assistant_message = repository.create_chat_message(
+                session_id, "assistant", "这篇的自动审核已经在处理中，完成后我会汇报结果。"
+            )
+            session.commit()
+            return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
+        review_run = repository.create_auto_review_run(target_draft.id, None, status="queued")
+        # 审核也要有一条可见的运行记录，否则用户在“生成记录”里看不到任何正在跑的任务。
+        chat_run = repository.create_chat_agent_run(
+            session_id, user_message.id, ConversationIntent.RUN_AUTO_REVIEW, False, False
+        )
+        repository.add_chat_agent_event(
+            chat_run.id, "识别对话意图", "已识别为：立即审核当前文案（仅审核，不投递）",
+            metadata={"intent": ConversationIntent.RUN_AUTO_REVIEW.value, "draft_ids": [target_draft.id]},
+        )
+        repository.add_chat_agent_event(
+            chat_run.id, "自动审核已入队",
+            f"正在审核《{(target_draft.title_options_json or ['当前草稿'])[0]}》并按其意见改稿一轮；通过后不会自动发表。",
+            "running",
+            metadata={"phase": "review", "state": "running", "draft_ids": [target_draft.id], "review_id": review_run.id},
+        )
+        assistant_message = repository.create_chat_message(
+            session_id,
+            "assistant",
+            f"好，正在对《{(target_draft.title_options_json or ['当前草稿'])[0]}》运行自动审核；通过后不会自动发表。",
+        )
+        chat_run.response_message_id = assistant_message.id
+        chat_run.summary = "自动审核中"
+        chat_run.status = ConversationRunStatus.RUNNING.value
+        session.commit()
+        try:
+            job_id = await enqueue_auto_review_job(
+                settings, target_draft.id, review_run.id, False, chat_run.id
+            )
+        except Exception as exc:
+            repository.finish_auto_review_run(review_run.id, "failed", {}, {}, "自动审核任务入队失败，请稍后重试")
+            repository.update_chat_message(assistant_message.id, "自动审核任务未能入队，请稍后重试。")
+            repository.finish_chat_agent_run(
+                chat_run.id, assistant_message.id, ConversationRunStatus.FAILED, "自动审核入队失败", [], str(exc)
+            )
+            session.commit()
+            logger.exception("chat_auto_review_enqueue_failed draft_id=%s error_type=%s", target_draft.id, type(exc).__name__)
+            raise HTTPException(status_code=503, detail="自动审核任务未能入队，请稍后重试") from exc
+        repository.add_chat_agent_event(
+            chat_run.id, "审核任务已创建", f"任务编号：{job_id}",
+            metadata={"phase": "review", "state": "running", "job_id": job_id, "draft_ids": [target_draft.id]},
+        )
+        logger.info("chat_auto_review_enqueued draft_id=%s review_id=%s job_id=%s", target_draft.id, review_run.id, job_id)
+        session.commit()
+        return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": chat_agent_run_to_dict(chat_run, repository)}
+
+    if decision and decision.intent == ConversationIntent.REUSE_DRAFT_ASSETS and target_draft is not None:
+        illustrations = repository.list_draft_illustrations(target_draft.id)
+        if not illustrations:
+            assistant_message = repository.create_chat_message(
+                session_id, "assistant", "这篇目前没有可复用的配图；需要的话我可以按当前正文重新生成配图。"
+            )
+            session.commit()
+            return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
+        # 复用＝用当前草稿已有的插图固化一次投递选择：封面取现有封面（没有就用第一张），正文取其余全部。
+        cover = next((item for item in illustrations if item.purpose == "cover"), illustrations[0])
+        inline = [item for item in illustrations if item.id != cover.id]
+        repository.save_wechat_asset_selection(target_draft.id, cover.asset_id, [item.asset_id for item in inline])
+        assistant_message = repository.create_chat_message(
+            session_id,
+            "assistant",
+            f"已复用当前草稿的配图：封面 1 张、正文插图 {len(inline)} 张；正文与图片都不变，可直接进入发布流程。",
+        )
+        session.commit()
+        logger.info("chat_reuse_draft_assets draft_id=%s inline=%s", target_draft.id, len(inline))
+        return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
+
     if not attachment_extraction_requested:
         assert decision is not None
         if decision.intent == ConversationIntent.COLLECT_NEWS:
+            target = normalize_github_target(decision.target)
             source_names = [source.value for source in decision.sources]
+            if target and SourceKind.GITHUB.value not in source_names:
+                # 点名了项目就必须包含 GitHub 来源，避免模型漏给 sources 时又去跑别的榜单。
+                source_names.insert(0, SourceKind.GITHUB.value)
             auto_illustration_requested = command.auto_illustration or decision.auto_illustration
             run = repository.create_chat_agent_run(
                 session_id, user_message.id, decision.intent,
                 command.auto_review, auto_illustration_requested,
             )
             repository.add_chat_agent_event(
-                run.id, "识别对话意图", "已识别为：采集资讯",
-                metadata={"intent": decision.intent.value},
+                run.id, "识别对话意图",
+                f"已识别为：按指定项目生成（{target}）" if target else "已识别为：采集资讯",
+                metadata={"intent": decision.intent.value, "target": target},
             )
             repository.add_chat_agent_event(
                 run.id, "加入后台采集队列",
-                "任务已入队；将按已登记来源规则生成待审核草稿。",
-                metadata={"sources": source_names, "limit": decision.limit, "auto_illustration": auto_illustration_requested},
+                f"任务已入队；将只抓取指定项目 {target} 并生成待审核草稿，不读取榜单。"
+                if target
+                else "任务已入队；将按已登记来源规则生成待审核草稿。",
+                metadata={
+                    "sources": source_names,
+                    "limit": decision.limit,
+                    "auto_illustration": auto_illustration_requested,
+                    "target": target,
+                },
             )
             repository.add_chat_agent_event(
                 run.id,
                 "文字生成中",
-                "正在采集来源、提取证据并生成待审核文案。",
+                f"正在获取 {target} 的仓库信息与 README，并生成待审核文案。"
+                if target
+                else "正在采集来源、提取证据并生成待审核文案。",
                 "running",
-                metadata={"phase": "text", "state": "running"},
+                metadata={"phase": "text", "state": "running", "target": target},
             )
             assistant_message = repository.create_chat_message(
-                session_id, "assistant", "已加入后台队列，正在采集并生成待审核草稿。"
+                session_id,
+                "assistant",
+                f"已加入后台队列，正在按指定项目 {target} 获取资料并生成待审核草稿。"
+                if target
+                else "已加入后台队列，正在采集并生成待审核草稿。",
             )
             run.response_message_id = assistant_message.id
             run.summary = "后台任务已排队"
@@ -1129,7 +1237,7 @@ async def send_chat_message(
             try:
                 job_id = await enqueue_collection_job(
                     settings, run.id, session_id, assistant_message.id, source_names, decision.limit,
-                    command.auto_review, auto_illustration_requested,
+                    command.auto_review, auto_illustration_requested, target,
                 )
                 repository.add_chat_agent_event(
                     run.id, "后台任务已创建", f"任务编号：{job_id}", metadata={"job_id": job_id}
@@ -1477,6 +1585,67 @@ def review_draft(
     return draft_to_dict(row, settings)
 
 
+@router.post("/drafts/{draft_id}/rewrite")
+async def rewrite_draft(
+    draft_id: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    session: SessionDependency,
+) -> dict[str, Any]:
+    """用已保存的来源证据（README 快照 + 证据包）重写当前草稿正文。
+
+    与聊天里的“重新生成”走同一条后台任务：不重新采集榜单、不新建草稿或生成记录，
+    成功后覆盖为新的草稿版本；已有草稿的图片与审核记录保留。
+    """
+    repository = ContentRepository(session)
+    draft = repository.get_draft(draft_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="草稿不存在")
+    if draft.status == ReviewStatus.PUBLISHED.value:
+        raise HTTPException(status_code=409, detail="已发布的文案不能重写")
+    origin_run = repository.find_generation_run_for_draft(draft_id)
+    if origin_run is None:
+        raise HTTPException(
+            status_code=409,
+            detail="当前草稿缺少可回溯的原生成记录，无法按已保存证据重写；请在生成记录中对该文案重新生成。",
+        )
+    assistant_message = repository.create_chat_message(
+        origin_run.session_id,
+        "assistant",
+        f"已按你的要求用已保存的来源证据重写文案（当前版本 {draft.version}），将更新原草稿版本。",
+    )
+    repository.reopen_generation_run(origin_run, assistant_message.id, False, False)
+    # 生成记录的状态要反映“正在重写”，而不是泛化的“正在原记录内重新生成”。
+    origin_run.summary = "正在重写文案"
+    repository.add_chat_agent_event(
+        origin_run.id,
+        "重写文案",
+        f"使用已保存的 README 与证据包重写正文，目标草稿版本 {draft.version}；不重新采集、不新建草稿。",
+        "running",
+        metadata={"phase": "text", "state": "running", "draft_ids": [draft_id], "regeneration": True, "rewrite": True},
+    )
+    session.commit()
+    try:
+        job_id = await enqueue_draft_regeneration_job(
+            settings, origin_run.id, origin_run.session_id, assistant_message.id, draft_id,
+            origin_run.auto_review_requested, origin_run.auto_illustration_requested,
+        )
+        repository.add_chat_agent_event(
+            origin_run.id, "正在重写文案", f"任务编号：{job_id}；将用已保存的 README 与证据包重写正文并覆盖为新版本。",
+            metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [draft_id], "regeneration": True},
+        )
+        session.commit()
+        logger.info("draft_rewrite_enqueued draft_id=%s run_id=%s job_id=%s", draft_id, origin_run.id, job_id)
+    except Exception as exc:
+        logger.exception("draft_rewrite_enqueue_failed draft_id=%s error_type=%s", draft_id, type(exc).__name__)
+        repository.update_chat_message(assistant_message.id, "重写任务未能入队，请稍后重试。")
+        repository.finish_chat_agent_run(
+            origin_run.id, assistant_message.id, ConversationRunStatus.FAILED, "重写任务入队失败", [], str(exc)
+        )
+        session.commit()
+        raise HTTPException(status_code=503, detail="重写任务未能入队，请稍后重试") from exc
+    return {"message": chat_message_to_dict(assistant_message), "execution": chat_agent_run_to_dict(origin_run, repository)}
+
+
 @router.post("/drafts/{draft_id}/publication")
 def record_manual_publication(
     draft_id: str,
@@ -1518,7 +1687,10 @@ def move_draft_illustration(
     settings: Annotated[Settings, Depends(get_settings)], session: SessionDependency,
 ) -> dict[str, Any]:
     repository = ContentRepository(session)
-    row = repository.update_draft_illustration_position(draft_id, illustration_id, command.placement_after_paragraph)
+    # 前端一直会带上 purpose；此前只更新段位，导致“设为封面/改为正文”被静默忽略。
+    row = repository.update_draft_illustration(
+        draft_id, illustration_id, command.purpose, command.placement_after_paragraph
+    )
     session.commit()
     return draft_illustration_to_dict(row, repository, settings)
 
@@ -1564,23 +1736,33 @@ def list_draft_revisions(draft_id: str, session: SessionDependency) -> list[dict
 
 
 @router.post("/drafts/{draft_id}/auto-review")
-async def run_auto_review(draft_id: str, settings: Annotated[Settings, Depends(get_settings)], session: SessionDependency) -> dict[str, Any]:
+async def run_auto_review(
+    draft_id: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    session: SessionDependency,
+    deliver: bool = Query(
+        default=True,
+        description="true=审核通过后按开关创建公众号草稿；false=仅审核与按意见改稿，不投递",
+    ),
+) -> dict[str, Any]:
     """创建可追溯审核任务并立即入队；通过不会自动发表。"""
     repository = ContentRepository(session)
+    repository.expire_stale_auto_review_run(draft_id, settings.collection_job_timeout_seconds)
+    session.commit()
     existing = repository.find_active_auto_review_run(draft_id)
     if existing is not None:
         raise HTTPException(status_code=409, detail="该文章已有自动审核任务正在处理中")
     run = repository.create_auto_review_run(draft_id, None, status="queued")
     session.commit()
     try:
-        job_id = await enqueue_auto_review_job(settings, draft_id, run.id)
+        job_id = await enqueue_auto_review_job(settings, draft_id, run.id, deliver)
     except Exception as exc:
         repository.finish_auto_review_run(run.id, "failed", {}, {}, "自动审核任务入队失败，请稍后重试")
         session.commit()
         logger.exception("auto_review_enqueue_failed draft_id=%s review_id=%s error_type=%s", draft_id, run.id, type(exc).__name__)
         raise HTTPException(status_code=503, detail="自动审核任务未能入队，请稍后重试") from exc
-    logger.info("auto_review_queued draft_id=%s review_id=%s job_id=%s", draft_id, run.id, job_id)
-    return {"review_id": run.id, "status": "queued", "draft_id": draft_id}
+    logger.info("auto_review_queued draft_id=%s review_id=%s deliver=%s job_id=%s", draft_id, run.id, deliver, job_id)
+    return {"review_id": run.id, "status": "queued", "draft_id": draft_id, "deliver": deliver}
 
 
 def _ensure_wechat_image_attachment(row: AttachmentRow) -> None:

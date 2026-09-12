@@ -57,6 +57,7 @@ export type AgentRun = {
   finished_at: string | null;
   tool_results: Array<{ tool?: string; plan_id?: string; status?: string }>;
   image_jobs?: ImageGenerationJob[];
+  draft_ids?: string[];
   request_text?: string;
   session_title?: string;
   progress?: {

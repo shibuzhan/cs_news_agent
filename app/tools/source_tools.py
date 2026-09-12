@@ -33,10 +33,33 @@ class SourceCollectionTool:
                 f"{self.source_kind.value} Tool 不接受 {request.source.value} 请求"
             )
         started_at = datetime.now(UTC)
+        target = (request.target or "").strip() or None
+        fetch_project = getattr(self.collector, "fetch_project", None)
         logger.info(
-            "source_tool_started source=%s limit=%s", self.source_kind.value, request.limit
+            "source_tool_started source=%s limit=%s mode=%s target=%s",
+            self.source_kind.value,
+            request.limit,
+            "project" if target else "list",
+            target or "-",
         )
         try:
+            if target and callable(fetch_project):
+                # 点名项目：只抓这一个仓库，不读榜单、不参与热度排序。
+                item = await fetch_project(target)
+                logger.info(
+                    "source_tool_finished source=%s mode=project target=%s readme=%s",
+                    self.source_kind.value,
+                    target,
+                    item.metadata.get("readme_fetch_status"),
+                )
+                return CollectionBatch(
+                    source_kind=self.source_kind.value,
+                    started_at=started_at,
+                    finished_at=datetime.now(UTC),
+                    items=[item],
+                    selected_items=[item],
+                    selection_metadata={"mode": "project", "target": target},
+                )
             items = await self.collector.collect(request.limit)
             logger.info(
                 "source_tool_finished source=%s received=%s",
@@ -51,8 +74,9 @@ class SourceCollectionTool:
             )
         except Exception as exc:  # 工具失败交由主 Agent 汇总，不扩散为整次失败
             logger.warning(
-                "source_tool_failed source=%s error_type=%s",
+                "source_tool_failed source=%s mode=%s error_type=%s",
                 self.source_kind.value,
+                "project" if target else "list",
                 type(exc).__name__,
             )
             return CollectionBatch(

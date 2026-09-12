@@ -46,6 +46,50 @@ def test_deterministic_draft_keeps_auditable_generation_fields() -> None:
     assert all("owner/repo" in title for title in draft.title_options)
 
 
+class _FakeSearchTool:
+    """替身：异步检索工具，记录调用次数并返回固定证据。"""
+
+    def __init__(self) -> None:
+        self.enabled = True
+        self.calls = 0
+
+    async def search(self, queries):
+        self.calls += 1
+        return [{"id": "exa-search-1", "title": "Exa 联网检索", "content": "某工具是什么"}]
+
+
+def test_search_evidence_works_inside_a_running_event_loop() -> None:
+    """重生成任务在 ARQ 协程里直接调用同步生成器：asyncio.run 会因嵌套事件循环而失败。"""
+    import asyncio
+
+    from app.services.generator import _run_coroutine
+
+    tool = _FakeSearchTool()
+    generator = EnhancedDraftGenerator.__new__(EnhancedDraftGenerator)
+    generator.search_tool = tool
+
+    async def call_from_loop():
+        return generator._search_evidence(["某个工具"])
+
+    evidence = asyncio.run(call_from_loop())
+
+    assert evidence[0]["id"] == "exa-search-1"
+    assert tool.calls == 1
+
+
+def test_search_evidence_works_from_a_plain_thread() -> None:
+    """采集任务在 asyncio.to_thread 的独立线程里调用：这条路径本来就没有运行中的循环。"""
+    from app.services.generator import _run_coroutine
+
+    tool = _FakeSearchTool()
+    generator = EnhancedDraftGenerator.__new__(EnhancedDraftGenerator)
+    generator.search_tool = tool
+
+    assert _run_coroutine(tool.search(["某个工具"]))[0]["id"] == "exa-search-1"
+    assert generator._search_evidence(["某个工具"])[0]["id"] == "exa-search-1"
+    assert tool.calls == 2
+
+
 def test_github_title_options_always_include_project_name() -> None:
     payload = {"title_options": ["一款值得关注的 AI 编程工具"]}
 
@@ -60,6 +104,15 @@ def test_source_writing_skill_loads_its_routed_reference() -> None:
     assert "GitHub 项目文案" in instructions
     assert "来源专用参考资料" in instructions
     assert "README 证据与补充规则" in instructions
+
+
+def test_source_writing_skill_degrades_gracefully_without_asset_dir(monkeypatch) -> None:
+    """资源目录缺失（例如容器内从 site-packages 导入）时降级，但不能抛错阻断生成。"""
+    monkeypatch.setattr("app.services.generator.agent_skills_dir", lambda: None)
+
+    instructions = _source_writing_skill(item())
+
+    assert instructions == "遵循通用科技资讯事实约束。"
 
 
 def test_resilient_generator_reports_provider_timeout_without_a_fallback_draft() -> None:

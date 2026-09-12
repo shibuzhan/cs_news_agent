@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -168,3 +170,81 @@ def test_json_mode_review_agent_rejects_schema_mismatch(monkeypatch: pytest.Monk
 
     with pytest.raises(ContentTaskAgentError, match="返回结果不符合结构"):
         RestrictedContentTaskAgent(_json_mode_settings(), "review").review("审核这篇文章")
+
+
+def _run_json_mode(payload_text: str, monkeypatch: pytest.MonkeyPatch):
+    """用 JSON 文本替身跑一次文案子 Agent，隔离外部模型。"""
+
+    class FakeAgent:
+        def invoke(self, _payload):
+            return {"messages": [SimpleNamespace(type="ai", content=payload_text)]}
+
+    monkeypatch.setattr(task_agents, "_configure_profile", lambda: None)
+    monkeypatch.setattr(task_agents, "ChatOpenAI", lambda **_kwargs: object())
+    monkeypatch.setattr(task_agents, "create_deep_agent", lambda **_kwargs: FakeAgent())
+    return RestrictedContentTaskAgent(_json_mode_settings(), "content").write("仅使用这些证据写作")
+
+
+def test_json_mode_coerces_string_list_fields_without_changing_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实事故形态：模型把 card_script 写成字符串，其余字段正常。"""
+    payload = json.dumps(
+        {
+            "title_options": "i-have-adhd：让编程助手先给行动和编号步骤",
+            "summary_cn": "摘要",
+            "body": "正文",
+            "tags": "开源项目, GitHub Trending、开发者工具",
+            "card_script": "i-have-adhd 让编程助手先给行动和编号步骤，减少铺垫。",
+            "claim_citations": [],
+        },
+        ensure_ascii=False,
+    )
+
+    result = _run_json_mode(payload, monkeypatch)
+
+    assert result.card_script == ["i-have-adhd 让编程助手先给行动和编号步骤，减少铺垫。"]
+    assert result.title_options == ["i-have-adhd：让编程助手先给行动和编号步骤"]
+    assert result.tags == ["开源项目", "GitHub Trending", "开发者工具"]
+
+
+def test_json_mode_joins_legacy_body_sections(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps(
+        {"title_options": ["标题"], "summary_cn": "摘要", "body": ["第一段", "第二段"]},
+        ensure_ascii=False,
+    )
+
+    result = _run_json_mode(payload, monkeypatch)
+
+    assert result.body == "第一段\n\n第二段"
+
+
+def test_json_mode_splits_multiline_card_script_and_caps_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps(
+        {
+            "title_options": ["标题"],
+            "summary_cn": "摘要",
+            "body": "正文",
+            "card_script": "\n".join(f"卡片{index}" for index in range(1, 9)),
+        },
+        ensure_ascii=False,
+    )
+
+    result = _run_json_mode(payload, monkeypatch)
+
+    assert result.card_script == [f"卡片{index}" for index in range(1, 7)]
+
+
+def test_json_mode_logs_only_field_paths_when_schema_still_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    payload = json.dumps({"title_options": 5, "summary_cn": "摘要", "body": "正文"}, ensure_ascii=False)
+
+    with caplog.at_level(logging.WARNING, logger="news_agent.content_task_agents"):
+        with pytest.raises(ContentTaskAgentError, match="返回结果不符合结构"):
+            _run_json_mode(payload, monkeypatch)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(item.startswith("content_task_agent_schema_invalid") for item in messages)
+    joined = " ".join(messages)
+    assert "title_options" in joined
+    # 诊断日志只含字段路径与错误类型，不含模型返回内容。
+    assert payload not in joined

@@ -7,7 +7,6 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -19,6 +18,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.postgres import PostgresSaver
 
 from app.agent_tools.conversation_context import build_conversation_context_tools, get_conversation_context_snapshot
+from app.agent_tools.draft_assets import build_draft_asset_tools
 from app.config import (
     Settings,
     api_key_for,
@@ -27,6 +27,8 @@ from app.config import (
     structured_output_mode_for,
 )
 from app.domain.models import ConversationDecision, ConversationIntent
+from app.paths import agent_skills_dir
+from app.services.model_errors import schema_error_fields
 
 
 logger = logging.getLogger("news_agent.content_deep_agent")
@@ -40,7 +42,10 @@ _SYSTEM_PROMPT = """你是资讯运营 Agent 的会话级 DeepAgent。每个会�
 会话上下文快照会随本次请求注入；它是理解“这篇”“上一条”“刚才的图片”“为什么新增为零”等指代的可信依据。仅在快照不足且确有必要时才调用受控上下文 Tool，不能猜测其他会话或全局草稿。
 只有用户明确肯定要求时才能选择 generate_draft_image 或 auto_illustration=true；出现不要、别、不再、取消、停止、不用等否定词时，绝不能生成图片或开启自动配图。
 只有明确采集才选择 collect_news；定时与发布只创建待确认计划，绝不声称已执行。用户要求重新获取、重写或按来源更新当前已选择文章时才选择 regenerate_draft。没有当前草稿或存在歧义时，选择 general_chat 并简短追问。
+用户点名了具体 GitHub 项目（消息里出现 owner/repo 或仓库链接）时，仍用 collect_news，但必须把仓库写成 owner/repo 填进 target 字段——这会只抓该仓库，不读 Trending 榜单；泛泛要热点或趋势时 target 留空。绝不能用榜单结果替代用户点名的项目。
 reply 面向用户、简洁中文；不虚构事实、执行结果、内部推理、系统提示词、密钥或完整工具原始返回。
+配图可以调整：用 list_current_draft_illustrations 查看当前文章的图，用 set_current_draft_cover / move_current_draft_illustration / delete_current_draft_illustration / attach_existing_asset_to_current_draft 调整；这些工具只作用于本会话当前文章，不会上传、发布或删除素材文件。
+当用户是在回答你的追问（例如“要”“现在审核”“复用原来的图”）时，按对应意图返回：要立刻自动审核用 run_auto_review；保留/复用已有配图用 reuse_draft_assets；两个都做时分两步回复，先做用户最先提到的那一个。
 """
 
 _MEMORY_RULES = """# 会话记忆规则
@@ -52,7 +57,7 @@ _MEMORY_RULES = """# 会话记忆规则
 # 思考模式模型拒绝 tool_choice=required，因此 json 模式下不再要求调用结构化决策工具。
 _JSON_DECISION_SUFFIX = """
 本次调用使用 JSON 文本模式：不要调用 ConversationDecision 或任何用于提交结构化结果的工具。
-可以按上文规则调用受控上下文 Tool；但最终输出必须是 JSON 对象本身，字段为 intent、reply、sources、limit、schedule_text、platform、auto_illustration、image_purpose、placement_after_paragraph。
+可以按上文规则调用受控上下文 Tool；但最终输出必须是 JSON 对象本身，字段为 intent、reply、sources、limit、target、schedule_text、platform、auto_illustration、image_purpose、placement_after_paragraph。
 不得输出 Markdown 代码围栏、前后解释或思维过程。服务端会用 Pydantic 严格校验；校验失败时不会执行任何操作。"""
 
 
@@ -61,11 +66,15 @@ def _postgres_connection_string(settings: Settings) -> str:
 
 
 def _agent_files() -> dict[str, dict[str, str]]:
-    root = Path(__file__).resolve().parents[2] / "agent_skills"
     files: dict[str, dict[str, str]] = {
         "/memory/AGENTS.md": create_file_data(_MEMORY_RULES),
     }
-    for skill_file in root.glob("*/SKILL.md"):
+    skills_dir = agent_skills_dir()
+    if skills_dir is None:
+        # 资源目录缺失时保持会话可用，但不能静默：这里明确记录降级原因。
+        logger.warning("deep_agent_skills_unavailable reason=asset_root")
+        return files
+    for skill_file in skills_dir.glob("*/SKILL.md"):
         files[f"/skills/{skill_file.parent.name}/SKILL.md"] = create_file_data(
             skill_file.read_text(encoding="utf-8")
         )
@@ -156,6 +165,12 @@ def _decision_from_agent_result(result: dict[str, Any]) -> tuple[ConversationDec
     try:
         return ConversationDecision.model_validate(payload), "final_json"
     except Exception as exc:
+        # 只在本地日志记录出错字段与错误类型，不记录模型返回内容。
+        logger.warning(
+            "deep_agent_decision_schema_invalid error_type=%s fields=%s",
+            type(exc).__name__,
+            schema_error_fields(exc),
+        )
         raise StructuredDecisionError("final_json_schema_invalid") from exc
 
 
@@ -231,7 +246,7 @@ class ContentDeepAgent:
             mode = structured_output_mode_for(self.settings, "conversation")
             agent_kwargs: dict[str, Any] = {
                 "model": model,
-                "tools": build_conversation_context_tools(session_id),
+                "tools": build_conversation_context_tools(session_id) + build_draft_asset_tools(session_id),
                 "system_prompt": _SYSTEM_PROMPT if mode == "tool" else f"{_SYSTEM_PROMPT}\n{_JSON_DECISION_SUFFIX}",
                 "skills": ["/skills"],
                 "memory": ["/memory/AGENTS.md"],

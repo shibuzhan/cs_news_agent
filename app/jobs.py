@@ -25,12 +25,14 @@ async def enqueue_collection_job(
     limit: int,
     auto_review_requested: bool = False,
     auto_illustration_requested: bool = False,
+    target: str | None = None,
 ) -> str:
     logger.info(
-        "collection_enqueue_started run_id=%s sources=%s limit=%s",
+        "collection_enqueue_started run_id=%s sources=%s limit=%s target=%s",
         run_id,
         sources,
         limit,
+        target or "-",
     )
     pool = await create_pool(redis_settings(settings))
     try:
@@ -43,6 +45,7 @@ async def enqueue_collection_job(
             limit,
             auto_review_requested,
             auto_illustration_requested,
+            target,
         )
         if job is None:
             raise RuntimeError("后台任务未能入队")
@@ -108,14 +111,24 @@ async def enqueue_image_generation_job(settings: Settings, image_task_id: str) -
         await pool.aclose()
 
 
-async def enqueue_auto_review_job(settings: Settings, draft_id: str, review_id: str) -> str:
-    """人工点击审核仅入队；模型与公众号投递不占用 HTTP 请求。"""
+async def enqueue_auto_review_job(
+    settings: Settings, draft_id: str, review_id: str, deliver: bool = True,
+    chat_run_id: str | None = None,
+) -> str:
+    """人工点击审核仅入队；模型与公众号投递不占用 HTTP 请求。
+
+    `deliver=False` 表示“仅审核”：跑规则与模型审核并按意见改稿一轮，但不创建公众号草稿。
+    `chat_run_id` 用于把这次审核挂到一条对话运行上，使其在“生成记录”里可见。
+    """
     pool = await create_pool(redis_settings(settings))
     try:
-        job = await pool.enqueue_job("process_auto_review_job", draft_id, review_id)
+        job = await pool.enqueue_job("process_auto_review_job", draft_id, review_id, deliver, chat_run_id)
         if job is None:
             raise RuntimeError("自动审核后台任务未能入队")
-        logger.info("auto_review_enqueue_finished draft_id=%s review_id=%s job_id=%s", draft_id, review_id, job.job_id)
+        logger.info(
+            "auto_review_enqueue_finished draft_id=%s review_id=%s deliver=%s job_id=%s",
+            draft_id, review_id, deliver, job.job_id,
+        )
         return job.job_id
     finally:
         await pool.aclose()

@@ -22,13 +22,10 @@ class SourceCollector(ABC):
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
 
-    async def fetch_text(self, url: str) -> str:
+    async def fetch_text(self, url: str, headers: dict[str, str] | None = None) -> str:
         logger.info("source_http_started source=%s host=%s", self.name, urlsplit(url).hostname)
         try:
-            response = await self.client.get(
-                url,
-                headers={"User-Agent": "news-agent/0.1 (+local content operations demo)"},
-            )
+            response = await self.client.get(url, headers=self._headers(headers))
             response.raise_for_status()
             text = response.text
             logger.info(
@@ -47,7 +44,15 @@ class SourceCollector(ABC):
             )
             raise SourceCollectionError(f"{self.name} 采集失败：{exc}") from exc
 
-    async def fetch_text_limited(self, url: str, max_bytes: int) -> str:
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers = {"User-Agent": "news-agent/0.1 (+local content operations demo)"}
+        if extra:
+            headers.update(extra)
+        return headers
+
+    async def fetch_text_limited(
+        self, url: str, max_bytes: int, headers: dict[str, str] | None = None
+    ) -> str:
         """读取受大小限制的公开响应，避免把异常大页面放入数据库或提示词。"""
         logger.info(
             "source_http_limited_started source=%s host=%s max_bytes=%s",
@@ -59,7 +64,7 @@ class SourceCollector(ABC):
             async with self.client.stream(
                 "GET",
                 url,
-                headers={"User-Agent": "news-agent/0.1 (+local content operations demo)"},
+                headers=self._headers(headers),
             ) as response:
                 response.raise_for_status()
                 chunks: list[bytes] = []

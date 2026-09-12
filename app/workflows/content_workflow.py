@@ -13,10 +13,26 @@ from app.config import Settings
 from app.domain.models import DraftContent, NormalizedItem, RawSourceItem
 from app.services.classifier import classify_item
 from app.services.generator import DraftGenerator
+from app.services.model_errors import README_UNAVAILABLE_REASON, safe_failure_reason
 from app.services.normalizer import has_meaningful_content, normalize_item
 from app.services.ranker import calculate_hot_score
 from app.storage.repositories import ContentRepository
 from app.services.source_snapshots import DraftSourceSnapshotStore
+
+# 与 GitHub 采集器保持一致的最小 README 长度。
+MIN_README_CHARS = 200
+
+
+def _github_content_ready(raw: RawSourceItem) -> bool:
+    """GitHub 条目必须有可用 README 正文才允许生成。
+
+    仅有的 Trending 简介通常只有一两百字，在正文下限下只能靠“来源没有说明”这类空话凑数，
+    因此这里直接拒绝生成，并把原因交给失败详情展示。
+    """
+    metadata = raw.metadata if isinstance(raw.metadata, dict) else {}
+    if metadata.get("readme_fetch_status") != "success":
+        return False
+    return len((raw.content or "").strip()) >= MIN_README_CHARS
 
 
 class ContentState(TypedDict, total=False):
@@ -115,7 +131,7 @@ class ContentPipeline:
                 self.session.commit()
             except Exception as exc:  # 单条失败不能使整批数据回滚
                 self.session.rollback()
-                result["errors"].append({"external_id": raw.external_id, "error": str(exc)})
+                result["errors"].append({"external_id": raw.external_id, "error": safe_failure_reason(exc)})
         return result
 
     def regenerate_draft(self, draft_id: str, raw: RawSourceItem) -> dict[str, Any]:
@@ -166,6 +182,12 @@ class ContentPipeline:
         }
         for raw in raw_items:
             try:
+                # 生成前先检查来源正文：README 缺失时只用 Trending 简介写长文只会得到空话。
+                if not _github_content_ready(raw):
+                    result["errors"].append(
+                        {"external_id": raw.external_id, "error": README_UNAVAILABLE_REASON}
+                    )
+                    continue
                 with self.session.begin_nested():
                     state = self.graph.invoke({"raw_item": raw.model_dump(mode="json")})
                     if not state.get("eligible"):
@@ -192,7 +214,7 @@ class ContentPipeline:
                     result["created"] += 1
                     result["created_draft_ids"].append(draft.id)
             except Exception as exc:  # 单项目失败不能让候选快照回滚
-                result["errors"].append({"external_id": raw.external_id, "error": str(exc)})
+                result["errors"].append({"external_id": raw.external_id, "error": safe_failure_reason(exc)})
         return result
 
     def process_github_aggregate(self, raw_items: list[RawSourceItem], top_n: int = 5) -> dict[str, Any]:
@@ -267,5 +289,5 @@ class ContentPipeline:
             self.session.commit()
         except Exception as exc:
             self.session.rollback()
-            result["errors"].append({"external_id": "github-aggregate", "error": str(exc)})
+            result["errors"].append({"external_id": "github-aggregate", "error": safe_failure_reason(exc)})
         return result

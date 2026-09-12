@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
 
 from bs4 import BeautifulSoup
 
-from app.domain.models import RawSourceItem, SourceKind
+from app.domain.models import ContentCategory, RawSourceItem, SourceKind
 from app.sources.base import SourceCollectionError, SourceCollector
+
+
+logger = logging.getLogger("news_agent.github")
+
+# README 重取间隔基数（秒）：第 1 次失败后等 2 秒，第 2 次失败后等 4 秒。
+README_RETRY_DELAY_SECONDS = 2.0
+# README 正文少于此长度时不认为拿到了可用来源正文。
+MIN_README_CHARS = 200
 
 
 def _number(text: str) -> int:
@@ -42,11 +52,35 @@ class GitHubTrendingCollector(SourceCollector):
     periods = ("daily", "weekly")
 
     def __init__(
-        self, client, response_max_bytes: int = 1_000_000, content_max_chars: int = 500_000
+        self,
+        client,
+        response_max_bytes: int = 1_000_000,
+        content_max_chars: int = 500_000,
+        token: str | None = None,
+        readme_attempts: int = 3,
     ):
         super().__init__(client)
         self.response_max_bytes = response_max_bytes
         self.content_max_chars = content_max_chars
+        # 未配置令牌时 GitHub API 只有每小时 60 次的匿名配额，README 很容易被限流。
+        self.token = token
+        self.readme_attempts = max(readme_attempts, 1)
+
+    def _api_headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    @staticmethod
+    def _readme_failure_kind(exc: Exception) -> str:
+        """只分类，不回显 GitHub 原始响应。"""
+        text = str(exc).casefold()
+        if "403" in text or "429" in text or "rate limit" in text:
+            return "rate_limited"
+        if "404" in text:
+            return "not_found"
+        return "unavailable"
 
     @staticmethod
     def parse_page(html: str, period: str, limit: int) -> list[RawSourceItem]:
@@ -116,27 +150,151 @@ class GitHubTrendingCollector(SourceCollector):
                 )
         return list(merged.values())
 
+    async def fetch_project(self, external_id: str) -> RawSourceItem:
+        """按用户点名的 owner/repo 抓取仓库元数据与 README，不读 Trending 榜单。
+
+        README 仍按受控次数重试：拿不到就如实标记 `readme_fetch_status=failed`，
+        由流水线拒绝生成，而不是拿描述凑一篇文案。
+        """
+        metadata: dict[str, Any] = {"project_target": True}
+        title = external_id
+        url = f"https://github.com/{external_id}"
+        summary = ""
+        metrics: dict[str, Any] = {}
+        try:
+            payload = await self.fetch_text_limited(
+                f"https://api.github.com/repos/{external_id}",
+                self.response_max_bytes,
+                self._api_headers(),
+            )
+            repo = json.loads(payload)
+            if isinstance(repo, dict):
+                title = str(repo.get("full_name") or external_id)
+                url = str(repo.get("html_url") or url)
+                summary = str(repo.get("description") or "")[:5000]
+                license_info = repo.get("license") if isinstance(repo.get("license"), dict) else {}
+                metrics = {
+                    "stars_total": int(repo.get("stargazers_count") or 0),
+                    "forks": int(repo.get("forks_count") or 0),
+                }
+                metadata.update(
+                    {
+                        "project_language": repo.get("language"),
+                        "project_topics": repo.get("topics") if isinstance(repo.get("topics"), list) else [],
+                        "project_homepage": repo.get("homepage"),
+                        "project_pushed_at": repo.get("pushed_at"),
+                        "project_created_at": repo.get("created_at"),
+                        "project_license": license_info.get("spdx_id") or license_info.get("name"),
+                        "project_open_issues": repo.get("open_issues_count"),
+                    }
+                )
+        except Exception as exc:  # 元数据失败不阻断：README 才是生成所需的本体
+            logger.warning(
+                "github_project_metadata_failed project=%s error_type=%s",
+                external_id,
+                type(exc).__name__,
+            )
+            metadata["project_metadata_status"] = "failed"
+        content, readme_metadata = await self._fetch_readme(external_id)
+        metadata.update(readme_metadata)
+        return RawSourceItem(
+            source_kind=SourceKind.GITHUB,
+            external_id=external_id,
+            title=title,
+            url=url,
+            source_name="GitHub 项目",
+            summary=summary,
+            content=content,
+            metrics=metrics,
+            category=ContentCategory.OPEN_SOURCE,
+            metadata=metadata,
+        )
+
+    async def _fetch_readme(self, external_id: str) -> tuple[str, dict[str, Any]]:
+        """读取 README 并按受控次数重试；返回正文与需要并入的元数据。"""
+        last_error: Exception | None = None
+        for attempt in range(1, self.readme_attempts + 1):
+            try:
+                response = await self.fetch_text_limited(
+                    f"https://api.github.com/repos/{external_id}/readme",
+                    self.response_max_bytes,
+                    self._api_headers(),
+                )
+                readme = decode_github_readme_response(response)
+                return readme[: self.content_max_chars], {
+                    "content_origin": "github_readme",
+                    "readme_fetch_status": "success",
+                    "readme_attempts": attempt,
+                }
+            except SourceCollectionError as exc:
+                last_error = exc
+                logger.warning(
+                    "github_readme_fetch_failed project=%s attempt=%s kind=%s",
+                    external_id,
+                    attempt,
+                    self._readme_failure_kind(exc),
+                )
+                if attempt < self.readme_attempts:
+                    await asyncio.sleep(README_RETRY_DELAY_SECONDS * attempt)
+        return "", {
+            "content_origin": "trending_description",
+            "readme_fetch_status": "failed",
+            "readme_fetch_error": self._readme_failure_kind(last_error or Exception()),
+            "readme_attempts": self.readme_attempts,
+        }
+
     async def enrich_items(self, items: list[RawSourceItem]) -> list[RawSourceItem]:
-        """仅为主 Agent 已选中的单个项目读取 README，不能用于批量抓取。"""
+        """仅为主 Agent 已选中的单个项目读取 README，不能用于批量抓取。
+
+        生成前必须拿到 README：失败时按受控次数重试，仍失败则如实标记，由流水线拒绝生成。
+        """
         enriched: list[RawSourceItem] = []
         for item in items:
             metadata: dict[str, Any] = dict(item.metadata)
-            try:
-                readme_response = await self.fetch_text_limited(
-                    f"https://api.github.com/repos/{item.external_id}/readme",
-                    self.response_max_bytes,
-                )
-                readme = decode_github_readme_response(readme_response)
-                metadata.update({"content_origin": "github_readme", "readme_fetch_status": "success"})
-                enriched.append(
-                    item.model_copy(
-                        update={
-                            "content": readme[: self.content_max_chars],
-                            "metadata": metadata,
+            last_error: Exception | None = None
+            for attempt in range(1, self.readme_attempts + 1):
+                try:
+                    readme_response = await self.fetch_text_limited(
+                        f"https://api.github.com/repos/{item.external_id}/readme",
+                        self.response_max_bytes,
+                        self._api_headers(),
+                    )
+                    readme = decode_github_readme_response(readme_response)
+                    metadata.update(
+                        {
+                            "content_origin": "github_readme",
+                            "readme_fetch_status": "success",
+                            "readme_attempts": attempt,
                         }
                     )
+                    metadata.pop("readme_fetch_error", None)
+                    enriched.append(
+                        item.model_copy(
+                            update={
+                                "content": readme[: self.content_max_chars],
+                                "metadata": metadata,
+                            }
+                        )
+                    )
+                    break
+                except SourceCollectionError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "github_readme_fetch_failed project=%s attempt=%s kind=%s",
+                        item.external_id,
+                        attempt,
+                        self._readme_failure_kind(exc),
+                    )
+                    if attempt < self.readme_attempts:
+                        await asyncio.sleep(README_RETRY_DELAY_SECONDS * attempt)
+            else:
+                metadata.update(
+                    {
+                        "content_origin": "trending_description",
+                        "readme_fetch_status": "failed",
+                        "readme_fetch_error": self._readme_failure_kind(last_error or Exception()),
+                        "readme_attempts": self.readme_attempts,
+                    }
                 )
-            except SourceCollectionError as exc:
-                metadata.update({"content_origin": "trending_description", "readme_fetch_status": "failed", "readme_fetch_error": str(exc)})
                 enriched.append(item.model_copy(update={"metadata": metadata}))
         return enriched

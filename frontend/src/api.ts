@@ -66,10 +66,13 @@ export const api = {
       body: JSON.stringify({ reviewer: "运营人员", action, note, idempotency_key: crypto.randomUUID() }),
     }),
   listDraftIllustrations: (id: string) => request<DraftIllustration[]>(`/drafts/${id}/illustrations`),
+  rewriteDraft: (id: string) =>
+    request<{ message: ChatMessage; execution: AgentRun }>(`/drafts/${id}/rewrite`, { method: "POST" }),
   moveDraftIllustration: (draftId: string, illustrationId: string, assetId: string, purpose: "cover" | "inline", placementAfterParagraph: number) =>
     request<DraftIllustration>(`/drafts/${draftId}/illustrations/${illustrationId}`, { method: "PATCH", body: JSON.stringify({ asset_id: assetId, purpose, placement_after_paragraph: placementAfterParagraph }) }),
   deleteDraftIllustration: (draftId: string, illustrationId: string) => request<{ deleted_id: string }>(`/drafts/${draftId}/illustrations/${illustrationId}`, { method: "DELETE" }),
-  runAutoReview: (id: string) => request<{ review_id: string; status: string; draft_id?: string; wechat_job_id?: string; error?: string }>(`/drafts/${id}/auto-review`, { method: "POST" }),
+  // deliver=false 表示仅审核与按意见改稿，不创建公众号草稿。
+  runAutoReview: (id: string, deliver = true) => request<{ review_id: string; status: string; draft_id?: string; wechat_job_id?: string; error?: string; deliver?: boolean }>(`/drafts/${id}/auto-review?deliver=${deliver ? "true" : "false"}`, { method: "POST" }),
   listAutoReviews: (id: string) => request<AutoReviewRun[]>(`/drafts/${id}/auto-reviews`),
   listDraftRevisions: (id: string) => request<DraftRevision[]>(`/drafts/${id}/revisions`),
   recordManualPublication: (id: string, publication: { platform: string; published_url: string; note?: string }) =>

@@ -25,17 +25,20 @@ class Settings(BaseSettings):
     content_openai_base_url: str | None = None
     review_openai_base_url: str | None = None
     illustration_planner_openai_base_url: str | None = None
+    evidence_selector_openai_base_url: str | None = None
     openai_api_key: str | None = None
     conversation_openai_api_key: str | None = None
     content_openai_api_key: str | None = None
     review_openai_api_key: str | None = None
     illustration_planner_openai_api_key: str | None = None
+    evidence_selector_openai_api_key: str | None = None
     llm_model: str | None = None
     # 按任务拆分模型：留空时回退到既有 LLM_MODEL，升级配置不会中断现有调用。
     conversation_llm_model: str | None = None
     content_llm_model: str | None = None
     review_llm_model: str | None = None
     illustration_planner_llm_model: str | None = None
+    evidence_selector_llm_model: str | None = None
     llm_enabled: bool = False
     enhanced_generation_enabled: bool = False
     llm_fast_model: str | None = None
@@ -52,6 +55,8 @@ class Settings(BaseSettings):
     exa_search_max_queries: int = 2
     exa_search_max_results: int = 5
     exa_search_result_max_chars: int = 6000
+    # 把联网补充搭在“本来就会发生”的那次改稿上：不增加模型调用，只增加 1–2 次检索。
+    revision_search_enabled: bool = True
     deep_agent_enabled: bool = False
     agent_script_timeout_seconds: int = 15
     minio_endpoint: str = "localhost:9000"
@@ -67,6 +72,10 @@ class Settings(BaseSettings):
     arxiv_categories: str = "cs.AI,cs.CL,cs.LG"
     rss_feeds: str = "https://github.blog/changelog/feed/"
     collect_limit: int = 25
+    # 可选：GitHub API 令牌。未配置时 README 接口只有每小时 60 次的匿名配额，容易被限流。
+    github_token: str | None = None
+    # 生成插图单独的大小上限：聊天附件的 2 MB 限制不适用于模型生成的图片。
+    generated_image_max_bytes: int = 10 * 1024 * 1024
     # 采集和普通对话保持较短超时；正文、改稿与审核为结构化长输出，使用独立时限。
     request_timeout_seconds: float = 20.0
     conversation_agent_timeout_seconds: float = 45.0
@@ -130,7 +139,7 @@ class Settings(BaseSettings):
 
     def model_for(
         self,
-        task: Literal["conversation", "content", "review", "illustration_planner"],
+        task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
     ) -> str | None:
         """按任务选择模型；新配置为空时保持 LLM_MODEL 的历史行为。"""
         configured = {
@@ -138,30 +147,33 @@ class Settings(BaseSettings):
             "content": self.content_llm_model,
             "review": self.review_llm_model,
             "illustration_planner": self.illustration_planner_llm_model,
+            "evidence_selector": self.evidence_selector_llm_model,
         }[task]
         return configured or self.llm_model
 
     def base_url_for(
         self,
-        task: Literal["conversation", "content", "review", "illustration_planner"],
+        task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
     ) -> str | None:
         configured = {
             "conversation": self.conversation_openai_base_url,
             "content": self.content_openai_base_url,
             "review": self.review_openai_base_url,
             "illustration_planner": self.illustration_planner_openai_base_url,
+            "evidence_selector": self.evidence_selector_openai_base_url,
         }[task]
         return configured or self.openai_base_url
 
     def api_key_for(
         self,
-        task: Literal["conversation", "content", "review", "illustration_planner"],
+        task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
     ) -> str | None:
         configured = {
             "conversation": self.conversation_openai_api_key,
             "content": self.content_openai_api_key,
             "review": self.review_openai_api_key,
             "illustration_planner": self.illustration_planner_openai_api_key,
+            "evidence_selector": self.evidence_selector_openai_api_key,
         }[task]
         return configured or self.openai_api_key
 
@@ -180,7 +192,7 @@ def structured_output_mode_for(
 
 def model_for(
     settings: Settings,
-    task: Literal["conversation", "content", "review", "illustration_planner"],
+    task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
 ) -> str | None:
     """兼容测试替身与旧调用方的任务模型选择入口。"""
     configured = getattr(settings, f"{task}_llm_model", None)
@@ -189,7 +201,7 @@ def model_for(
 
 def base_url_for(
     settings: Settings,
-    task: Literal["conversation", "content", "review", "illustration_planner"],
+    task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
 ) -> str | None:
     """兼容测试替身与旧调用方的任务服务地址选择入口。"""
     configured = getattr(settings, f"{task}_openai_base_url", None)
@@ -198,7 +210,7 @@ def base_url_for(
 
 def api_key_for(
     settings: Settings,
-    task: Literal["conversation", "content", "review", "illustration_planner"],
+    task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
 ) -> str | None:
     """任务密钥优先；留空时兼容既有 OPENAI_API_KEY。"""
     configured = getattr(settings, f"{task}_openai_api_key", None)

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from app.services.plain_text import normalize_plain_text
+from app.services.plain_text import is_source_footer_line, normalize_plain_text
 
 
 class WechatOfficialAccountError(RuntimeError):
@@ -30,39 +30,43 @@ class WechatRemoteDraft:
 
 
 def render_wechat_html(body: str, inline_image_urls: list[str | dict[str, Any]]) -> str:
-    """将纯文本受审核文案转为最小安全 HTML；不解析 Markdown。"""
-    blocks: list[str] = []
+    """将纯文本受审核文案转为最小安全 HTML；不解析 Markdown。
+
+    插图只出现在正文开头或段落之间：位置被夹在 0 到“最后一段之前”，
+    因此文末（最后一个正文段之后、含来源尾注之前）永远不会追加图片。
+    位置 0 表示正文开头，缺失或非法位置按 0 处理。
+    """
+    lines = [line.strip() for line in normalize_plain_text(body).splitlines() if line.strip()]
+    content_paragraphs = sum(1 for line in lines if not is_source_footer_line(line))
+    max_position = max(content_paragraphs - 1, 0)
     positioned: dict[int, list[str]] = {}
-    tail: list[str] = []
     for item in inline_image_urls:
         if isinstance(item, str):
-            url, position = item, -1
+            url, position = item, 0
         elif isinstance(item, dict):
             url = item.get("url", "")
-            position = item.get("after_paragraph", -1)
+            position = item.get("after_paragraph", 0)
         else:
             continue
         normalized_url = _wechat_inline_image_url(url)
         if normalized_url is None:
             continue
-        url = normalized_url
-        if isinstance(position, int) and position >= 0:
-            positioned.setdefault(position, []).append(url)
-        else:
-            tail.append(url)
+        if not isinstance(position, int) or position < 0:
+            position = 0
+        positioned.setdefault(min(position, max_position), []).append(normalized_url)
+
+    blocks: list[str] = [f'<p><img src="{html.escape(url, quote=True)}" /></p>' for url in positioned.get(0, [])]
     paragraph_index = 0
-    for raw in normalize_plain_text(body).splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        # 纯文本规范化会移除段首空白；微信正文逐段恢复两个全角空格缩进。
-        prefix = "" if line.startswith("原文标题：") else "　　"
+    for line in lines:
+        is_footer = is_source_footer_line(line)
+        # 纯文本规范化会移除段首空白；微信正文逐段恢复两个全角空格缩进，来源行不缩进。
+        prefix = "" if is_footer else "　　"
         blocks.append(f"<p>{prefix}{html.escape(line)}</p>")
+        if is_footer:
+            continue
         paragraph_index += 1
         for url in positioned.get(paragraph_index, []):
             blocks.append(f'<p><img src="{html.escape(url, quote=True)}" /></p>')
-    for url in positioned.get(0, []) + tail:
-        blocks.append(f'<p><img src="{html.escape(url, quote=True)}" /></p>')
     return "".join(blocks)
 
 

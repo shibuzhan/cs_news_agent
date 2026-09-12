@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC
 from hashlib import sha256
+import logging
 import re
 
 from datetime import datetime, timedelta
@@ -53,6 +55,9 @@ from app.storage.tables import (
     utcnow,
 )
 from app.services.plain_text import normalize_plain_text
+
+
+logger = logging.getLogger("news_agent.repositories")
 
 
 class RepositoryError(RuntimeError):
@@ -523,6 +528,7 @@ class ContentRepository:
 
     def create_image_generation_job(
         self, chat_agent_run_id: str, draft_id: str, purpose: str, placement_after_paragraph: int,
+        subject: str = "", style: str = "",
     ) -> ImageGenerationJobRow:
         if purpose not in {"cover", "inline"}:
             raise RepositoryError("图片任务类型仅支持封面或正文插图")
@@ -534,6 +540,8 @@ class ContentRepository:
             draft_id=draft_id,
             purpose=purpose,
             placement_after_paragraph=placement_after_paragraph,
+            subject=(subject or "").strip() or None,
+            style=(style or "").strip() or None,
         )
         self.session.add(row)
         self.session.flush()
@@ -595,6 +603,20 @@ class ContentRepository:
         if row is None or row.draft_id != draft_id:
             raise RepositoryError("草稿插图不存在")
         row.placement_after_paragraph = placement_after_paragraph
+        self.session.flush()
+        return row
+
+    def update_draft_illustration(
+        self, draft_id: str, illustration_id: str, purpose: str, placement_after_paragraph: int
+    ) -> DraftIllustrationRow:
+        """调整插图的用途（封面/正文）与段位；只改绑定关系，不动素材文件。"""
+        if purpose not in {"cover", "inline"}:
+            raise RepositoryError("插图用途仅支持封面或正文插图")
+        row = self.session.get(DraftIllustrationRow, illustration_id)
+        if row is None or row.draft_id != draft_id:
+            raise RepositoryError("草稿插图不存在")
+        row.purpose = purpose
+        row.placement_after_paragraph = 0 if purpose == "cover" else placement_after_paragraph
         self.session.flush()
         return row
 
@@ -1656,6 +1678,50 @@ class ContentRepository:
         if row is None:
             raise DraftNotFound(f"草稿不存在：{draft_id}")
         return row
+
+    def append_draft_evidence(self, draft_id: str, entries: list[dict]) -> int:
+        """把补充资料（例如改稿时的联网检索结果）并入草稿证据。
+
+        审核与改稿都从 `evidence_json` 取证据：只写进改稿提示词而不落库，
+        审核模型就看不到这些事实，只能把它们判成“来源证据中未出现”。
+        """
+        if not entries:
+            return 0
+        row = self.get_draft(draft_id)
+        existing = list(row.evidence_json or [])
+        known = {str(item.get("id")) for item in existing if isinstance(item, dict)}
+        prefix = "search"
+        appended = 0
+        for entry in entries:
+            if not isinstance(entry, dict) or not str(entry.get("content") or "").strip():
+                continue
+            index = len([item for item in existing if str(item.get("id", "")).startswith(prefix)]) + 1
+            candidate = f"{prefix}-{index}"
+            while candidate in known:
+                index += 1
+                candidate = f"{prefix}-{index}"
+            known.add(candidate)
+            existing.append({**entry, "id": candidate, "origin": "revision_search"})
+            appended += 1
+        if appended:
+            row.evidence_json = existing
+            self.session.flush()
+        return appended
+
+    def expire_stale_auto_review_run(self, draft_id: str, timeout_seconds: int) -> None:
+        """清理僵死的审核任务：服务重启或超时中断会让记录永远停在 running，并挡住新的审核。"""
+        row = self.find_active_auto_review_run(draft_id)
+        if row is None:
+            return
+        created_at = row.created_at
+        if created_at is None or created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC) if created_at else utcnow()
+        if (utcnow() - created_at).total_seconds() < max(timeout_seconds, 60):
+            return
+        self.finish_auto_review_run(
+            row.id, "failed", {}, {}, "上次自动审核任务已中断（超时或服务重启），已自动清理，可重新发起审核。"
+        )
+        logger.warning("auto_review_run_expired draft_id=%s review_id=%s", draft_id, row.id)
 
     def edit_draft(self, draft_id: str, patch: DraftEdit) -> DraftRow:
         row = self.get_draft(draft_id)

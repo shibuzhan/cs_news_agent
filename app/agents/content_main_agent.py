@@ -110,6 +110,15 @@ class ContentMainAgent:
         self.settings = settings
         self.graph = self._build_graph()
 
+    @staticmethod
+    def is_targeted_batch(batch: CollectionBatch) -> bool:
+        """是否为“用户点名项目”的抓取批次。
+
+        这类批次已经只包含指定的那一个仓库并带回了 README：不参与榜单热度排序，
+        也不套用“已介绍过就跳过”的过滤，更不重复请求 README。
+        """
+        return batch.selection_metadata.get("mode") == "project"
+
     def _build_graph(self):
         def plan_node(state: MainAgentState) -> MainAgentState:
             command = AgentCollectCommand.model_validate(state["command"])
@@ -128,8 +137,10 @@ class ContentMainAgent:
             for source_name in state["selected_sources"]:
                 source = SourceKind(source_name)
                 tool = self.tools[source]
+                # 只有点名项目的 GitHub 采集才带 target：它按 owner/repo 抓取，不读榜单。
+                target = command.target if source == SourceKind.GITHUB else None
                 batch = await tool.invoke(
-                    CollectionToolRequest(source=source, limit=command.limit)
+                    CollectionToolRequest(source=source, limit=command.limit, target=target)
                 )
                 batches.append(batch)
                 tool_results.append(tool.result_from_batch(batch).model_dump(mode="json"))
@@ -142,6 +153,17 @@ class ContentMainAgent:
             for batch in state["batches"]:
                 if batch.source_kind != SourceKind.GITHUB.value or batch.error:
                     batches.append(batch)
+                    continue
+                if self.is_targeted_batch(batch):
+                    metadata = {
+                        **batch.selection_metadata,
+                        "candidate_count": len(batch.items),
+                        "selected_project": batch.items[0].external_id if batch.items else None,
+                    }
+                    batches.append(replace(batch, selection_metadata=metadata))
+                    for result in tool_results:
+                        if result.get("source") == SourceKind.GITHUB.value:
+                            result["before_enrichment"] = metadata
                     continue
                 selected, excluded_before_rank = await asyncio.to_thread(
                     self.github_candidate_filter, batch.items
@@ -166,6 +188,24 @@ class ContentMainAgent:
             for batch in state["batches"]:
                 if batch.source_kind != SourceKind.GITHUB.value or batch.error:
                     batches.append(batch)
+                    continue
+                if self.is_targeted_batch(batch):
+                    # README 已在按项目抓取时取回，不重复请求；也不套用榜单排序过滤。
+                    metadata = {
+                        **batch.selection_metadata,
+                        "readme_requested": len(batch.items),
+                        "readme_available": sum(
+                            item.metadata.get("readme_fetch_status") == "success"
+                            for item in batch.items
+                        ),
+                    }
+                    batches.append(replace(batch, selection_metadata=metadata))
+                    for result in tool_results:
+                        if result.get("source") == SourceKind.GITHUB.value:
+                            result["readme_enrichment"] = {
+                                "requested": metadata["readme_requested"],
+                                "available": metadata["readme_available"],
+                            }
                     continue
                 enriched = await self.tools[SourceKind.GITHUB].enrich_items(
                     batch.selected_items or []

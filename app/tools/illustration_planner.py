@@ -1,4 +1,4 @@
-"""受控配图规划：决定数量与位置，不暴露模型推理过程。"""
+"""受控配图规划：决定数量、位置与池内主体，不暴露模型推理过程。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from openai import OpenAI
 
 from app.config import Settings, api_key_for, base_url_for, model_for
 from app.observability import langsmith_enabled
+from app.services.image_brief import ImageBrief, load_brief, pick_object, pick_objects, pick_style, spread_categories
+from app.services.plain_text import is_source_footer_line
 from app.storage.repositories import ContentRepository
 from app.tools.image_generation import GeneratedIllustration, ImageGenerationTool
 
@@ -18,20 +20,23 @@ from app.tools.image_generation import GeneratedIllustration, ImageGenerationToo
 logger = logging.getLogger("news_agent.illustration_planner")
 MAX_AUTO_ILLUSTRATIONS = 3
 
-# 同一篇文章的插图通过不同的视觉角色区分，避免每一段都生成同一种蓝色芯片或代码屏幕。
+# 仅当来源写作 Skill 的 `references/image-brief.md` 不可用时才使用的兜底方向（例如未知来源或资源目录
+# 缺失）。四条方向只用真实介质与实物，不再回到 isometric 模块图、抽象数据流这类最容易显得像 AI 的构图。
 INLINE_VISUAL_DIRECTIONS = (
-    "an isometric system architecture with layered modules and flowing connections",
-    "a calm developer workflow scene using abstract tools and physical desk objects, no people",
-    "an abstract data-flow landscape with distinct input, processing, and output structures",
-    "a close-up conceptual mechanism showing constraints, checks, and feedback loops",
-    "a wide technical environment illustrating deployment or real-world use context",
+    "a close-up photograph of one simple physical object on a matte desk, soft directional daylight, shallow depth of field",
+    "a documentary photograph of a tidy workspace corner with analog tools, cool window light, no people",
+    "a two-colour risograph print of flat geometric shapes, visible paper grain, slight ink misregistration",
+    "a still-life photograph of stacked blank paper and one small metal tool under hard side light",
 )
 
 
 def visual_direction_for(purpose: str, placement_after_paragraph: int) -> str:
     """稳定地给异步图片任务分配不同构图，不依赖队列中的临时内存。"""
     if purpose == "cover":
-        return "a high-information-density editorial hero composition with one clear focal technical concept"
+        return (
+            "an editorial still-life photograph of one everyday object on a neutral paper backdrop, "
+            "hard directional light, generous negative space"
+        )
     return INLINE_VISUAL_DIRECTIONS[(max(placement_after_paragraph, 1) - 1) % len(INLINE_VISUAL_DIRECTIONS)]
 
 
@@ -39,6 +44,10 @@ def visual_direction_for(purpose: str, placement_after_paragraph: int) -> str:
 class IllustrationPlan:
     placements: list[int]
     mode: str
+    # 与 placements 一一对应的实物池条目；池不可用时为空元组。
+    subjects: tuple[str, ...] = ()
+    # 与 placements 一一对应的风格池条目：同一篇内每张图风格也不同。
+    styles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,21 +62,104 @@ class PublicationAssetSelectionError(RuntimeError):
 
 
 def _paragraphs(body: str) -> list[str]:
+    """正文自然段：来源尾注与文末提示行不计入，也不参与插图定位。"""
     return [
         item.strip() for item in body.replace("\r", "").split("\n\n")
-        if item.strip() and not item.lstrip("　 ").startswith("原文标题：")
+        if item.strip() and not is_source_footer_line(item.lstrip("　 "))
     ]
 
 
-def fallback_plan(body: str) -> IllustrationPlan:
+def _inline_limit(paragraphs: list[str]) -> int:
+    """正文插图的位置上限：最后一段之前，保证文末不出现插图。"""
+    return max(len(paragraphs) - 1, 0)
+
+
+def fallback_plan(
+    body: str,
+    brief: ImageBrief | None = None,
+    draft_id: str | None = None,
+) -> IllustrationPlan:
     paragraphs = _paragraphs(body)
-    if len(paragraphs) < 3:
+    if len(paragraphs) < 2:
         return IllustrationPlan([], "deterministic")
+    limit = _inline_limit(paragraphs)
     if len(paragraphs) >= 6:
-        return IllustrationPlan([2, 4, 5], "deterministic")
-    if len(paragraphs) >= 5:
-        return IllustrationPlan([2, 4], "deterministic")
-    return IllustrationPlan([2], "deterministic")
+        candidates = [2, 4, 5]
+    elif len(paragraphs) >= 5:
+        candidates = [2, 4]
+    else:
+        candidates = [2]
+    placements = [position for position in candidates if position <= limit]
+    return IllustrationPlan(
+        placements,
+        "deterministic",
+        pick_objects(brief, draft_id, "inline", placements),
+        tuple(pick_style(brief, draft_id, "inline", position) for position in placements),
+    )
+
+
+def subject_for(draft, purpose: str, placement_after_paragraph: int = 1) -> str:
+    """按草稿 ID 在来源实物池里轮换一个主体；没有 brief 时返回空串。"""
+    brief = load_brief(getattr(getattr(draft, "source_item", None), "source_kind", None))
+    return pick_object(brief, getattr(draft, "id", None), purpose, placement_after_paragraph)
+
+
+def style_for(draft, purpose: str = "cover", placement_after_paragraph: int = 1) -> str:
+    """按草稿 ID 在来源风格池里轮换一条风格；没有 brief 时返回空串。"""
+    brief = load_brief(getattr(getattr(draft, "source_item", None), "source_kind", None))
+    return pick_style(brief, getattr(draft, "id", None), purpose, placement_after_paragraph)
+
+
+def _rotated_styles(
+    brief: ImageBrief | None,
+    base_index: object,
+    count: int,
+    draft_id: str | None = None,
+    placements: list[int] | None = None,
+) -> tuple[str, ...]:
+    """把模型给出的起始风格编号按插图顺序错开，得到每张图各自的风格。
+
+    模型没给有效编号时，用草稿 ID 与第一张图的位置哈希出起点，再逐张错开。
+    """
+    if brief is None or not brief.styles or count <= 0:
+        return tuple("" for _ in range(max(count, 0)))
+    if isinstance(base_index, int) and 1 <= base_index <= len(brief.styles):
+        start = base_index - 1
+    else:
+        first_position = placements[0] if placements else 1
+        base_style = pick_style(brief, draft_id, "inline", first_position)
+        start = brief.styles.index(base_style) if base_style in brief.styles else 0
+    return tuple(brief.styles[(start + offset) % len(brief.styles)] for offset in range(count))
+
+
+def _plan_prompt(brief: ImageBrief | None, paragraphs: list[str], title: str) -> str:
+    """把风格池与实物池编号后交给规划模型；模型只返回编号，不能自创池外内容。"""
+    article = (
+        f"文章标题：{title}；正文段落："
+        + json.dumps(paragraphs, ensure_ascii=False)
+    )
+    if brief is None:
+        return (
+            "你是资讯文章配图规划器。只返回 JSON：placements（整数数组）。"
+            "根据正文结构决定是否需要正文插图、插几张及每张应插在第几段后。"
+            f"最多 {MAX_AUTO_ILLUSTRATIONS} 张；没有必要可返回空数组。"
+            "禁止封面、品牌、人物、截图或正文以外的信息。不要输出解释或推理。"
+            f"{article}"
+        )
+    styles = "\n".join(f"{index + 1}. {item}" for index, item in enumerate(brief.styles))
+    objects = "\n".join(f"{index + 1}. {item}" for index, item in enumerate(brief.objects))
+    return (
+        "你是资讯文章配图规划器。只返回 JSON："
+        '{"style_index":2,"placements":[{"after_paragraph":2,"subject_index":3}]}。'
+        "style_index 为整篇文章挑一条统一的画面风格；placements 为每张正文插图决定插在第几段之后，"
+        "并从实物清单里挑选最贴合该段内容的一个实物。"
+        f"正文插图最多 {MAX_AUTO_ILLUSTRATIONS} 张；没有必要可返回空数组。"
+        "两个编号都只能填清单里已有的编号，不得填写编号以外的内容、不得描述颜色或自行发明实物；"
+        "不要输出解释或推理。\n"
+        f"风格清单：\n{styles}\n"
+        f"实物清单：\n{objects}\n"
+        f"{article}"
+    )
 
 
 class IllustrationPlanner:
@@ -76,23 +168,20 @@ class IllustrationPlanner:
 
     def decide(self, draft) -> IllustrationPlan:
         paragraphs = _paragraphs(draft.body)
+        brief = load_brief(getattr(getattr(draft, "source_item", None), "source_kind", None))
+        draft_id = getattr(draft, "id", None)
         selected_model = model_for(self.settings, "illustration_planner")
         selected_api_key = api_key_for(self.settings, "illustration_planner")
         if not (self.settings.llm_enabled and selected_api_key and selected_model):
-            return fallback_plan(draft.body)
-        prompt = (
-            "你是资讯文章配图规划器。只返回 JSON：placements（整数数组）。"
-            "根据正文结构决定是否需要正文插图、插几张及每张应插在第几段后。"
-            f"最多 {MAX_AUTO_ILLUSTRATIONS} 张；没有必要可返回空数组。"
-            "禁止封面、品牌、人物、截图或正文以外的信息。不要输出解释或推理。"
-            f"文章标题：{(draft.title_options_json or [''])[0]}；正文段落："
-            + json.dumps(paragraphs, ensure_ascii=False)
-        )
+            return fallback_plan(draft.body, brief, draft_id)
+        prompt = _plan_prompt(brief, paragraphs, (draft.title_options_json or [""])[0])
         try:
             logger.info(
-                "illustration_plan_llm_started draft_id=%s model_category=illustration_planner model=%s",
+                "illustration_plan_llm_started draft_id=%s model_category=illustration_planner model=%s styles=%s objects=%s",
                 getattr(draft, "id", "unknown"),
                 selected_model,
+                len(brief.styles) if brief else 0,
+                len(brief.objects) if brief else 0,
             )
             client = OpenAI(
                 api_key=selected_api_key,
@@ -107,12 +196,39 @@ class IllustrationPlanner:
                 response_format={"type": "json_object"}, temperature=0,
             )
             payload = json.loads(response.choices[0].message.content or "{}")
-            raw = payload.get("placements", [])
-            placements = sorted({int(item) for item in raw if isinstance(item, int) and 1 <= item <= len(paragraphs)})[:MAX_AUTO_ILLUSTRATIONS]
-            return IllustrationPlan(placements, "llm")
+            # 位置夹在“最后一段之前”，模型给出文末位置时自动前移。
+            limit = _inline_limit(paragraphs)
+            placements: list[int] = []
+            subjects: list[str] = []
+            raw_style = payload.get("style_index")
+            for item in payload.get("placements", []):
+                if isinstance(item, int):
+                    position, chosen_index = item, None
+                elif isinstance(item, dict):
+                    position, chosen_index = item.get("after_paragraph"), item.get("subject_index")
+                else:
+                    continue
+                if not isinstance(position, int) or not 1 <= position <= limit or position in placements:
+                    continue
+                placements.append(position)
+                # 只接受池内编号；越界、缺失或类型不对时按草稿 ID 轮换，模型无法自创实物。
+                if brief and isinstance(chosen_index, int) and 1 <= chosen_index <= len(brief.objects):
+                    subjects.append(brief.objects[chosen_index - 1])
+                else:
+                    subjects.append(pick_object(brief, draft_id, "inline", position))
+                if len(placements) == MAX_AUTO_ILLUSTRATIONS:
+                    break
+            # 同一篇内避开同一类实物；风格按模型给的起点逐张错开。
+            spread = spread_categories(brief, tuple(subjects), draft_id, "inline", placements)
+            return IllustrationPlan(
+                placements,
+                "llm",
+                spread,
+                _rotated_styles(brief, raw_style, len(placements), draft_id, placements),
+            )
         except Exception as exc:
             logger.warning("illustration_plan_llm_fallback error_type=%s", type(exc).__name__)
-            return fallback_plan(draft.body)
+            return fallback_plan(draft.body, brief, draft_id)
 
     def decide_publication_assets(self, draft, illustrations) -> PublicationAssetSelection:
         """只从已绑定的生成图片中选择公众号封面与正文插图，不接受前端逐张勾选。"""
@@ -199,11 +315,13 @@ class AutoIllustrationTool:
         plan = IllustrationPlanner(self.settings).decide(draft)
         paragraphs = _paragraphs(draft.body)
         generated: list[GeneratedIllustration] = []
-        for position in plan.placements:
+        for index, position in enumerate(plan.placements):
+            subject = plan.subjects[index] if index < len(plan.subjects) else ""
+            style = plan.styles[index] if index < len(plan.styles) else ""
             generated.append(
                 await ImageGenerationTool(self.settings, self.repository).invoke(
                     draft_id, "inline", position, paragraphs[position - 1],
-                    visual_direction_for("inline", position),
+                    visual_direction_for("inline", position), subject, style,
                 )
             )
         return {

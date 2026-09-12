@@ -11,7 +11,10 @@ def build_collectors(client: httpx.AsyncClient, settings: Settings) -> dict[str,
     return {
         "arxiv": ArxivCollector(client, settings.arxiv_category_list),
         "github": GitHubTrendingCollector(
-            client, settings.source_response_max_bytes, settings.source_content_max_chars
+            client,
+            settings.source_response_max_bytes,
+            settings.source_content_max_chars,
+            token=settings.github_token,
         ),
         "hacker_news": HackerNewsCollector(
             client, settings.source_response_max_bytes, settings.source_content_max_chars

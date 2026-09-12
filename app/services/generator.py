@@ -3,22 +3,27 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
 
 from langsmith.wrappers import wrap_openai
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 from app.agents.content_task_agents import RestrictedContentTaskAgent
 from app.config import Settings, api_key_for, base_url_for, model_for
 from app.domain.models import DraftContent, NormalizedItem, SourceKind
 from app.observability import langsmith_enabled
+from app.paths import agent_skills_dir
+from app.services.model_errors import generation_failure_message, is_provider_error
+from app.services.evidence_selector import build_evidence
 from app.services.plain_text import (
     NATURAL_ARTICLE_MIN_CHARS,
+    article_length_band,
     compose_natural_article,
     format_source_body,
     normalize_wechat_description,
+    select_evidence_text,
 )
 from app.services.term_policy import terminology_guidance
 from app.tools.search_tools import ExaMcpSearchError, ExaMcpSearchTool
@@ -42,14 +47,52 @@ class GenerationError(RuntimeError):
     pass
 
 
+def _run_coroutine(coro):
+    """在同步代码里执行协程，并兼容“调用方已经在事件循环里”的情况。
+
+    采集任务通过 `asyncio.to_thread` 调用生成器（独立线程，没有运行中的循环），
+    而原记录重生成是在 ARQ 协程里直接调用的——此时 `asyncio.run()` 会抛
+    `RuntimeError: asyncio.run() cannot be called from a running event loop`。
+    因此在检测到运行中的循环时，改在一次性线程里跑它自己的循环。
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 def _natural_article_instruction(min_chars: int, max_chars: int) -> str:
-    minimum = max(min_chars, NATURAL_ARTICLE_MIN_CHARS)
+    """写作指令按「结构 / 语言 / 事实 / 输出」分层，避免一整段长约束被模型漏读。"""
+    target_low, target_high, minimum, maximum = article_length_band(min_chars, max_chars)
     return (
-        "正文必须返回 body：一个纯文本字符串，使用 4 到 8 个自然段，并以空行分隔。"
-        "文章应自然覆盖背景与切入、技术或过程、价值与边界、后续观察这四类信息，但不必一一对应、"
-        "也不要写出这些名称、任何小标题、编号或“先说结论”。正文建议控制在 "
-        f"{minimum} 到 {max_chars} 个中文字符，且不得少于 {NATURAL_ARTICLE_MIN_CHARS} 个中文字符；"
-        "使用自然、生活化的语言，不得大段复制 README 或原文。"
+        "\n【结构】正文必须返回 body：一个纯文本字符串，使用 4 到 8 个自然段，段落之间以空行分隔。"
+        "全文应覆盖背景与切入、技术或过程、价值与边界、后续观察这几类信息，但**不要每篇都套同一个顺序**，"
+        "也不要写出这些名称、小标题、编号或“先说结论”；让信息自然长出来，允许出现两三句话的短段，长短交替。"
+        "每一段都必须带来来源支持的新信息，不要用空话把段落凑满。"
+        "\n【开头】第一段必须先交代主体与背景：**这是什么（项目/研究/产品名）、谁做的或来自哪里、为什么值得看**，"
+        "然后再进入功能与细节。**每个句子都要有明确主语**，不要写“本地运行后，浏览器中会显示……”"
+        "“安装后即可看到……”这类没有主语、也不说明在看什么的句子；也不要直接从操作步骤或界面现象开头。"
+        "\n【语言】写给普通科技读者：不要“随着……的发展”“在当今……时代”这类万能开头，"
+        "结尾也不要“综上所述”“总的来说”“值得关注的是”这种收束套话。每段只说清一件事，避免通篇都是同样长度的中长句。"
+        "禁止“如果把它放在……的语境里看”“从某种角度看”“在一定程度上”这类翻译腔或空泛铺垫，能直接说清楚的就直接说。"
+        "数字按中文读者习惯写（41987 写成约 4.2 万），单位与量级要与来源一致。"
+        "\n【取材与重点】先选**2 到 3 个要点**，每点用 1 到 2 段展开，其余信息一句话带过即可，不要逐条覆盖来源："
+        "第一点通常是它想解决什么问题、为什么会出现；第二点是它具体能做什么、怎么做到；第三点是普通人怎么用起来、边界在哪里。"
+        "**安装步骤、价格与套餐、官方渠道清单、支持语言列表、命令与参数、版本号一律不写**"
+        "（除非本篇主体就是某个版本的发布公告），这些内容对读者没有价值，也会让文章变成说明书的摘要。"
+        "读者要了解的是这个项目或事件本身：重点写背景（为什么会有它）、能力（它具体能做什么）、用法与适用场景（谁在什么情况下怎么用）。"
+        "不要出现来源文件名（例如 README、仓库摘要、项目简介），也不要把它们当成叙述的主语，直接陈述事实即可。"
+        "正文提到的外部产品、工具、平台或组织名，第一次出现时用半句话自然交代它是什么"
+        "（例如“一个命令行里的编码 agent”），不要用括号堆注解；来源与检索都没有说明的就不展开。"
+        "\n【禁止凑数】不要用“来源没有说明”“没有给出”“无法确认”“只能说明”这类句子充当内容，也不要把同一层意思换句话重复；"
+        "正文里每一段都必须带来新的、来源支持的信息。如果证据只够写几点，就把这几点写清楚、写具体，不要为了篇幅反复议论来源缺了什么。"
+        "\n【事实】只能使用给定的证据包：来源未支持的数字、时间、人物或结论不要写；确需提及就用来源事实直接表述，"
+        "不要用含糊措辞掩盖，也不要大段复制 README 或原文。"
+        "\n【输出】正文建议控制在 "
+        f"{target_low} 到 {target_high} 个中文字符（硬性要求：不得少于 {minimum} 个中文字符、不得超过 {maximum} 个中文字符），"
+        "不要贴着下限写，也不要写到接近上限——超过上限会被规则审核直接判定为不合格。"
         "每段单独成行，服务端会统一处理段首缩进。"
     )
 
@@ -93,7 +136,15 @@ def _source_writing_skill(item: NormalizedItem) -> str:
     folder = _SOURCE_WRITING_SKILLS.get(item.source_kind)
     if not folder:
         return "遵循通用科技资讯事实约束。"
-    skill_root = Path(__file__).resolve().parents[2] / "agent_skills" / folder
+    skills_dir = agent_skills_dir()
+    if skills_dir is None:
+        logger.warning(
+            "source_writing_skill_unavailable source=%s skill=%s reason=asset_root",
+            item.source_kind.value,
+            folder,
+        )
+        return "遵循通用科技资讯事实约束。"
+    skill_root = skills_dir / folder
     entry_path = skill_root / "SKILL.md"
     reference_path = skill_root / "references" / "evidence-and-search.md"
     try:
@@ -101,17 +152,18 @@ def _source_writing_skill(item: NormalizedItem) -> str:
         reference = reference_path.read_text(encoding="utf-8").strip()
         return f"{entry}\n\n## 来源专用参考资料\n{reference}"
     except OSError:
-        logger.warning("source_writing_skill_unavailable source=%s skill=%s", item.source_kind.value, folder)
+        logger.warning(
+            "source_writing_skill_unavailable source=%s skill=%s reason=unreadable root=%s",
+            item.source_kind.value,
+            folder,
+            skills_dir,
+        )
         return "遵循通用科技资讯事实约束。"
 
 
 def _is_recoverable_provider_error(exc: Exception) -> bool:
-    """识别可向用户说明的模型服务故障；不生成确定性替代文案。"""
-    if isinstance(exc, (APIConnectionError, APITimeoutError, TimeoutError, asyncio.TimeoutError)):
-        return True
-    if isinstance(exc, APIStatusError):
-        return exc.status_code == 402 or exc.status_code == 408 or exc.status_code == 429 or exc.status_code >= 500
-    return False
+    """兼容旧调用方；所有供应商错误现在统一脱敏为可操作原因。"""
+    return is_provider_error(exc)
 
 
 class SearchDecision(BaseModel):
@@ -167,11 +219,23 @@ class DeterministicDraftGenerator:
         aggregate = item.metadata.get("evidence")
         if isinstance(aggregate, list) and aggregate:
             return [dict(entry, id=f"evidence-{index}") for index, entry in enumerate(aggregate, start=1)]
-        return [{"id": "source-1", "title": item.title, "url": str(item.url), "summary": item.summary, "content": item.content[:12000]}]
+        return [
+            {
+                "id": "source-1",
+                "title": item.title,
+                "url": str(item.url),
+                "summary": item.summary,
+                "content": item.content[:12000],
+                # 指标与来源字段必须一并进入证据包，否则审核模型无法核对正文引用的数字。
+                "source_name": item.source_name,
+                "published_at": item.published_at.isoformat() if item.published_at else None,
+                "metrics": item.metrics,
+            }
+        ]
 
 
 class ResilientDraftGenerator:
-    """将模型服务故障转为可审计的生成失败，不伪造模型文案。"""
+    """将模型服务故障转为可审计的生成失败，不伪造文案，也不回显供应商原始响应。"""
 
     def __init__(self, primary: DraftGenerator):
         self.primary = primary
@@ -179,25 +243,24 @@ class ResilientDraftGenerator:
     def generate(self, item: NormalizedItem) -> DraftContent:
         try:
             return self.primary.generate(item)
+        except GenerationError:
+            raise
         except Exception as exc:
-            if not _is_recoverable_provider_error(exc):
+            if not is_provider_error(exc):
+                # 非供应商错误（例如真实代码缺陷）保持原样，由上层显示通用失败原因。
                 raise
-            status_code = getattr(exc, "status_code", None)
+            timeout_seconds = getattr(
+                getattr(self.primary, "settings", None), "content_llm_timeout_seconds", None
+            )
+            reason = generation_failure_message(exc, timeout_seconds)
             logger.warning(
-                "draft_generation_provider_failed source=%s external_id=%s error_type=%s status_code=%s",
+                "draft_generation_provider_failed source=%s external_id=%s error_type=%s status_code=%s reason=%s",
                 item.source_kind.value,
                 item.external_id,
                 type(exc).__name__,
-                status_code,
+                getattr(exc, "status_code", None),
+                reason,
             )
-            if isinstance(exc, (APITimeoutError, TimeoutError, asyncio.TimeoutError)):
-                reason = "内容模型请求超时，未在等待时限内收到响应"
-            elif isinstance(exc, APIConnectionError):
-                reason = "内容模型连接失败，请检查代理或网络连接"
-            elif status_code is not None:
-                reason = f"内容模型服务返回 HTTP {status_code}"
-            else:
-                reason = "内容模型服务暂时不可用"
             raise GenerationError(reason) from exc
 
 
@@ -221,7 +284,9 @@ class OpenAICompatibleDraftGenerator:
         facts = {
             "title": item.title,
             "summary": item.summary,
-            "content": item.content[: self.settings.llm_evidence_max_chars],
+            "content": build_evidence(
+                self.settings, item.content, self.settings.llm_evidence_max_chars, item.external_id
+            ),
             "category": item.category.value,
             "source_name": item.source_name,
             "source_url": str(item.url),
@@ -272,10 +337,24 @@ class OpenAICompatibleDraftGenerator:
                 item.external_id,
                 type(exc).__name__,
             )
-            raise GenerationError(f"LLM 输出不符合草稿结构：{exc}") from exc
+            raise GenerationError("内容模型输出不符合草稿结构，请重试或检查模型配置") from exc
 
     def _evidence_pack(self, item: NormalizedItem) -> list[dict]:
-        return [{"id": "source-1", "title": item.title, "url": str(item.url), "summary": item.summary, "content": item.content[: self.settings.llm_evidence_max_chars]}]
+        return [
+            {
+                "id": "source-1",
+                "title": item.title,
+                "url": str(item.url),
+                "summary": item.summary,
+                "content": build_evidence(
+                    self.settings, item.content, self.settings.llm_evidence_max_chars, item.external_id
+                ),
+                # 指标与来源字段必须一并进入证据包，否则审核模型无法核对正文引用的数字。
+                "source_name": item.source_name,
+                "published_at": item.published_at.isoformat() if item.published_at else None,
+                "metrics": item.metrics,
+            }
+        ]
 
 
 class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
@@ -309,11 +388,11 @@ class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
         aggregate = item.metadata.get("evidence")
         if isinstance(aggregate, list) and aggregate:
             return [dict(entry, id=f"evidence-{index}") for index, entry in enumerate(aggregate, start=1)]
-        return [{"id": "source-1", "title": item.title, "url": str(item.url), "summary": item.summary, "content": item.content[: self.settings.llm_evidence_max_chars], "metrics": item.metrics}]
+        return [{"id": "source-1", "title": item.title, "url": str(item.url), "summary": item.summary, "content": select_evidence_text(item.content, self.settings.llm_evidence_max_chars), "metrics": item.metrics}]
 
     def _search_evidence(self, queries: list[str]) -> list[dict]:
         try:
-            return asyncio.run(self.search_tool.search(queries))
+            return _run_coroutine(self.search_tool.search(queries))
         except ExaMcpSearchError:
             logger.warning("draft_generation_search_skipped query_count=%s", len(queries))
             return []
@@ -334,9 +413,15 @@ class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
             if self.search_tool.enabled:
                 decision_payload = self._json(
                     fast_model,
-                    "你是科技资讯检索规划器。只根据来源证据判断：是否需要补充读者理解所需的背景、技术优点、部署或使用语境，"
-                    "或来源未解释的专有名词。只有确有必要补充且可获得公开可靠资料时才设置 need_search=true；"
-                    "最多给出 2 条自然语言检索词，不得检索个人隐私、凭据或与选题无关的信息。"
+                    "你是科技资讯检索规划器。只根据来源证据判断：是否需要补充读者理解所需的背景、技术优点、使用或部署语境，"
+                    "或来源未解释的专有名词。"
+                    "**正文会提到来源里的外部产品、工具、平台与组织名**（编码工具、编辑器、厂商、服务等）："
+                    "只有当某个名称不解释就读不懂文章主体时才需要检索（例如文章核心讲的项目、方法或平台）；"
+                    "仅仅出现在“支持/兼容/也可用于”这类列举里的工具名不必检索。"
+                    "需要安装或使用方式时也可检索，但优先补齐与主体相关的名称与背景，而不是补充命令细节。"
+                    "只有确有必要补充且可获得公开可靠资料时才设置 need_search=true；"
+                    "最多给出 2 条自然语言检索词（优先把最关键的 1 到 2 个名称放进检索词），"
+                    "不得检索个人隐私、凭据或与选题无关的信息。"
                     "输出 JSON：need_search、queries、reason。\n证据包："
                     + json.dumps({"evidence": evidence}, ensure_ascii=False),
                 )
@@ -349,11 +434,14 @@ class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
                 "你是科技资讯写作者。只能使用证据包和选题规划。"
                 + _natural_article_instruction(self.settings.draft_body_min_chars, self.settings.draft_body_max_chars)
                 + terminology_guidance()
-                + "联网补充证据只可用于背景、技术优点、部署或使用语境的准确说明，不能补造项目事实。\n来源专用写作规则：\n"
+                + "联网补充证据只可用于背景、技术优点、名称与使用语境的准确说明，不能补造项目事实；"
+                "如果联网证据说明了某个外部产品、工具或组织的来历，就用半句话写进正文，帮助读者看懂它是什么。\n来源专用写作规则：\n"
                 + _source_writing_skill(item)
                 + "\nbody 必须为纯文本，不得使用 Markdown、HTML、列表符号、图片链接、原文标题或原文链接；来源标题由服务端统一添加，链接由公众号“阅读原文”承载。"
                 "summary_cn 是公众号 description：一句吸引点击但不夸张的导语，30 到 60 个中文字符、不得换行。"
                 "输出 JSON：title_options、summary_cn、body、tags、card_script、claim_citations。claim_citations 为数组，每项含 claim 和 evidence_ids；"
+                "只对写进正文的具体事实（数字、版本、许可、时间、外部结论）标注，"
+                "普通叙述、过渡句与常识性说明不必逐句标注，也不要为了标注而把句子写得不自然。"
                 "所有 evidence_ids 必须来自证据包。不得虚构数字、时间、人物或结论。\n证据包："
                 + json.dumps(facts, ensure_ascii=False)
                 + "\n规划："
@@ -408,7 +496,7 @@ class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
                 item.external_id,
                 type(exc).__name__,
             )
-            raise GenerationError(f"增强生成输出不符合结构：{exc}") from exc
+            raise GenerationError("增强生成输出不符合结构，请重试或检查模型配置") from exc
 
 
 def build_generator(settings: Settings) -> DraftGenerator:

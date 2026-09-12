@@ -26,3 +26,6 @@ frontend/.build-check/
 .docker-build-app.err.log
 .pytest-tmp/
 .check-probe/
+
+# 本地配图样例（仅用于人工比对，不进入仓库）
+image_samples/

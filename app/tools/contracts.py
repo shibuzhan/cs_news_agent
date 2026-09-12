@@ -8,10 +8,11 @@ from app.domain.models import SourceKind
 
 
 class CollectionToolRequest(BaseModel):
-    """每个采集 Tool 只接受已登记来源和受限条数。"""
+    """每个采集 Tool 只接受已登记来源和受限条数；`target` 为点名的具体项目。"""
 
     source: SourceKind
     limit: int = Field(ge=1, le=50)
+    target: str | None = Field(default=None, max_length=200)
 
 
 class CollectionToolResult(BaseModel):

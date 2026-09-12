@@ -192,6 +192,9 @@ class ImageGenerationJobRow(Base):
     )
     purpose: Mapped[str] = mapped_column(String(20), default="inline")
     placement_after_paragraph: Mapped[int] = mapped_column(Integer, default=1)
+    # 规划阶段选中的风格（文章级）与实物（每张图）；为空表示按草稿 ID 轮换（历史任务与未启用规划时）。
+    style: Mapped[str | None] = mapped_column(Text, nullable=True)
+    subject: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
     arq_job_id: Mapped[str | None] = mapped_column(String(100), nullable=True, unique=True)
     illustration_id: Mapped[str | None] = mapped_column(

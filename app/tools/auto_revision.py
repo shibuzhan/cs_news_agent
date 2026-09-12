@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from langsmith.wrappers import wrap_openai
 from openai import OpenAI
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.config import Settings, api_key_for, base_url_for, model_for
 from app.observability import langsmith_enabled
 from app.services.model_errors import model_failure_message
 from app.services.plain_text import (
     NATURAL_ARTICLE_MIN_CHARS,
+    NaturalArticleError,
+    article_length_band,
     compose_natural_article,
     normalize_wechat_description,
 )
@@ -30,6 +33,21 @@ class RevisionPayload(BaseModel):
     summary_cn: str = Field(min_length=1, max_length=1000)
     body: str = Field(min_length=1, max_length=10000)
     tags: list[str] = Field(default_factory=list, max_length=10)
+
+    # 与文案子 Agent 相同的形态兼容：模型偶尔把列表字段写成字符串、把正文写成段落数组。
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _coerce_tags(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in re.split(r"[,，、;；]+", value) if item.strip()][:10]
+        return value
+
+    @field_validator("body", mode="before")
+    @classmethod
+    def _coerce_body(cls, value: object) -> object:
+        if isinstance(value, list):
+            return "\n\n".join(str(item).strip() for item in value if str(item).strip())
+        return value
 
 
 @dataclass(frozen=True)
@@ -56,12 +74,42 @@ def revision_issues(rule_report: dict, model_report: dict) -> list[str]:
     return issues[:12]
 
 
+def _search_evidence_section(search_evidence: list[dict] | None) -> str:
+    """改稿提示词里的联网补充段落；没有资料时返回空串，保持原提示词不变。"""
+    if not search_evidence:
+        return ""
+    lines: list[str] = []
+    for entry in search_evidence[:2]:
+        if not isinstance(entry, dict):
+            continue
+        title = " ".join(str(entry.get("title") or "").split())[:120]
+        content = " ".join(str(entry.get("content") or "").split())[:1200]
+        if not content:
+            continue
+        lines.append(f"- {title}：{content}" if title else f"- {content}")
+    if not lines:
+        return ""
+    return (
+        "联网补充资料（只能用于为正文里的外部名称与背景补一句准确说明，不得用于编造项目事实、"
+        "不得据此改写来源事实，也不要把正文写成安装教程）：\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
 class AutoRevisionTool:
     def __init__(self, settings: Settings, repository: ContentRepository):
         self.settings = settings
         self.repository = repository
 
-    def invoke(self, draft_id: str, rule_report: dict, model_report: dict, draft=None) -> AutoRevisionResult:
+    def invoke(
+        self,
+        draft_id: str,
+        rule_report: dict,
+        model_report: dict,
+        draft=None,
+        search_evidence: list[dict] | None = None,
+    ) -> AutoRevisionResult:
         selected_model = model_for(self.settings, "content")
         selected_api_key = api_key_for(self.settings, "content")
         if not (self.settings.llm_enabled and selected_api_key and selected_model):
@@ -71,16 +119,29 @@ class AutoRevisionTool:
         if not issues:
             raise AutoRevisionError("审核未提供可执行的改稿意见")
         evidence = draft.evidence_json[:12]
+        target_low, target_high, minimum_chars, maximum_chars = article_length_band(
+            self.settings.draft_body_min_chars, self.settings.draft_body_max_chars
+        )
+        search_section = _search_evidence_section(search_evidence)
         prompt = (
             "你是科技资讯编辑，只能根据来源证据和审核意见改写草稿。返回 JSON：summary_cn、body、tags。"
             "不可改变来源名称、来源链接、原文标题或任何未被证据支持的事实；不要编造数据、人物或结论。"
-            "body 必须使用 4 到 8 个自然段，以空行分隔；应自然覆盖背景、技术或过程、价值与边界、后续观察，"
+            "body 必须使用 4 到 8 个自然段，以空行分隔；"
+            f"正文长度目标是 {target_low} 到 {target_high} 个中文字符——"
+            f"硬性要求：不得少于 {minimum_chars} 个中文字符，也不得超过 {maximum_chars} 个中文字符"
+            "（超过上限会被规则审核直接判为不合格，不要写到接近上限）。"
+            "删减重复或空泛内容时也不得低于下限，宁可保留必要的细节和判断依据。"
+            "应自然覆盖背景、技术或过程、价值与边界、后续观察，"
             "但不要在正文写出这些名称、显式段落标题、编号、原文标题或链接。"
-            "body 必须为纯文本，不用 Markdown、HTML。语气自然、生活化，但避免绝对化表述。每段段首缩进和原文标题尾注由服务端处理。"
+            "body 必须为纯文本，不用 Markdown、HTML。每段段首缩进和原文标题尾注由服务端处理。"
+            "语气自然、直接、生活化，避免绝对化表述；"
+            "不得使用“如果把它放在……的语境里看”“从某种角度看”“在一定程度上”这类翻译腔或空泛铺垫，"
+            "能直接说清楚的就直接说；来源没有支持的细节就删掉或简化，不要用含糊措辞掩盖。"
             + terminology_guidance()
             + "不得把术语替换成无来源的近义说法。"
             "summary_cn 是 30 到 60 字、吸引点击但不夸张的一句话导语。\n"
-            f"来源名称：{draft.source_name}\n原文标题：{draft.source_item.title}\n来源链接：{draft.source_url}\n"
+            + search_section
+            + f"来源名称：{draft.source_name}\n原文标题：{draft.source_item.title}\n来源链接：{draft.source_url}\n"
             f"来源证据：{json.dumps(evidence, ensure_ascii=False)}\n"
             f"当前摘要：{draft.summary_cn}\n当前正文：{draft.body[:7000]}\n"
             f"审核意见：{json.dumps(issues, ensure_ascii=False)}"
@@ -120,6 +181,10 @@ class AutoRevisionTool:
                 tags=[tag.strip("# ") for tag in payload.tags if tag.strip("# ")],
                 article_shape=article_shape,
             )
+        except NaturalArticleError as exc:
+            # 正文形态由服务端规则决定；这里给出具体原因，避免只显示“不符合结构”。
+            logger.warning("auto_revision_article_rejected draft_id=%s reason=%s", draft_id, exc)
+            raise AutoRevisionError(f"自动改稿正文不符合要求：{exc}") from exc
         except (ValidationError, ValueError, KeyError, json.JSONDecodeError) as exc:
             logger.warning("auto_revision_invalid draft_id=%s error_type=%s", draft_id, type(exc).__name__)
             raise AutoRevisionError("自动改稿输出不符合结构") from exc

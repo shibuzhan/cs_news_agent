@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 import app.services.auto_delivery as auto_delivery
+from app.domain.models import SourceKind
+from app.services.image_brief import load_brief
 from app.services.wechat_official import render_wechat_html
 from app.tools.auto_review import _blocking_issue_count, _review_score, rule_review
 from app.tools.auto_revision import revision_issues
@@ -74,31 +76,41 @@ def test_deterministic_illustration_plan_decides_count_and_positions_from_articl
 
 @pytest.mark.asyncio
 async def test_auto_illustration_plans_before_generating_and_binds_each_position(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str, int, str, str]] = []
+    calls: list[tuple[str, str, int, str, str, str, str]] = []
 
     class Repository:
         def get_draft(self, _draft_id):
             return SimpleNamespace(
                 id="draft-1",
                 body="\n\n".join([f"　　第 {index} 段正文" for index in range(1, 6)]),
+                source_item=SimpleNamespace(source_kind="github"),
             )
 
     class ImageTool:
         def __init__(self, *_args) -> None:
             pass
 
-        async def invoke(self, draft_id, purpose, position, context, visual_direction=""):
-            calls.append((draft_id, purpose, position, context, visual_direction))
+        async def invoke(self, draft_id, purpose, position, context, visual_direction="", subject="", style=""):
+            calls.append((draft_id, purpose, position, context, visual_direction, subject, style))
             return GeneratedIllustration(f"illustration-{position}", f"asset-{position}", purpose, position)
 
     monkeypatch.setattr("app.tools.illustration_planner.ImageGenerationTool", ImageTool)
     result = await AutoIllustrationTool(
         SimpleNamespace(llm_enabled=False, openai_api_key=None, llm_model=None), Repository()
     ).invoke("draft-1")
+    brief = load_brief(SourceKind.GITHUB)
+    assert brief is not None
 
     assert result["placements"] == [2, 4]
     assert [call[2] for call in calls] == [2, 4]
     assert calls[0][4] != calls[1][4]
+    # 规划阶段就在两个池里定好风格与主体，并随调用传给图片 Tool。
+    assert all(call[5] in brief.objects for call in calls)
+    assert calls[0][5] != calls[1][5]
+    assert all(call[6] in brief.styles for call in calls)
+    # 同一篇内每张图的风格也不同。
+    assert calls[0][6] != calls[1][6]
+    assert len({call[5] for call in calls}) == 2
     assert result["generated_illustration_ids"] == ["illustration-2", "illustration-4"]
 
 
@@ -194,7 +206,11 @@ async def test_auto_review_rewrites_once_then_keeps_failed_final_result(monkeypa
     repository = Repository()
 
     result = await auto_delivery.auto_review_and_create_wechat_draft(
-        SimpleNamespace(), repository, "draft-1", "chat-run-1"
+        # 改稿前联网补充在本用例中关闭：只验证“重写一次后保留失败结论”的流程。
+        SimpleNamespace(revision_search_enabled=False, exa_mcp_enabled=False),
+        repository,
+        "draft-1",
+        "chat-run-1",
     )
 
     assert result["status"] == "failed"

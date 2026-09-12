@@ -31,16 +31,17 @@ class AttachmentAccessError(AttachmentError):
     pass
 
 
-def validate_attachment(filename: str, content: bytes, settings: Settings) -> str:
+def validate_attachment(
+    filename: str, content: bytes, settings: Settings, max_bytes: int | None = None
+) -> str:
+    limit = settings.attachment_max_bytes if max_bytes is None else max_bytes
     suffix = Path(filename).suffix.casefold()
     if suffix not in ALLOWED_TEXT_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS:
         raise AttachmentValidationError("仅支持 .txt、.md、.csv、.jpg、.jpeg、.png 文件")
     if not content:
         raise AttachmentValidationError("不允许上传空文件")
-    if len(content) > settings.attachment_max_bytes:
-        raise AttachmentValidationError(
-            f"附件不能超过 {settings.attachment_max_bytes // (1024 * 1024)} MB"
-        )
+    if len(content) > limit:
+        raise AttachmentValidationError(f"附件不能超过 {limit // (1024 * 1024)} MB")
     return suffix
 
 
@@ -52,9 +53,9 @@ def validate_text_attachment(filename: str, content: bytes, settings: Settings) 
 
 
 def validate_image_attachment(
-    filename: str, content: bytes, content_type: str, settings: Settings
+    filename: str, content: bytes, content_type: str, settings: Settings, max_bytes: int | None = None
 ) -> str:
-    suffix = validate_attachment(filename, content, settings)
+    suffix = validate_attachment(filename, content, settings, max_bytes)
     expected_types = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
     if suffix not in expected_types or content_type != expected_types.get(suffix):
         raise AttachmentValidationError("发布图片仅支持 JPG、JPEG、PNG 文件")
@@ -82,8 +83,10 @@ class PrivateAttachmentStore:
             secure=settings.minio_secure,
         )
 
-    def upload(self, filename: str, content: bytes, content_type: str) -> tuple[str, str]:
-        suffix = validate_attachment(filename, content, self.settings)
+    def upload(
+        self, filename: str, content: bytes, content_type: str, max_bytes: int | None = None
+    ) -> tuple[str, str]:
+        suffix = validate_attachment(filename, content, self.settings, max_bytes)
         try:
             self._ensure_private_bucket()
             object_key = f"attachments/{uuid4()}{suffix}"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -22,6 +23,30 @@ class ContentCategory(StrEnum):
     PRODUCT_UPDATE = "产品更新"
     DAILY_OBSERVATION = "日常观察"
     NEEDS_REVIEW = "待人工判断"
+
+
+# 用户点名的 GitHub 项目：接受 owner/repo 或仓库链接，统一归一化为 owner/repo。
+_GITHUB_URL_TARGET = re.compile(
+    r"^(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+_GITHUB_SLUG_TARGET = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$")
+
+
+def normalize_github_target(value: object) -> str | None:
+    """把用户给出的仓库写成 owner/repo；无法识别时返回 None（调用方据此回落榜单采集）。"""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().strip("，,。.、；;：:（）()【】[]<>\"'")
+    if not text:
+        return None
+    for pattern in (_GITHUB_URL_TARGET, _GITHUB_SLUG_TARGET):
+        match = pattern.match(text)
+        if match:
+            owner, repo = match.group(1), match.group(2)
+            if owner and repo and repo not in {".", ".."}:
+                return f"{owner}/{repo}"
+    return None
 
 
 class ReviewStatus(StrEnum):
@@ -56,6 +81,9 @@ class ConversationIntent(StrEnum):
     ATTACHMENT_DRAFT = "attachment_draft"
     GENERATE_DRAFT_IMAGE = "generate_draft_image"
     REGENERATE_DRAFT = "regenerate_draft"
+    # 用户回答 agent 的追问：现在就跑自动审核 / 复用已有配图。
+    RUN_AUTO_REVIEW = "run_auto_review"
+    REUSE_DRAFT_ASSETS = "reuse_draft_assets"
 
 
 class ConversationRunStatus(StrEnum):
@@ -144,6 +172,18 @@ class AgentCollectCommand(BaseModel):
     action: Literal["collect"] = "collect"
     sources: list[SourceKind] = Field(default_factory=list, max_length=4)
     limit: int = Field(default=25, ge=1, le=50)
+    # 用户点名的具体项目（owner/repo）。设置后 GitHub 走“按项目抓取”，不再读 Trending 榜单。
+    target: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def normalize_target(self) -> AgentCollectCommand:
+        if self.target is None:
+            return self
+        normalized = normalize_github_target(self.target)
+        if normalized is None:
+            raise ValueError("target 必须是 GitHub 仓库（owner/repo 或仓库链接）")
+        self.target = normalized
+        return self
 
     @model_validator(mode="after")
     def reject_duplicate_sources(self) -> AgentCollectCommand:
@@ -187,6 +227,8 @@ class ConversationDecision(BaseModel):
     limit: int = Field(default=5, ge=1, le=20)
     schedule_text: str | None = Field(default=None, max_length=500)
     platform: str | None = Field(default=None, max_length=100)
+    # 用户点名了具体 GitHub 项目时填写 owner/repo；没有点名则留空（按来源榜单采集）。
+    target: str | None = Field(default=None, max_length=200)
     draft_id: str | None = Field(default=None, max_length=36)
     auto_illustration: bool = False
     image_purpose: Literal["cover", "inline"] = "inline"

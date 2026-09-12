@@ -15,7 +15,7 @@ from deepagents import create_deep_agent
 from deepagents.backends.state import StateBackend
 from langchain.agents.structured_output import ToolStrategy
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.agents.content_deep_agent import _configure_profile
 from app.config import (
@@ -25,6 +25,7 @@ from app.config import (
     model_for,
     structured_output_mode_for,
 )
+from app.services.model_errors import schema_error_fields
 
 
 logger = logging.getLogger("news_agent.content_task_agents")
@@ -44,6 +45,39 @@ class DraftWritingResponse(BaseModel):
     card_script: list[str] = Field(default_factory=list, max_length=6)
     claim_citations: list[dict[str, Any]] = Field(default_factory=list)
 
+    # 模型偶尔把列表字段写成字符串（`card_script` 已实际出现过）。这里只做**格式兼容**：
+    # 不新增、不改写任何内容，超出长度上限时按上限截断，避免整条草稿因格式失败。
+    @field_validator("title_options", mode="before")
+    @classmethod
+    def _coerce_title_options(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        return value
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _coerce_tags(cls, value: object) -> object:
+        if isinstance(value, str):
+            # 只按显式分隔符拆分：标签本身常含空格（如 “GitHub Trending”“coding agent”）。
+            return [item.strip() for item in re.split(r"[,，、;；]+", value) if item.strip()][:10]
+        return value
+
+    @field_validator("card_script", mode="before")
+    @classmethod
+    def _coerce_card_script(cls, value: object) -> object:
+        if isinstance(value, str):
+            lines = [line.strip() for line in value.splitlines() if line.strip()]
+            return (lines or [value.strip()])[:6]
+        return value
+
+    @field_validator("body", mode="before")
+    @classmethod
+    def _coerce_body(cls, value: object) -> object:
+        # 兼容历史的 body_sections 形态：数组合并为纯文本段落。
+        if isinstance(value, list):
+            return "\n\n".join(str(item).strip() for item in value if str(item).strip())
+        return value
+
 
 class ReviewIssue(BaseModel):
     type: str = Field(min_length=1, max_length=120)
@@ -57,6 +91,28 @@ class ReviewResponse(BaseModel):
     score: int = Field(ge=0, le=100)
     issues: list[ReviewIssue] = Field(default_factory=list, max_length=30)
     summary: str = Field(default="", max_length=2000)
+    # 审核模型顺手指出的、需要联网补一句说明的外部名称；复用审核调用，不额外增加模型请求。
+    search_queries: list[str] = Field(default_factory=list, max_length=2)
+
+    @field_validator("search_queries", mode="before")
+    @classmethod
+    def _coerce_search_queries(cls, value: object) -> list[str]:
+        """只保留 1 到 2 条短检索词：兼容字符串、去空、去重、截断超长项。"""
+        if isinstance(value, str):
+            raw: list[object] = [value]
+        elif isinstance(value, list):
+            raw = value
+        else:
+            return []
+        queries: list[str] = []
+        for item in raw:
+            text = " ".join(str(item).split()) if item is not None else ""
+            if not text or text in queries:
+                continue
+            queries.append(text[:80])
+            if len(queries) == 2:
+                break
+        return queries
 
 
 _WRITER_SYSTEM_PROMPT = """你是资讯运营 Agent 内部的文案生成子 Agent。
@@ -219,6 +275,15 @@ class RestrictedContentTaskAgent:
         except ContentTaskAgentError:
             raise
         except Exception as exc:
+            # 只在本地日志记录出错字段与错误类型，不记录模型返回内容。
+            logger.warning(
+                "content_task_agent_schema_invalid task=%s agent=%s structured_output_mode=%s error_type=%s fields=%s",
+                self.task,
+                name,
+                mode,
+                type(exc).__name__,
+                schema_error_fields(exc),
+            )
             raise ContentTaskAgentError(f"{name} 返回结果不符合结构") from exc
         logger.info(
             "content_task_agent_finished task=%s model_category=%s model=%s agent=%s structured_output_mode=%s",
