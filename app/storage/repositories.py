@@ -59,6 +59,18 @@ from app.services.plain_text import normalize_plain_text
 
 logger = logging.getLogger("news_agent.repositories")
 
+# 生成记录（任务队列）里可见的运行类型：生成、附件成稿、配图、自动审核与审核决定。
+GENERATION_RECORD_INTENTS: tuple[str, ...] = (
+    ConversationIntent.COLLECT_NEWS.value,
+    ConversationIntent.ATTACHMENT_DRAFT.value,
+    ConversationIntent.REGENERATE_DRAFT.value,
+    ConversationIntent.GENERATE_DRAFT_IMAGE.value,
+    ConversationIntent.RUN_AUTO_REVIEW.value,
+    "approve_draft",
+    "discard_draft",
+    "revoke_approval",
+)
+
 
 class RepositoryError(RuntimeError):
     pass
@@ -817,7 +829,7 @@ class ContentRepository:
             self.session.scalars(
                 select(ChatAgentRunRow)
                 .where(
-                    ChatAgentRunRow.intent == ConversationIntent.COLLECT_NEWS.value,
+                    ChatAgentRunRow.intent.in_(GENERATION_RECORD_INTENTS),
                     ChatAgentRunRow.status == ConversationRunStatus.RUNNING.value,
                     ChatAgentRunRow.attempt_started_at <= cutoff,
                 )
@@ -871,11 +883,14 @@ class ContentRepository:
         return run_id
 
     def list_generation_chat_agent_runs(self, limit: int = 100) -> list[ChatAgentRunRow]:
-        """生成记录页使用的终态/运行态任务列表，不混入普通对话和计划确认。"""
+        """生成记录页使用的终态/运行态任务列表，不混入普通对话和计划确认。
+
+        生成、审核、配图、审核决定都是“任务”，都要在队列里可见；只有纯对话与计划确认不进列表。
+        """
         return list(
             self.session.scalars(
                 select(ChatAgentRunRow)
-                .where(ChatAgentRunRow.intent == ConversationIntent.COLLECT_NEWS.value)
+                .where(ChatAgentRunRow.intent.in_(GENERATION_RECORD_INTENTS))
                 .order_by(ChatAgentRunRow.created_at.desc())
                 .limit(limit)
             )
