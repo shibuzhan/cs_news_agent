@@ -2276,3 +2276,17 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 249
+
+- 用户指令：将项目合适的部分上传到 GitHub。经确认选择：全部文档一并公开（含 `process.md`、`progress.md`、`findings.md`、`task_plan.md`）；提交作者邮箱改为 GitHub noreply。
+- 影响范围：`.gitignore`（新增本地缓存、构建与验证产物的排除项）、Git 首次提交与 `origin/main` 推送、仓库级 `user.email` 与凭据助手配置；未修改业务代码、运行配置或数据库。
+- 处理结论：目标仓库 `https://github.com/shibuzhan/cs_news_agent` 原为空的 PUBLIC 仓库，无需新建。首次提交 `4e138b5` 共 177 个文件，排除 `.env`、`.pnpm-store/`（12,996 个文件）、`.docker-build-app*.log`、`frontend/dist/`、`runtime_logs/*.log` 与两个验证临时目录。提交前对**暂存内容**再做凭据扫描：`sk-`、`lsv2_pt_`、微信 AppID/AppSecret、Exa Key、Agnes Key 各模式均 0 命中，`.env` 未进入暂存区。作者邮箱改为仓库级 `<GitHubID>+shibuzhan@users.noreply.github.com`（ID 取自 `gh api user`），不修改全局 Git 配置。
+- 验证：`gh repo view` 返回 `isEmpty=false`、默认分支 `main`；`git ls-remote` 为 `4e138b55860fdc98df59439680c0feb161a8677c`，与本地提交一致；GitHub API 核对远端 177 个 blob，且 `.env`、`.pnpm-store`、`frontend/dist`、`runtime_logs/*.log` 均不存在；提交作者 email 为 noreply 形式并在页面上归属 `shibuzhan`。
+- 环境说明：本机 git 的 HTTPS 需 `-c http.sslBackend=openssl`（默认 schannel 在受限环境下失败），推送经宿主本地代理 `http://127.0.0.1:7895`；凭据由仓库级 `credential.https://github.com.helper="!gh auth git-credential"` 提供，其进程需要更宽执行权限才能创建信号管道。后续推送可复用同一命令。
+- 风险提示：公开仓库无法撤回已抓取的内容。本次按确认公开了历史过程文档，其中包含一次历史出口 IP 与公众号接口权限审计结论；如需回收必须重写历史或删除仓库。
+- 授权状态：已确认并完成
+
+-->
