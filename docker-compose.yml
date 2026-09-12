@@ -1,0 +1,248 @@
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-news_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-news_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build: .
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FILE: /app/runtime_logs/app.log
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-cs-news-agent}
+      LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+      LANGSMITH_WORKSPACE_ID: ${LANGSMITH_WORKSPACE_ID:-}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-news_agent}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-news_agent}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      CONVERSATION_OPENAI_BASE_URL: ${CONVERSATION_OPENAI_BASE_URL:-}
+      CONTENT_OPENAI_BASE_URL: ${CONTENT_OPENAI_BASE_URL:-}
+      REVIEW_OPENAI_BASE_URL: ${REVIEW_OPENAI_BASE_URL:-}
+      ILLUSTRATION_PLANNER_OPENAI_BASE_URL: ${ILLUSTRATION_PLANNER_OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CONVERSATION_OPENAI_API_KEY: ${CONVERSATION_OPENAI_API_KEY:-}
+      CONTENT_OPENAI_API_KEY: ${CONTENT_OPENAI_API_KEY:-}
+      REVIEW_OPENAI_API_KEY: ${REVIEW_OPENAI_API_KEY:-}
+      ILLUSTRATION_PLANNER_OPENAI_API_KEY: ${ILLUSTRATION_PLANNER_OPENAI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      CONVERSATION_LLM_MODEL: ${CONVERSATION_LLM_MODEL:-}
+      CONTENT_LLM_MODEL: ${CONTENT_LLM_MODEL:-}
+      REVIEW_LLM_MODEL: ${REVIEW_LLM_MODEL:-}
+      ILLUSTRATION_PLANNER_LLM_MODEL: ${ILLUSTRATION_PLANNER_LLM_MODEL:-}
+      LLM_STRUCTURED_OUTPUT_MODE: ${LLM_STRUCTURED_OUTPUT_MODE:-tool}
+      CONVERSATION_STRUCTURED_OUTPUT_MODE: ${CONVERSATION_STRUCTURED_OUTPUT_MODE:-}
+      CONTENT_STRUCTURED_OUTPUT_MODE: ${CONTENT_STRUCTURED_OUTPUT_MODE:-}
+      REVIEW_STRUCTURED_OUTPUT_MODE: ${REVIEW_STRUCTURED_OUTPUT_MODE:-}
+      LLM_ENABLED: ${LLM_ENABLED:-false}
+      DEEP_AGENT_ENABLED: ${DEEP_AGENT_ENABLED:-false}
+      EXA_MCP_ENABLED: ${EXA_MCP_ENABLED:-false}
+      EXA_MCP_URL: ${EXA_MCP_URL:-https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa}
+      EXA_API_KEY: ${EXA_API_KEY:-}
+      EXA_SEARCH_MAX_QUERIES: ${EXA_SEARCH_MAX_QUERIES:-2}
+      EXA_SEARCH_MAX_RESULTS: ${EXA_SEARCH_MAX_RESULTS:-5}
+      EXA_SEARCH_RESULT_MAX_CHARS: ${EXA_SEARCH_RESULT_MAX_CHARS:-6000}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
+      MINIO_BUCKET: ${MINIO_BUCKET:-chat-attachments}
+      ATTACHMENT_DOWNLOAD_SECRET: ${ATTACHMENT_DOWNLOAD_SECRET:-change-me-before-production}
+      ATTACHMENT_LINK_TTL_SECONDS: ${ATTACHMENT_LINK_TTL_SECONDS:-900}
+      ATTACHMENT_MAX_BYTES: ${ATTACHMENT_MAX_BYTES:-2097152}
+      APP_BASE_URL: ${APP_BASE_URL:-http://127.0.0.1:8000}
+      ARXIV_CATEGORIES: ${ARXIV_CATEGORIES:-cs.AI,cs.CL,cs.LG}
+      RSS_FEEDS: ${RSS_FEEDS:-https://github.blog/changelog/feed/}
+      COLLECT_LIMIT: ${COLLECT_LIMIT:-25}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-20}
+      CONVERSATION_AGENT_TIMEOUT_SECONDS: ${CONVERSATION_AGENT_TIMEOUT_SECONDS:-45}
+      CONTENT_LLM_TIMEOUT_SECONDS: ${CONTENT_LLM_TIMEOUT_SECONDS:-600}
+      CONTENT_LLM_MAX_RETRIES: ${CONTENT_LLM_MAX_RETRIES:-0}
+      SOURCE_RESPONSE_MAX_BYTES: ${SOURCE_RESPONSE_MAX_BYTES:-1000000}
+      SOURCE_CONTENT_MAX_CHARS: ${SOURCE_CONTENT_MAX_CHARS:-500000}
+      LLM_EVIDENCE_MAX_CHARS: ${LLM_EVIDENCE_MAX_CHARS:-12000}
+      DRAFT_BODY_MIN_CHARS: ${DRAFT_BODY_MIN_CHARS:-800}
+      DRAFT_BODY_MAX_CHARS: ${DRAFT_BODY_MAX_CHARS:-3200}
+      AUTO_REVIEW_PASS_SCORE: ${AUTO_REVIEW_PASS_SCORE:-85}
+      HTTP_PROXY: ${OUTBOUND_HTTP_PROXY:-}
+      HTTPS_PROXY: ${OUTBOUND_HTTPS_PROXY:-}
+      ALL_PROXY: ${OUTBOUND_ALL_PROXY:-}
+      NO_PROXY: ${OUTBOUND_NO_PROXY:-localhost,127.0.0.1,postgres,redis,minio,app,worker}
+      LOCAL_PROXY_CA_FILE: ${LOCAL_PROXY_CA_FILE:-/opt/news-agent-local-ca/steamtools-root-ca.crt}
+      REDIS_URL: redis://redis:6379/0
+      SOURCE_STALE_AFTER_MINUTES: ${SOURCE_STALE_AFTER_MINUTES:-120}
+      WECHAT_APP_ID: ${WECHAT_APP_ID:-}
+      WECHAT_APP_SECRET: ${WECHAT_APP_SECRET:-}
+      WECHAT_API_TIMEOUT_SECONDS: ${WECHAT_API_TIMEOUT_SECONDS:-45}
+      IMAGE_GENERATION_ENABLED: ${IMAGE_GENERATION_ENABLED:-false}
+      IMAGE_GENERATION_PROVIDER: ${IMAGE_GENERATION_PROVIDER:-agnes}
+      IMAGE_GENERATION_BASE_URL: ${IMAGE_GENERATION_BASE_URL:-https://apihub.agnes-ai.com}
+      IMAGE_GENERATION_API_KEY: ${IMAGE_GENERATION_API_KEY:-}
+      IMAGE_GENERATION_MODEL: ${IMAGE_GENERATION_MODEL:-agnes-image-2.5-flash}
+      IMAGE_GENERATION_SIZE: ${IMAGE_GENERATION_SIZE:-1024x1024}
+      IMAGE_GENERATION_TIMEOUT_SECONDS: ${IMAGE_GENERATION_TIMEOUT_SECONDS:-900}
+      COLLECTION_JOB_TIMEOUT_SECONDS: ${COLLECTION_JOB_TIMEOUT_SECONDS:-900}
+      IMAGE_GENERATION_JOB_TIMEOUT_SECONDS: ${IMAGE_GENERATION_JOB_TIMEOUT_SECONDS:-1200}
+      AUTO_WECHAT_DRAFT_ENABLED: ${AUTO_WECHAT_DRAFT_ENABLED:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000},http://localhost:5173,http://127.0.0.1:5173
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      workspace-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      redis:
+        condition: service_started
+    volumes:
+      - ./.local-certs:/opt/news-agent-local-ca:ro
+      - ./runtime_logs:/app/runtime_logs
+      - agent_workspace_data:/app/agent_workspace
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    environment:
+      VITE_API_BASE_URL: http://127.0.0.1:8000/api
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      app:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: arq app.worker.WorkerSettings
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FILE: /app/runtime_logs/worker.log
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-cs-news-agent}
+      LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+      LANGSMITH_WORKSPACE_ID: ${LANGSMITH_WORKSPACE_ID:-}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-news_agent}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-news_agent}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      CONVERSATION_OPENAI_BASE_URL: ${CONVERSATION_OPENAI_BASE_URL:-}
+      CONTENT_OPENAI_BASE_URL: ${CONTENT_OPENAI_BASE_URL:-}
+      REVIEW_OPENAI_BASE_URL: ${REVIEW_OPENAI_BASE_URL:-}
+      ILLUSTRATION_PLANNER_OPENAI_BASE_URL: ${ILLUSTRATION_PLANNER_OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CONVERSATION_OPENAI_API_KEY: ${CONVERSATION_OPENAI_API_KEY:-}
+      CONTENT_OPENAI_API_KEY: ${CONTENT_OPENAI_API_KEY:-}
+      REVIEW_OPENAI_API_KEY: ${REVIEW_OPENAI_API_KEY:-}
+      ILLUSTRATION_PLANNER_OPENAI_API_KEY: ${ILLUSTRATION_PLANNER_OPENAI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      CONVERSATION_LLM_MODEL: ${CONVERSATION_LLM_MODEL:-}
+      CONTENT_LLM_MODEL: ${CONTENT_LLM_MODEL:-}
+      REVIEW_LLM_MODEL: ${REVIEW_LLM_MODEL:-}
+      ILLUSTRATION_PLANNER_LLM_MODEL: ${ILLUSTRATION_PLANNER_LLM_MODEL:-}
+      LLM_STRUCTURED_OUTPUT_MODE: ${LLM_STRUCTURED_OUTPUT_MODE:-tool}
+      CONVERSATION_STRUCTURED_OUTPUT_MODE: ${CONVERSATION_STRUCTURED_OUTPUT_MODE:-}
+      CONTENT_STRUCTURED_OUTPUT_MODE: ${CONTENT_STRUCTURED_OUTPUT_MODE:-}
+      REVIEW_STRUCTURED_OUTPUT_MODE: ${REVIEW_STRUCTURED_OUTPUT_MODE:-}
+      LLM_ENABLED: ${LLM_ENABLED:-false}
+      DEEP_AGENT_ENABLED: ${DEEP_AGENT_ENABLED:-false}
+      EXA_MCP_ENABLED: ${EXA_MCP_ENABLED:-false}
+      EXA_MCP_URL: ${EXA_MCP_URL:-https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa}
+      EXA_API_KEY: ${EXA_API_KEY:-}
+      EXA_SEARCH_MAX_QUERIES: ${EXA_SEARCH_MAX_QUERIES:-2}
+      EXA_SEARCH_MAX_RESULTS: ${EXA_SEARCH_MAX_RESULTS:-5}
+      EXA_SEARCH_RESULT_MAX_CHARS: ${EXA_SEARCH_RESULT_MAX_CHARS:-6000}
+      # Worker 运行在 Docker 网络中，不能使用主机侧 localhost:9000。
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
+      MINIO_BUCKET: ${MINIO_BUCKET:-chat-attachments}
+      REDIS_URL: redis://redis:6379/0
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-20}
+      CONVERSATION_AGENT_TIMEOUT_SECONDS: ${CONVERSATION_AGENT_TIMEOUT_SECONDS:-45}
+      CONTENT_LLM_TIMEOUT_SECONDS: ${CONTENT_LLM_TIMEOUT_SECONDS:-600}
+      CONTENT_LLM_MAX_RETRIES: ${CONTENT_LLM_MAX_RETRIES:-0}
+      SOURCE_RESPONSE_MAX_BYTES: ${SOURCE_RESPONSE_MAX_BYTES:-1000000}
+      SOURCE_CONTENT_MAX_CHARS: ${SOURCE_CONTENT_MAX_CHARS:-500000}
+      LLM_EVIDENCE_MAX_CHARS: ${LLM_EVIDENCE_MAX_CHARS:-12000}
+      DRAFT_BODY_MIN_CHARS: ${DRAFT_BODY_MIN_CHARS:-800}
+      DRAFT_BODY_MAX_CHARS: ${DRAFT_BODY_MAX_CHARS:-3200}
+      AUTO_REVIEW_PASS_SCORE: ${AUTO_REVIEW_PASS_SCORE:-85}
+      IMAGE_GENERATION_ENABLED: ${IMAGE_GENERATION_ENABLED:-false}
+      IMAGE_GENERATION_PROVIDER: ${IMAGE_GENERATION_PROVIDER:-agnes}
+      IMAGE_GENERATION_BASE_URL: ${IMAGE_GENERATION_BASE_URL:-https://apihub.agnes-ai.com}
+      IMAGE_GENERATION_API_KEY: ${IMAGE_GENERATION_API_KEY:-}
+      IMAGE_GENERATION_MODEL: ${IMAGE_GENERATION_MODEL:-agnes-image-2.5-flash}
+      IMAGE_GENERATION_SIZE: ${IMAGE_GENERATION_SIZE:-1024x1024}
+      IMAGE_GENERATION_TIMEOUT_SECONDS: ${IMAGE_GENERATION_TIMEOUT_SECONDS:-900}
+      COLLECTION_JOB_TIMEOUT_SECONDS: ${COLLECTION_JOB_TIMEOUT_SECONDS:-900}
+      IMAGE_GENERATION_JOB_TIMEOUT_SECONDS: ${IMAGE_GENERATION_JOB_TIMEOUT_SECONDS:-1200}
+      AUTO_WECHAT_DRAFT_ENABLED: ${AUTO_WECHAT_DRAFT_ENABLED:-false}
+      WECHAT_APP_ID: ${WECHAT_APP_ID:-}
+      WECHAT_APP_SECRET: ${WECHAT_APP_SECRET:-}
+      WECHAT_API_TIMEOUT_SECONDS: ${WECHAT_API_TIMEOUT_SECONDS:-45}
+      HTTP_PROXY: ${OUTBOUND_HTTP_PROXY:-}
+      HTTPS_PROXY: ${OUTBOUND_HTTPS_PROXY:-}
+      ALL_PROXY: ${OUTBOUND_ALL_PROXY:-}
+      NO_PROXY: ${OUTBOUND_NO_PROXY:-localhost,127.0.0.1,postgres,redis,minio,app,worker}
+      LOCAL_PROXY_CA_FILE: ${LOCAL_PROXY_CA_FILE:-/opt/news-agent-local-ca/steamtools-root-ca.crt}
+    depends_on:
+      workspace-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./.local-certs:/opt/news-agent-local-ca:ro
+      - ./runtime_logs:/app/runtime_logs
+      - agent_workspace_data:/app/agent_workspace
+    restart: unless-stopped
+
+  workspace-init:
+    build: .
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /app/agent_workspace && chown 10001:10001 /app/agent_workspace"]
+    volumes:
+      - agent_workspace_data:/app/agent_workspace
+    restart: "no"
+
+volumes:
+  postgres_data:
+  minio_data:
+  redis_data:
+  agent_workspace_data:

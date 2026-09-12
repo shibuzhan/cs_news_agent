@@ -1,0 +1,11 @@
+.env
+.local-certs/
+runtime_logs/
+.git/
+.idea/
+.jbeval/
+.venv/
+__pycache__/
+.pytest_cache/
+tests/
+*.py[cod]

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Official Blog</title>
+    <item>
+      <guid>official-001</guid>
+      <title>Product Version 2 Released</title>
+      <link>https://example.com/releases/2</link>
+      <description><![CDATA[<p>The new version improves reliability.</p>]]></description>
+      <pubDate>Mon, 01 Sep 2026 12:00:00 GMT</pubDate>
+      <author>Example Team</author>
+    </item>
+  </channel>
+</rss>

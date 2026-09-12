@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>arXiv Query</title>
+  <entry>
+    <id>http://arxiv.org/abs/2609.00001v1</id>
+    <updated>2026-09-01T12:00:00Z</updated>
+    <published>2026-09-01T12:00:00Z</published>
+    <title>Reliable Agent Workflows</title>
+    <summary>We study reliable stateful workflows for language model agents.</summary>
+    <author><name>Alice Example</name></author>
+    <category term="cs.AI" />
+    <link href="https://arxiv.org/abs/2609.00001v1" rel="alternate" type="text/html" />
+  </entry>
+</feed>
