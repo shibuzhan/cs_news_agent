@@ -22,6 +22,7 @@ from app.services.source_media import (
     raw_github_base,
     validate_downloaded_image,
 )
+from app.services.async_bridge import run_coroutine_sync
 from app.services.source_snapshots import DraftSourceSnapshotStore
 from app.storage.database import SessionLocal
 from app.storage.repositories import ContentRepository
@@ -82,8 +83,7 @@ async def _download_image(client: httpx.AsyncClient, image: SourceImage) -> Down
 def build_source_media_tools(session_id: str):
     """构造来源图片 Tool（列出候选 / 下载并绑定）。"""
 
-    @tool("list_source_images")
-    async def list_source_images(draft_id: str = "", include_official_site: bool = False) -> dict[str, Any]:
+    async def _impl_list_source_images(draft_id: str = "", include_official_site: bool = False) -> dict[str, Any]:
         """列出当前文章可用的真实图片来源：项目 README 自带的截图，以及可选的官方页面图。
 
         include_official_site=true 时会用联网检索抓项目官网/文档页（消耗一次检索配额）。
@@ -121,8 +121,7 @@ def build_source_media_tools(session_id: str):
                 "images": [item.__dict__ for item in images[:20]],
             }
 
-    @tool("attach_source_image")
-    async def attach_source_image(
+    async def _impl_attach_source_image(
         url: str, purpose: str = "inline", placement_after_paragraph: int = 1, draft_id: str = ""
     ) -> dict[str, Any]:
         """把一张来源图片（README 或官方页面的图）下载并绑定到当前文章：purpose 为 cover 或 inline。
@@ -199,5 +198,31 @@ def build_source_media_tools(session_id: str):
                 "source_url": url,
                 "message": f"已把来源图片绑定为{'封面' if resolved_purpose == 'cover' else f'第 {placement} 段后的正文插图'}；图片来自 {url}，请在正文中标注来源。",
             }
+
+    # 会话 Agent 同步执行工具：异步实现需要同步外壳（否则 NotImplementedError）。
+    @tool("list_source_images")
+    def list_source_images(draft_id: str = "", include_official_site: bool = False) -> dict[str, Any]:
+        """列出当前文章可用的真实图片来源：项目 README 自带的截图，以及可选的官方页面图。
+
+        include_official_site=true 时会用联网检索抓项目官网/文档页（消耗一次检索配额）。
+        """
+        return run_coroutine_sync(
+            _impl_list_source_images(draft_id=draft_id, include_official_site=include_official_site)
+        )
+
+    @tool("attach_source_image")
+    def attach_source_image(
+        url: str, purpose: str = "inline", placement_after_paragraph: int = 1, draft_id: str = ""
+    ) -> dict[str, Any]:
+        """把一张来源图片（README 或官方页面的图）下载并绑定到当前文章：purpose 为 cover 或 inline。
+
+        只接受项目仓库与官方页面的图；图片会存入私有素材库并标注来源，不会上传或发表。
+        """
+        return run_coroutine_sync(
+            _impl_attach_source_image(
+                url=url, purpose=purpose,
+                placement_after_paragraph=placement_after_paragraph, draft_id=draft_id,
+            )
+        )
 
     return [list_source_images, attach_source_image]

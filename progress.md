@@ -728,3 +728,11 @@
 - 修复：`raw_github_base` 需兼容 Pydantic `HttpUrl`（首版假设字符串，实测崩溃）。
 - 验证：后端 254 项通过、0 失败（新增 6 项）；容器内工具注册与真实来源提取均通过（该项目 README 多为徽章，仅提出 1 张视频封面，说明部分项目需官方页或 AI 配图）。app/worker 已重建。
 - 遗留：容器暂时连不上 api.github.com（网络抖动），下载链路未端到端实测。
+
+## 2026-09-12｜修复“对话模型暂时不可用”（实为工具同步入口缺失）
+
+- 现象：用户自然语言请求返回“对话模型暂时不可用”。app 日志实为 failure_stage=agent_invoke / error_type=NotImplementedError——DeepAgent 同步执行工具，而我新加的 6 个工具只有 async 实现。对话模型端点本身正常（/models 200）。
+- 已修：新增 run_coroutine_sync 桥接；六个工具改为“异步实现 + 同步 @tool 外壳”；并修正修复中自己引入的重复装饰器错误（实现名被绑定成 StructuredTool）。
+- 防复发：新增回归测试遍历全部会话工具，断言都有同步入口（tool.func 非空），并覆盖桥接的两种调用情形。
+- 验证：后端 261 项通过、0 失败；容器内同步 invoke list_source_images → ok；17 个会话工具中仅异步数量 0；app/worker 已重建。
+- Git：本地提交，未推送（用户要求网络不佳时不要反复 push）。

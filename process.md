@@ -2952,3 +2952,18 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 294
+
+- 用户指令：给出对话截图——发送“获取项目真实截图作为截图并覆盖公众号草稿箱”后回复“对话模型暂时不可用，未执行采集、配图、改稿或发布操作”，要求排查。
+- 影响范围：新增 `app/services/async_bridge.py`、`tests/test_session_tools_sync.py`；`app/agent_tools/draft_actions.py`、`app/agent_tools/source_media_tools.py`（异步实现 + 同步外壳）；重建 app/worker。**未发起付费调用**。
+- 根因（与模型无关）：app 日志 `deep_agent_resolution_failed failure_stage=agent_invoke error_type=NotImplementedError`。**DeepAgent 以同步方式执行工具**，而我在变更 292/293 里新加的工具只有 `async def` 实现——LangChain 对“只有 coroutine、没有 sync func”的工具在同步调用时抛 `NotImplementedError`。对话模型端点本身正常（`GET /models` 200、0.3 秒）。
+- 处理结论：新增 `run_coroutine_sync()`（调用方已在事件循环里时改用一次性线程），把六个异步工具改为“**异步实现 `_impl_*` + 同步 `@tool` 外壳**”；同时修正修复过程中我自己引入的一个错误——重命名实现函数后遗留了旧的 `@tool(...)` 装饰器，导致实现名被绑定成 StructuredTool、调用时报 `TypeError: 'StructuredTool' object is not callable`。
+- 处理结论（防复发）：新增回归测试 `test_every_session_tool_has_a_sync_entrypoint`——遍历会话 Agent 注册的全部工具，断言每个工具都有同步入口（`tool.func is not None`），并额外覆盖 `run_coroutine_sync` 在“无循环/已在循环内”两种情形。
+- 验证：后端 **261 项通过、0 失败**（新增 3 项）；重建后在容器内以**同步方式直接 invoke** `list_source_images` → `status=ok`；会话工具共 17 个、仅异步数量为 0；`/api/health` 正常。
+- 遗留：用户的自然语言请求（真实截图 + 覆盖公众号草稿）需要一次会话模型调用才能真正跑通，未擅自触发。
+- 授权状态：已确认并完成
+
+-->

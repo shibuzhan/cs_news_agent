@@ -21,6 +21,7 @@ from app.jobs import (
     enqueue_image_generation_job,
 )
 from app.storage.database import SessionLocal
+from app.services.async_bridge import run_coroutine_sync
 from app.storage.repositories import ContentRepository
 
 
@@ -131,8 +132,7 @@ async def _start_rewrite(
 def build_draft_action_tools(session_id: str):
     """构造只作用于本会话草稿的动作 Tool。"""
 
-    @tool("run_auto_review")
-    async def run_auto_review(draft_id: str = "", deliver: bool = False) -> dict[str, Any]:
+    async def _impl_run_auto_review(draft_id: str = "", deliver: bool = False) -> dict[str, Any]:
         """对当前文章发起自动审核（规则 + 模型审核，并按意见改稿一轮）。
 
         deliver=true 表示审核通过后创建公众号草稿箱记录（不会发表）；默认 false 仅审核。
@@ -148,8 +148,7 @@ def build_draft_action_tools(session_id: str):
         logger.info("agent_tool_run_auto_review session_id=%s draft_id=%s status=%s", session_id, draft_id or "-", result.get("status"))
         return result
 
-    @tool("rewrite_draft")
-    async def rewrite_draft(draft_id: str = "") -> dict[str, Any]:
+    async def _impl_rewrite_draft(draft_id: str = "") -> dict[str, Any]:
         """用已保存的来源证据重写当前文案正文（不重新采集、不新建草稿），覆盖为新版本。"""
         settings = get_settings()
         with SessionLocal() as session:
@@ -197,8 +196,7 @@ def build_draft_action_tools(session_id: str):
         """撤销已通过的审核，使文案回到可编辑状态。"""
         return _review_decision(draft_id, "revoke", note, {ReviewStatus.READY_TO_PUBLISH.value})
 
-    @tool("generate_draft_illustration")
-    async def generate_draft_illustration(
+    async def _impl_generate_draft_illustration(
         purpose: str = "cover", placement_after_paragraph: int = 0, draft_id: str = ""
     ) -> dict[str, Any]:
         """为当前文章生成一张配图：purpose 为 cover 或 inline，inline 需给段位。
@@ -243,8 +241,7 @@ def build_draft_action_tools(session_id: str):
             "message": f"已开始为《{_draft_label(draft)}》生成{'封面图' if resolved == 'cover' else '正文插图'}。",
         }
 
-    @tool("publish_to_wechat_draft")
-    async def publish_to_wechat_draft(draft_id: str = "") -> dict[str, Any]:
+    async def _impl_publish_to_wechat_draft(draft_id: str = "") -> dict[str, Any]:
         """把当前已审核通过的文章投递到微信公众号草稿箱（绝不发表）。
 
         远端草稿已存在时会**原地覆盖**内容与配图（`draft/update`），不会留下重复草稿；
@@ -282,6 +279,44 @@ def build_draft_action_tools(session_id: str):
                 "job_state": job.state,
                 "message": f"{action}（{_draft_label(draft)}），未提交发表。",
             }
+
+    # 会话 Agent 以同步方式执行工具：异步实现必须配同步外壳，否则 LangChain 抛
+    # NotImplementedError（真实故障：对话模型报“暂时不可用”，failure_stage=agent_invoke）。
+    @tool("run_auto_review")
+    def run_auto_review(draft_id: str = "", deliver: bool = False) -> dict[str, Any]:
+        """对当前文章发起自动审核（规则 + 模型审核，并按意见改稿一轮）。
+
+        deliver=true 表示审核通过后创建公众号草稿箱记录（不会发表）；默认 false 仅审核。
+        """
+        return run_coroutine_sync(_impl_run_auto_review(draft_id=draft_id, deliver=deliver))
+
+    @tool("rewrite_draft")
+    def rewrite_draft(draft_id: str = "") -> dict[str, Any]:
+        """用已保存的来源证据重写当前文案正文（不重新采集、不新建草稿），覆盖为新版本。"""
+        return run_coroutine_sync(_impl_rewrite_draft(draft_id=draft_id))
+
+    @tool("generate_draft_illustration")
+    def generate_draft_illustration(
+        purpose: str = "cover", placement_after_paragraph: int = 0, draft_id: str = ""
+    ) -> dict[str, Any]:
+        """为当前文章生成一张配图：purpose 为 cover 或 inline，inline 需给段位。
+
+        只生成并私有保存，不上传公众号、不发表。
+        """
+        return run_coroutine_sync(
+            _impl_generate_draft_illustration(
+                purpose=purpose, placement_after_paragraph=placement_after_paragraph, draft_id=draft_id
+            )
+        )
+
+    @tool("publish_to_wechat_draft")
+    def publish_to_wechat_draft(draft_id: str = "") -> dict[str, Any]:
+        """把当前已审核通过的文章投递到微信公众号草稿箱（绝不发表）。
+
+        远端草稿已存在时会**原地覆盖**内容与配图（`draft/update`），不会留下重复草稿；
+        文案或配图在投递后被修改过时，这一步会把远端草稿刷新到最新内容。
+        """
+        return run_coroutine_sync(_impl_publish_to_wechat_draft(draft_id=draft_id))
 
     return [
         run_auto_review,
