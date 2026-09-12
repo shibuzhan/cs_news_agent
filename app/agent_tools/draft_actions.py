@@ -314,6 +314,69 @@ def build_draft_action_tools(session_id: str):
             "message": f"已开始{'更新' if updating else '创建'}公众号草稿（{_draft_label(draft)}），完成后我会汇报；不会发表。",
         }
 
+    async def _impl_reselect_publication_assets(draft_id: str = "") -> dict[str, Any]:
+        """作废当前投递素材选择并按最新口径重新选择（真实截图优先、AI 配图补足）。
+
+        已投递的草稿会在重选后**原地覆盖**远端公众号草稿；未投递时只固化新的选择。
+        """
+        settings = get_settings()
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(
+                repository, session_id, draft_id,
+                allowed={ReviewStatus.READY_TO_PUBLISH.value, ReviewStatus.DRAFTBOX_CREATED.value},
+            )
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            existing = repository.get_wechat_publication_for_draft(draft.id)
+            updating = bool(existing is not None and existing.wechat_draft_media_id)
+            # 作废旧选择：这样后台投递一定会重新跑素材选择（含视觉识别官方图）。
+            invalidated = repository.invalidate_unfinished_wechat_publication_for_regeneration(
+                draft.id, "用户要求按最新口径重新选择投递配图。"
+            )
+            chat_run = repository.create_chat_agent_run(
+                session_id, None, ConversationIntent.RESELECT_PUBLICATION_ASSETS, False, False
+            )
+            _announce(
+                repository, session_id, chat_run,
+                f"好，正在重新为《{_draft_label(draft)}》选择投递配图（真实截图优先，AI 配图补足）"
+                + ("，完成后会覆盖公众号草稿内容。" if updating else "。"),
+            )
+            repository.add_chat_agent_event(
+                chat_run.id, "重新选择配图已入队",
+                "已作废旧的投递素材选择，将按当前草稿里的全部图片重新选择。",
+                "running",
+                metadata={"phase": "image", "state": "queued", "draft_ids": [draft.id], "reselection": True},
+            )
+            session.commit()
+        try:
+            from app.jobs import enqueue_wechat_delivery_job
+
+            job_id = await enqueue_wechat_delivery_job(settings, draft.id, chat_run.id)
+        except Exception as exc:
+            logger.warning("agent_tool_reselect_enqueue_failed draft_id=%s error_type=%s", draft.id, type(exc).__name__)
+            return {"status": "failed", "draft_id": draft.id, "message": f"重新选择配图任务未能入队：{exc}"}
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            repository.add_chat_agent_event(
+                chat_run.id, "任务已创建", f"任务编号：{job_id}",
+                metadata={"phase": "image", "state": "running", "job_id": job_id, "draft_ids": [draft.id]},
+            )
+            session.commit()
+        logger.info(
+            "agent_tool_reselect_publication_assets draft_id=%s invalidated=%s updating=%s job_id=%s",
+            draft.id, invalidated, updating, job_id,
+        )
+        return {
+            "status": "started",
+            "draft_id": draft.id,
+            "draft_title": _draft_label(draft),
+            "previous_selection_invalidated": invalidated,
+            "updated_remote": updating,
+            "chat_run_id": chat_run.id,
+            "message": f"已开始重新选择《{_draft_label(draft)}》的投递配图，完成后我会汇报。",
+        }
+
     # 会话 Agent 以同步方式执行工具：异步实现必须配同步外壳，否则 LangChain 抛
     # NotImplementedError（真实故障：对话模型报“暂时不可用”，failure_stage=agent_invoke）。
     @tool("run_auto_review")
@@ -352,6 +415,11 @@ def build_draft_action_tools(session_id: str):
         """
         return run_coroutine_sync(_impl_publish_to_wechat_draft(draft_id=draft_id))
 
+    @tool("reselect_publication_assets")
+    def reselect_publication_assets(draft_id: str = "") -> dict[str, Any]:
+        """重新选择投递配图：作废旧选择并按“真实截图优先、AI 配图补足”重选，必要时覆盖远端草稿。"""
+        return run_coroutine_sync(_impl_reselect_publication_assets(draft_id=draft_id))
+
     return [
         run_auto_review,
         rewrite_draft,
@@ -360,4 +428,5 @@ def build_draft_action_tools(session_id: str):
         revoke_approval,
         generate_draft_illustration,
         publish_to_wechat_draft,
+        reselect_publication_assets,
     ]

@@ -67,6 +67,7 @@ GENERATION_RECORD_INTENTS: tuple[str, ...] = (
     ConversationIntent.GENERATE_DRAFT_IMAGE.value,
     ConversationIntent.RUN_AUTO_REVIEW.value,
     ConversationIntent.PUBLISH_TO_WECHAT_DRAFT.value,
+    ConversationIntent.RESELECT_PUBLICATION_ASSETS.value,
     "approve_draft",
     "discard_draft",
     "revoke_approval",

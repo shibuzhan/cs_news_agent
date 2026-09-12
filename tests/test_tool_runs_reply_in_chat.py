@@ -15,7 +15,7 @@ def test_agent_tools_attach_an_assistant_message_to_their_run() -> None:
     source = inspect.getsource(draft_actions)
 
     # 三个会创建后台运行的工具都必须挂一条助手消息。
-    assert source.count("_announce(") >= 4  # 定义 + 审核 + 配图 + 投递
+    assert source.count("_announce(") >= 5  # 定义 + 审核 + 配图 + 投递 + 重选配图
     assert "run.response_message_id = message.id" in source
 
 

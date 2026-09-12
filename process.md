@@ -3075,3 +3075,18 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 301
+
+- 用户指令：同意“发布页加一个‘重新选择配图’按钮”，并要求“也和之前一样作为 tool 给到对话模型，并在聊天框显示”。
+- 影响范围：`app/agent_tools/draft_actions.py`（新增 `reselect_publication_assets` 工具）、`app/domain/models.py`（新增意图 `RESELECT_PUBLICATION_ASSETS`）、`app/storage/repositories.py`（队列白名单）、`app/services/agent_commands.py`（命令映射）、`frontend/src/App.tsx`（发布页按钮）、两个测试文件；重建 app/worker/frontend。**未发起付费调用**（未实际触发重选，避免又消耗一次视觉调用与微信上传）。
+- 处理结论①（工具）：`reselect_publication_assets(draft_id?)` —— 作废当前投递素材选择（`invalidate_unfinished_wechat_publication_for_regeneration`，已投递时保留远端 `media_id` 并标记 `delivery_stale`），再入队既有的 `process_wechat_delivery_job`；后台会重新跑素材选择（含视觉识别官方图），已投递的草稿**原地覆盖**，未投递时只固化新选择。
+- 处理结论②（对话可见）：工具创建运行并调用 `_announce()` 挂一条助手消息，后台结束时由模型汇报，结果落在**聊天框**里，与审核/投递/配图一致。
+- 处理结论③（命令与按钮）：命令解析新增 `重新选择配图`／`重选配图`；发布页在 `ready_to_publish`／`draftbox_created` 状态下显示“重新选择配图”按钮，点击先确认（说明会作废旧选择、已投递草稿会被覆盖），再作为命令发给会话 Agent。
+- 验证：后端 **287 项通过、0 失败**；前端 `tsc` 0 错误；重建后容器内确认 8 个动作工具已注册、两条命令均解析为 `reselect_publication_assets`、前端模块含按钮文案；`/api/health` 正常。
+- 遗留：本轮未实际点击验证（会消耗 1 次视觉选图 + 微信素材上传），按钮与工具路径已就位。
+- 授权状态：已确认并完成
+
+-->

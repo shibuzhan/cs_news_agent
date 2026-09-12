@@ -86,6 +86,8 @@ class ConversationIntent(StrEnum):
     REUSE_DRAFT_ASSETS = "reuse_draft_assets"
     # 投递/更新公众号草稿箱（后台任务，绝不发表）。
     PUBLISH_TO_WECHAT_DRAFT = "publish_to_wechat_draft"
+    # 作废旧选择并重新选择投递配图（后台任务）。
+    RESELECT_PUBLICATION_ASSETS = "reselect_publication_assets"
 
 
 class ConversationRunStatus(StrEnum):
