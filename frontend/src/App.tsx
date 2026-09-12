@@ -636,29 +636,27 @@ function previewParagraphs(body: string) {
 
 function PublicationArticlePreview({ draft, job, illustrations }: { draft: Draft; job: WechatPublicationJob | null; illustrations: DraftIllustration[] }) {
   const currentAssetIds = new Set(illustrations.map((item) => item.asset_id));
-  // 投递选择按用途分别判断：封面只有仍指向当前插图时才采用；正文只有当"选中的正文插图在当前插图里
-  // 存在"时才按选择过滤，否则显示当前全部正文插图——否则"只选了封面、没选正文"会让预览里所有插图消失。
-  const jobCover = job?.cover_asset_id ? illustrations.find((item) => item.asset_id === job.cover_asset_id) : undefined;
-  const cover = jobCover || illustrations.find((item) => item.purpose === "cover");
+  // 预览展示**草稿自己的全部插图**；投递选择只作为提示（否则未入选的插图会像“丢了”一样）。
+  const cover = illustrations.find((item) => item.purpose === "cover")
+    || (job?.cover_asset_id ? illustrations.find((item) => item.asset_id === job.cover_asset_id) : undefined);
+  const inlineIllustrations = illustrations.filter((item) => item.purpose === "inline");
   const selectedInlineIds = (job?.inline_asset_ids || []).filter((assetId) => currentAssetIds.has(assetId));
-  const filterInlineBySelection = selectedInlineIds.length > 0;
+  const deliveryCovers = job?.cover_asset_id && currentAssetIds.has(job.cover_asset_id) ? 1 : 0;
   const paragraphs = previewParagraphs(draft.body);
   // 与后端渲染一致：插图只出现在正文开头或段落之间，越界位置前移到“最后一段之前”。
   const maxPosition = Math.max(paragraphs.length - 1, 0);
   const clampPosition = (value: number) => Math.min(Math.max(value, 0), maxPosition);
-  const inlineByParagraph = illustrations
-    .filter((item) => item.purpose === "inline" && (!filterInlineBySelection || selectedInlineIds.includes(item.asset_id)))
+  const inlineByParagraph = inlineIllustrations
     .reduce<Record<number, DraftIllustration[]>>((result, item) => {
       (result[clampPosition(item.placement_after_paragraph)] ||= []).push(item);
       return result;
     }, {});
-  const inlineCount = Object.values(inlineByParagraph).reduce((total, items) => total + items.length, 0);
-  const coverCount = illustrations.filter((item) => item.purpose === "cover").length;
+  const inlineCount = inlineIllustrations.length;
 
   return <article className="article-preview article-preview-with-images">
     <h2>{draft.title_options[0]}</h2>
     <p className="preview-summary">{draft.summary_cn}</p>
-    {illustrations.length > 0 && <p className="muted">{filterInlineBySelection ? `投递已选：封面 ${jobCover ? 1 : 0} 张、正文插图 ${inlineCount} 张` : `当前草稿共 ${illustrations.length} 张插图（封面 ${coverCount} 张、正文 ${inlineCount} 张；投递未选择正文插图，预览显示全部）`}</p>}
+    {illustrations.length > 0 && <p className="muted">{`草稿共 ${illustrations.length} 张插图（封面 ${cover ? 1 : 0} 张、正文 ${inlineCount} 张）；投递将使用封面 ${deliveryCovers} 张、正文插图 ${selectedInlineIds.length} 张${selectedInlineIds.length < inlineCount ? "（其余插图仅在草稿中保留，不会上传）" : ""}。`}</p>}
     {cover && <img className="publication-preview-cover" src={cover.asset.download_url} alt="文章封面预览" />}
     <div className="preview-body">
       {(inlineByParagraph[0] || []).map((item) => <img className="publication-preview-inline" key={item.id} src={item.asset.download_url} alt="正文插图：正文开头" />)}
