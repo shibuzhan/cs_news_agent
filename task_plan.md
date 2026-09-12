@@ -804,6 +804,16 @@ Phase 77 complete（真实链路验证待用户执行）
 - [x] 确认无活动任务后重建三容器；后端 248 项通过、0 失败；生成记录已含审核运行、前端与容器内均复验。
 - **Status:** complete
 
+### Phase 80: 来源真实截图能力
+
+- [x] 实测 Exa MCP 只有文本工具（web_search_exa / web_fetch_exa），无图片检索。
+- [x] 实现从 README / 官方页 markdown 提取图片链接（过滤徽章、统计图、赞助图、追踪像素、动图、SVG；相对路径解析到 raw.githubusercontent.com）。
+- [x] 下载后按魔数校验类型与体积；只接受候选清单内的 URL。
+- [x] 新增工具 `list_source_images`、`attach_source_image` 并注册进会话 Agent；新增 Skill `source-media`（含版权边界与失败降级）。
+- [x] 后端 254 项通过、0 失败；容器内工具注册与真实来源提取验证；app/worker 已重建。
+- [ ] 下载链路端到端实测（等容器恢复访问 api.github.com / 图片 CDN）。
+- **Status:** complete（端到端实测待网络恢复）
+
 
 
 

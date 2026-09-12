@@ -73,9 +73,12 @@ def _normalize(url: str) -> str:
     return value
 
 
-def raw_github_base(source_url: str) -> str:
-    """GitHub 仓库地址 → README 里相对图片路径的真实基址。"""
-    match = re.match(r"^https?://github\.com/([^/]+)/([^/?#]+)/?$", (source_url or "").strip(), re.IGNORECASE)
+def raw_github_base(source_url: object) -> str:
+    """GitHub 仓库地址 → README 里相对图片路径的真实基址。
+
+    参数可能是 HttpUrl（Pydantic 字段）或字符串，统一转成文本再解析。
+    """
+    match = re.match(r"^https?://github\.com/([^/]+)/([^/?#]+)/?$", str(source_url or "").strip(), re.IGNORECASE)
     if not match:
         return ""
     owner, repo = match.group(1), match.group(2).removesuffix(".git")

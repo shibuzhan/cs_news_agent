@@ -70,6 +70,19 @@ def test_validate_accepts_png_and_rejects_bad_payloads() -> None:
         validate_downloaded_image("https://x/big.png", png, "image/png", max_bytes=1024)
 
 
+def test_raw_github_base_accepts_url_objects_and_variants() -> None:
+    from pydantic import HttpUrl
+
+    from app.services.source_media import raw_github_base
+
+    assert raw_github_base("https://github.com/o/r") == "https://raw.githubusercontent.com/o/r/HEAD/"
+    assert raw_github_base("https://github.com/o/r.git/") == "https://raw.githubusercontent.com/o/r/HEAD/"
+    # 草稿的 source_url 是 Pydantic HttpUrl，不能假设是字符串。
+    assert raw_github_base(HttpUrl("https://github.com/o/r")) == "https://raw.githubusercontent.com/o/r/HEAD/"
+    assert raw_github_base("https://example.com/a/b") == ""
+    assert raw_github_base(None) == ""
+
+
 def test_image_filename_normalizes_extension() -> None:
     assert image_filename("https://cdn.example.com/path/Dashboard.PNG?x=1", "image/png").endswith(".png")
     assert image_filename("https://cdn.example.com/path/demo", "image/jpeg").endswith(".jpg")

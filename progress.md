@@ -720,3 +720,11 @@
 - 审核链路首次完整跑通：首轮 84 分（1 条意见）→ 联网补充并入证据 → 改稿生成 v4 → 复审 89 分 0 意见 → `approved_no_delivery`（通过），ARQ 用时 597 秒。
 - 修正汇报错误：`approved_no_delivery` 未计入“通过”，聊天误报“未通过”；已改判定并加测试。
 - 部署：确认无活动任务后重建三容器；复验生成记录已包含审核运行、前端预览提示与队列白名单、审核进度事件均生效。后端 248 项通过、0 失败。
+
+## 2026-09-12｜来源真实截图能力
+
+- 实测 Exa MCP（`tools/list`）：只有 `web_search_exa`（文本）与 `web_fetch_exa`（网页转 markdown），**没有图片工具**；图片只能从 markdown 链接里提取（README / 官方页）。
+- 已实现（用户选“README + 官网/文档页图”）：`source_media.py` 提取与去噪（徽章/统计图/赞助/追踪像素/动图/SVG 全过滤，相对路径解析到 raw.githubusercontent.com）+ 下载魔数校验；两个 Tool：`list_source_images`、`attach_source_image`；Skill `source-media`；版权边界为“仅来源仓库与项目官方页面”。
+- 修复：`raw_github_base` 需兼容 Pydantic `HttpUrl`（首版假设字符串，实测崩溃）。
+- 验证：后端 254 项通过、0 失败（新增 6 项）；容器内工具注册与真实来源提取均通过（该项目 README 多为徽章，仅提出 1 张视频封面，说明部分项目需官方页或 AI 配图）。app/worker 已重建。
+- 遗留：容器暂时连不上 api.github.com（网络抖动），下载链路未端到端实测。

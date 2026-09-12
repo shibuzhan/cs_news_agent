@@ -90,7 +90,7 @@ def build_source_media_tools(session_id: str):
             if draft is None:
                 return {"status": "rejected", "reason": reason}
             readme = _readme_text(settings, repository, draft)
-            base = raw_github_base(draft.source_url or "") or (draft.source_url or "")
+            base = raw_github_base(draft.source_url) or str(draft.source_url or "")
             images = extract_image_urls(readme, base_url=base, origin="readme")
             if include_official_site:
                 from app.tools.search_tools import ExaMcpSearchError, ExaMcpSearchTool
@@ -133,7 +133,7 @@ def build_source_media_tools(session_id: str):
             if draft is None:
                 return {"status": "rejected", "reason": reason}
             readme = _readme_text(settings, repository, draft)
-            base = raw_github_base(draft.source_url or "") or (draft.source_url or "")
+            base = raw_github_base(draft.source_url) or str(draft.source_url or "")
             allowed = {item.url for item in extract_image_urls(readme, base_url=base, origin="readme")}
             if url not in allowed:
                 return {

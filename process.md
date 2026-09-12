@@ -2918,3 +2918,20 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 292
+
+- 用户指令：询问“搜索 mcp 是否能获取到相关图片？能否作为截图？”，并在给出的选项中确认“**README + 官网/文档页图**”。
+- 影响范围：新增 `app/services/source_media.py`、`app/agent_tools/source_media_tools.py`、`agent_skills/source-media/SKILL.md`、`tests/test_source_media.py`；`app/agents/content_deep_agent.py`（注册工具与提示词）；重建 app/worker。**未发起付费调用**。
+- 事实①（MCP 能力，实测 `tools/list`）：我们接的 Exa MCP 只暴露 `web_search_exa`（文本）与 `web_fetch_exa`（网页转 markdown），**没有任何图片检索工具**；因此“搜索直接拿图”不可行。
+- 事实②（可行路径）：图片 URL 可以从 markdown 里提取——`web_fetch_exa` 的正文、以及我们本来就在抓的 README（GitHub API 返回 base64 markdown，含 `![...](...)` 与 `<img src=...>`）。README 里的官方截图是最合适的“项目截图”来源。
+- 处理结论（实现）：新增 `source_media.py`（纯函数）——提取 markdown/HTML 图片链接，**过滤徽章/统计图/赞助图/追踪像素/动图/SVG**，把 README 里的相对路径解析到 `raw.githubusercontent.com/<owner>/<repo>/HEAD/`；下载后按**魔数**校验类型（png/jpg/webp）、体积（>8KB 且不超上限）。新增两个 Tool：`list_source_images(draft_id?, include_official_site?)`（列候选；官方页需联网抓取，消耗一次检索配额）与 `attach_source_image(url, purpose, placement, draft_id?)`（下载 → 校验 → 存私有素材库 → 绑定封面/正文插图，**只接受候选清单里的 URL**）。新增 Skill `source-media` 写明允许来源、标注要求与失败降级（改用 `generate_draft_illustration`）。
+- 处理结论（版权边界）：只允许来源仓库自带的图与项目官方页面/文档页的图；第三方文章/图库/社交平台的图禁止使用；绑定真实截图后要求在正文标注来源。
+- 验证：后端 **254 项通过、0 失败**（新增 6 项：候选提取与去噪、相对路径解析到 raw 基址、data URI 与重复链接处理、下载校验的类型/体积/魔数、文件名归一化、工具注册，以及 `HttpUrl` 兼容）；容器内确认两个工具已注册、`raw_github_base` 兼容 Pydantic `HttpUrl`；对真实来源正文实测提取出候选图（该项目的 README 内容多为徽章，仅提取到 1 张视频封面图，说明部分项目需靠官方页或 AI 配图补充）。
+- 施工中发现并修复：`raw_github_base` 首版假设入参是字符串，而草稿的 `source_url` 可能是 Pydantic `HttpUrl` 对象 → 统一 `str(...)` 转换并加断言。
+- 遗留：容器当前连不上 `api.github.com`（与本次 git push 失败同源的网络抖动），下载链路未能端到端实测；提取与校验逻辑已由离线用例覆盖。
+- 授权状态：已确认并完成
+
+-->
