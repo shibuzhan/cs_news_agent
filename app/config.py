@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     exa_search_result_max_chars: int = 6000
     # 把联网补充搭在“本来就会发生”的那次改稿上：不增加模型调用，只增加 1–2 次检索。
     revision_search_enabled: bool = True
+    # 公众号草稿的留言设置：微信在这两个字段缺省时按 0（关闭留言）处理，必须显式给出。
+    wechat_open_comment: bool = True
+    wechat_only_fans_can_comment: bool = False
     # 投递选图是否把真实截图交给视觉模型看：先识别官方图内容，再决定封面与正文插图。
     publication_vision_selection_enabled: bool = True
     deep_agent_enabled: bool = False

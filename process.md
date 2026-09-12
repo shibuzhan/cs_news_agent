@@ -3105,3 +3105,19 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 304
+
+- 用户指令：①“跑完了，你试试能不能做到”（要求用 ECC README 的真实截图走完整链路）；②“投递草稿的时候是否有开启留言的配置？为什么上传的草稿留言功能都是关闭的”。
+- 影响范围：`app/services/normalizer.py`、`app/agent_tools/source_media_tools.py`、`app/agent_tools/draft_assets.py`、`app/tools/wechat_official_account.py`、`app/config.py`、`.env`、`.env.example`、`docker-compose.yml`、新增 `tests/test_source_image_preservation.py` 与 `tests/test_wechat_comment_settings.py`；重建 app/worker。**未发起付费调用**（下载图片与微信接口均免费）。
+- 结论①（真实截图链路已跑通）：ECC 草稿最终为**封面 `source-hero.png`（项目横幅）+ 正文 3 张官方指南截图 + 2 张 AI 补足**，远端草稿 `lJDDFrVGnUHQYRIU…` **原地覆盖**，未新建、未发表。
+- 根因①（“README 里 0 张图”）：`clean_text()` 用 `BeautifulSoup.get_text()` 去标签，而 **`<img>` 没有文本内容会被整段丢掉**；ECC 的 README 图片全是 HTML `<img>`（35 个，含 `assets/hero.png` 与 8 个 `<picture>`），markdown 图片为 0，于是入库正文里图片链接为 0。**已修**：去标签前先把 `<img src>` / `<source srcset>` 转成 markdown 图片链接；实测同一份 README 规范化后候选图 0 → **4 张**。注意只对**新采集**生效。
+- 根因②（绑定封面静默失败）：`create_draft_illustration()` 对 `purpose="cover"` 有“已存在则直接返回旧封面”的规则，工具却回报成功 → `source-hero.png` 素材已入库（141KB）但**没有绑定**。**已修**：作为封面绑定时先把已有封面降级为正文插图（`attach_source_image` 与 `attach_existing_asset_to_current_draft` 都改）。
+- 根因③（留言全关闭）：建草稿的 article 里**没有 `need_open_comment` / `only_fans_can_comment`**，微信对缺省字段按 **0（关闭留言）** 处理。**已修**：抽出 `_article_payload()`，创建与更新都显式下发这两个字段；新增配置 `WECHAT_OPEN_COMMENT=true`、`WECHAT_ONLY_FANS_CAN_COMMENT=false`（`.env`、`.env.example`、compose 的 app/worker 两处均透传）。
+- 验证：后端 **299 项通过、0 失败**（新增 3 项留言设置 + 4 项图片链接保留）；实测按新配置覆盖 ECC 草稿后，用 `/cgi-bin/draft/get` **读回远端草稿**确认 `need_open_comment=1`、`only_fans_can_comment=0`。
+- 遗留：①修复前生成的草稿留言仍是关闭的，需要重新投递/重新选择配图覆盖一次才会打开（ECC 已覆盖，gods-eye-view 尚未）；②留言是否真的可用还取决于公众号账号本身是否具备留言权限（微信只对符合条件的账号开放），接口接受设置不等于前台显示留言入口。
+- 授权状态：已确认并完成
+
+-->

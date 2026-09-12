@@ -115,6 +115,20 @@ async def _live_readme_text(source_url: Any) -> str:
         return ""
 
 
+def _demote_existing_covers(repository: ContentRepository, draft_id: str) -> list[str]:
+    """把已有封面降级为正文插图，让新封面能真正生效。
+
+    仓储层对 `purpose="cover"` 有“已存在则直接返回旧封面”的规则：不先降级就会出现
+    “工具回报成功、但图并没有换成封面”的静默失败（真实故障：hero.png 未成为封面）。
+    """
+    demoted: list[str] = []
+    for row in repository.list_draft_illustrations(draft_id):
+        if row.purpose == "cover":
+            repository.update_draft_illustration(draft_id, row.id, "inline", 1)
+            demoted.append(row.id)
+    return demoted
+
+
 def build_source_media_tools(session_id: str):
     """构造来源图片 Tool（列出候选 / 下载并绑定）。"""
 
@@ -218,6 +232,8 @@ def build_source_media_tools(session_id: str):
                 sha256=content_hash,
             )
             repository.bind_publication_asset(draft.id, asset.id)
+            if resolved_purpose == "cover":
+                _demote_existing_covers(repository, draft.id)
             illustration = repository.create_draft_illustration(draft.id, asset.id, resolved_purpose, placement)
             # 配图变了，旧的投递素材选择就不再成立：作废以免投递用了过期的图。
             repository.invalidate_unfinished_wechat_publication_for_regeneration(

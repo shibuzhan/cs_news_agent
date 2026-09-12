@@ -96,6 +96,26 @@ class WechatOfficialAccountTool:
         logger.info("wechat_official_inline_upload_started filename=%s size_bytes=%s", filename, len(content))
         return await self._call("upload_inline_image", self._require_api().upload_inline_image(content, filename))
 
+    def _article_payload(
+        self, *, title: str, digest: str, content_html: str, source_url: str, cover_media_id: str
+    ) -> dict[str, Any]:
+        """草稿文章字段。
+
+        `need_open_comment` / `only_fans_can_comment` 必须显式给出：微信在这两个字段缺省时
+        按 **0（留言关闭）** 处理——这就是此前所有草稿留言功能都是关闭状态的原因。
+        """
+        return {
+            "title": title,
+            "author": "资讯运营 Agent",
+            "digest": digest,
+            "content": content_html,
+            "content_source_url": source_url,
+            "thumb_media_id": cover_media_id,
+            "show_cover_pic": 1,
+            "need_open_comment": 1 if self.settings.wechat_open_comment else 0,
+            "only_fans_can_comment": 1 if self.settings.wechat_only_fans_can_comment else 0,
+        }
+
     async def create_draft(
         self,
         *,
@@ -105,15 +125,10 @@ class WechatOfficialAccountTool:
         source_url: str,
         cover_media_id: str,
     ) -> str:
-        article = {
-            "title": title,
-            "author": "资讯运营 Agent",
-            "digest": digest,
-            "content": content_html,
-            "content_source_url": source_url,
-            "thumb_media_id": cover_media_id,
-            "show_cover_pic": 1,
-        }
+        article = self._article_payload(
+            title=title, digest=digest, content_html=content_html,
+            source_url=source_url, cover_media_id=cover_media_id,
+        )
         return await self._call("create_draft", self._require_api().create_draft(article))
 
     async def update_draft(
@@ -127,15 +142,10 @@ class WechatOfficialAccountTool:
         cover_media_id: str,
     ) -> None:
         """只覆盖指定远端草稿，复用已上传的封面和正文图片，不创建新草稿。"""
-        article = {
-            "title": title,
-            "author": "资讯运营 Agent",
-            "digest": digest,
-            "content": content_html,
-            "content_source_url": source_url,
-            "thumb_media_id": cover_media_id,
-            "show_cover_pic": 1,
-        }
+        article = self._article_payload(
+            title=title, digest=digest, content_html=content_html,
+            source_url=source_url, cover_media_id=cover_media_id,
+        )
         await self._call("update_draft", self._require_api().update_draft(media_id, article))
 
     async def list_remote_drafts(self, *, offset: int = 0, count: int = 20) -> tuple[int, list[WechatRemoteDraft]]:

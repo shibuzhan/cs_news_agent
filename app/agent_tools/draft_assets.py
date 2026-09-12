@@ -141,6 +141,11 @@ def build_draft_asset_tools(session_id: str):
                 return {"status": "rejected", "reason": reason}
             resolved = purpose if purpose in {"cover", "inline"} else "inline"
             placement = max(0, min(int(placement_after_paragraph), MAX_PLACEMENT))
+            if resolved == "cover":
+                # 仓储层“已有封面就直接返回旧封面”，不先降级会静默失败。
+                for item in items:
+                    if item.purpose == "cover":
+                        repository.update_draft_illustration(draft.id, item.id, "inline", 1)
             row = repository.create_draft_illustration(draft.id, asset_id, resolved, placement)
             repository.invalidate_unfinished_wechat_publication_for_regeneration(
                 draft.id, "当前文章配图已调整，原投递图片选择已失效；下次投递将只从当前保留图片重新确定。"
