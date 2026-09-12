@@ -3057,3 +3057,21 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 300
+
+- 用户指令：询问“目前负责选图的是什么模型？有视觉能力吗？如果有则先识别官方图再选择适合做封面的图，其余作为插图”，并说明“我在 .env 里已填入有视觉能力的新模型，按你的建议实现”。
+- 影响范围：`app/config.py`（新增 `publication_vision_selection_enabled`）、`app/tools/illustration_planner.py`（视觉候选装载、消息构造、宽松解析、token 预算）、`app/services/auto_delivery.py`（传入真实截图读取器）、`.env` 与 `.env.example`、`docker-compose.yml`（开关透传）、新增 `tests/test_publication_vision_selection.py`；重建 app/worker。**用到 1 次列模型调用 + 3 次极小视觉探测 + 真实选图调用**。
+- 事实①（原选图模型）：配图规划任务模型，`ILLUSTRATION_PLANNER_LLM_MODEL` 原先为空 → 跟随 `LLM_MODEL=deepseek-v4-flash`（tokenhub）；**并且候选只传文字**（asset_id/用途/段位/生成提示词/origin），图片本身从不给模型看 —— 所以“有没有视觉”此前根本不影响选图。
+- 事实②（用户新配置的模型确实有视觉）：`.env` 中 `ILLUSTRATION_PLANNER_LLM_MODEL=deepseek-flash`、端点 `https://api.deepseek.com`（该端点列出的模型：`deepseek-flash`、`deepseek-v4-pro`）。实测：纯蓝方块 → 正确回答“蓝色”（视觉可用）；纯红方块 → 返回空内容（该模型偶尔只输出推理不吐正文）。
+- 处理结论①（视觉选图）：新增开关 `PUBLICATION_VISION_SELECTION_ENABLED`（默认 true）。选图时**只把真实截图**（`provider` 为空）读成 data URI 交给模型，AI 配图仍只用文字（省 token）；提示词要求“先识别每张官方图的实际画面内容，选最能说明‘这是什么’的一张作封面，其余官方图作正文插图；AI 配图只用于补足”。
+- 处理结论②（健壮性）：`max_tokens=1500`（视觉/推理模型会先消耗预算，实测出现 JSON 被截断）；新增 `_parse_selection_payload()` 按字段宽松解析（截断时用正则抠出 asset_id）；读取图像失败或视觉调用异常时**回退文本策略**，再套用确定性规则（真实截图强制入选、缺口补 AI）。
+- 处理结论③（配置同步）：`.env` 与 `.env.example` 均新增 `PUBLICATION_VISION_SELECTION_ENABLED=true`，compose 的 app/worker 两处透传（键集合保持一致）。
+- 实测（最终状态）：“模型看图后”把封面换成 `source-open-source-survey.png`，正文为 `youtube-popular-videos.png`（另一张官方截图）+ 3 张 AI 配图；远端草稿 `lJDDFrVGnUHQ` 原地覆盖、未新建。两张官方图现在都在内容里，符合“先识别官方图再选封面、其余作插图”。
+- 顺带发现（已记录，未改）：投递记录**已有素材选择时不重选**，所以仅“改口径/换模型”不会触发重选，需要先作废选择（配图变更会自动作废，仅改配置不会）。可考虑在发布页加一个“重新选择配图”入口。
+- 验证：后端 **287 项通过、0 失败**（新增 4 项：只对真实截图读图、读图失败可容忍、无图时消息为纯文本、提示词与 token 预算）。
+- 授权状态：已确认并完成
+
+-->

@@ -116,8 +116,15 @@ async def ensure_agent_selected_wechat_assets(
         return existing
     draft = repository.get_draft(draft_id)
     illustrations = repository.list_draft_illustrations(draft_id)
+    def load_source_image(asset_id: str) -> bytes | None:
+        """供视觉选图读取真实截图字节；AI 配图不读。"""
+        asset = repository.get_publication_asset(asset_id)
+        if not str(asset.original_name or "").startswith("source-"):
+            return None
+        return PrivateAttachmentStore(settings).read(asset.object_key)
+
     selection = await run_in_threadpool(
-        IllustrationPlanner(settings).decide_publication_assets, draft, illustrations
+        IllustrationPlanner(settings).decide_publication_assets, draft, illustrations, load_source_image
     )
     return repository.save_wechat_asset_selection(
         draft_id, selection.cover_asset_id, selection.inline_asset_ids

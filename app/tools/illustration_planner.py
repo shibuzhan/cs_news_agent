@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import re
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from langsmith.wrappers import wrap_openai
@@ -249,8 +252,32 @@ class IllustrationPlanner:
             logger.warning("illustration_plan_llm_fallback error_type=%s", type(exc).__name__)
             return fallback_plan(draft.body, brief, draft_id)
 
-    def decide_publication_assets(self, draft, illustrations) -> PublicationAssetSelection:
-        """只从已绑定的生成图片中选择公众号封面与正文插图，不接受前端逐张勾选。"""
+    def _load_source_images(
+        self, candidates: list[dict], load_image: Callable[[str], bytes | None]
+    ) -> dict[str, str]:
+        """把真实截图读成 data URI 交给视觉模型；读不到就跳过（不阻断选择）。"""
+        images: dict[str, str] = {}
+        for item in candidates:
+            if item.get("origin") != "source":
+                continue
+            try:
+                content = load_image(item["asset_id"])
+            except Exception as exc:
+                logger.warning("publication_vision_load_failed asset_id=%s error_type=%s", item["asset_id"], type(exc).__name__)
+                continue
+            if not content:
+                continue
+            images[item["asset_id"]] = "data:image/png;base64," + base64.b64encode(content).decode("ascii")
+        return images
+
+    def decide_publication_assets(
+        self, draft, illustrations, load_image: Callable[[str], bytes | None] | None = None
+    ) -> PublicationAssetSelection:
+        """决定公众号封面与正文插图。
+
+        `load_image(asset_id)` 提供真实截图的字节：有视觉模型时把官方图**给模型看**，
+        先识别内容再选封面；AI 配图仍只用文字描述（省 token）。
+        """
         candidates = [
             {
                 "asset_id": item.asset_id,
@@ -268,20 +295,29 @@ class IllustrationPlanner:
         selected_api_key = api_key_for(self.settings, "illustration_planner")
         if not (self.settings.llm_enabled and selected_api_key and selected_model):
             raise PublicationAssetSelectionError("投递素材选择需要启用配图规划模型")
+        vision_enabled = bool(getattr(self.settings, "publication_vision_selection_enabled", True)) and callable(load_image)
+        images = self._load_source_images(candidates, load_image) if vision_enabled else {}
         prompt = (
             "你是公众号草稿投递素材选择器。仅从候选图片中决定 1 张封面及 0 到 6 张正文插图。"
             "返回 JSON：cover_asset_id、inline_asset_ids。封面必须选择一个候选 asset_id；正文图可为空且不得包含封面。"
-            "选择口径：**真实截图（origin=source）优先**——正文里能用的真实截图都要选上；" 
+            + (
+                "**下面附带了真实截图的图像**（按 asset_id 标注）：先识别每张官方图的实际画面内容，"
+                "判断哪张最能代表这篇文章的主题，把它选为封面；其余真实截图作为正文插图。"
+                if images else ""
+            )
+            + "选择口径：**真实截图（origin=source）优先**——正文里能用的真实截图都要选上；"
             "再用 AI 配图（origin=generated）把每个主要段落补足，正文合计 2 到 3 张，最多 6 张。"
             "**AI 配图是氛围图，不得因为“与文章主题不完全对应”就整批排除**；只有明显重复、或与主题严重冲突的才排除。"
-            "封面选最能代表文章主题的一张。不得解释、不得创建新 ID、不得输出推理。"
+            "封面要选：优先官方截图里最能说明“这是什么”的一张；没有合适截图时才用 AI 图。"
+            "不得解释、不得创建新 ID、不得输出推理。"
             f"文章标题：{(draft.title_options_json or [''])[0]}；正文：{draft.body[:5000]}；候选："
             + json.dumps(candidates, ensure_ascii=False)
         )
         try:
             logger.info(
-                "publication_asset_selection_started draft_id=%s model_category=illustration_planner model=%s candidate_count=%s",
-                getattr(draft, "id", "unknown"), selected_model, len(candidates),
+                "publication_asset_selection_started draft_id=%s model_category=illustration_planner model=%s "
+                "candidate_count=%s vision_images=%s",
+                getattr(draft, "id", "unknown"), selected_model, len(candidates), len(images),
             )
             client = OpenAI(
                 api_key=selected_api_key,
@@ -292,10 +328,13 @@ class IllustrationPlanner:
             client = wrap_openai(client) if langsmith_enabled(self.settings) else client
             response = client.chat.completions.create(
                 model=selected_model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}, temperature=0,
+                messages=[{"role": "user", "content": _selection_message(prompt, images)}],
+                response_format={"type": "json_object"},
+                temperature=0,
+                # 视觉与推理模型会先花掉一部分 token：给足预算，否则会返回空内容。
+                max_tokens=1500,
             )
-            payload = json.loads(response.choices[0].message.content or "{}")
+            payload = _parse_selection_payload(response.choices[0].message.content or "")
             allowed_ids = {item["asset_id"] for item in candidates}
             cover_asset_id = payload.get("cover_asset_id")
             if not isinstance(cover_asset_id, str) or cover_asset_id not in allowed_ids:
@@ -332,6 +371,41 @@ class IllustrationPlanner:
                 getattr(draft, "id", "unknown"), type(exc).__name__,
             )
             raise PublicationAssetSelectionError("Agent 未能确定公众号投递素材") from exc
+
+
+def _parse_selection_payload(text: str) -> dict:
+    """解析选择结果；推理/视觉模型偶尔返回被截断的 JSON，这里按字段兜底提取。
+
+    只需要两个字段（封面 id 与正文 id 列表），截断时用正则把 id 抠出来即可，不必整段合法。
+    """
+    raw = (text or "").strip()
+    try:
+        data = json.loads(raw or "{}")
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    cover_match = re.search(r'"cover_asset_id"\s*:\s*"([^"]+)"', raw)
+    inline_block = re.search(r'"inline_asset_ids"\s*:\s*\[(.*?)(\]|$)', raw, re.DOTALL)
+    inline_ids = re.findall(r'"([^"]+)"', inline_block.group(1)) if inline_block else []
+    if not cover_match and not inline_ids:
+        raise json.JSONDecodeError("选择结果既不是合法 JSON，也提取不到 asset_id", raw, 0)
+    payload: dict = {"inline_asset_ids": inline_ids}
+    if cover_match:
+        payload["cover_asset_id"] = cover_match.group(1)
+    logger.warning("publication_asset_selection_parsed_leniently chars=%s", len(raw))
+    return payload
+
+
+def _selection_message(prompt: str, images: dict[str, str]) -> object:
+    """构造选择器的消息内容：没有图像时是纯文本，有图像时按 asset_id 逐个附上。"""
+    if not images:
+        return prompt
+    parts: list[dict] = [{"type": "text", "text": prompt}]
+    for asset_id, data_uri in images.items():
+        parts.append({"type": "text", "text": f"以下图像属于 asset_id={asset_id}："})
+        parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+    return parts
 
 
 def _apply_selection_policy(
