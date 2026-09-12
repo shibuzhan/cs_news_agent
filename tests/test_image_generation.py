@@ -10,6 +10,24 @@ from app.services import image_text_guard
 from app.services.image_brief import load_brief
 
 
+def test_publication_asset_prompt_defaults_to_keeping_relevant_illustrations() -> None:
+    """投递素材选择的口径是“默认保留相关图”，不是“最少但足够”。
+
+    历史上提示词写着“选择最匹配、最少但足够的图片”，模型于是 3 张正文候选只留 1 张。
+    """
+    import inspect
+
+    from app.tools import illustration_planner
+
+    source = inspect.getsource(illustration_planner.IllustrationPlanner.decide_publication_assets)
+
+    assert "最少但足够" not in source
+    assert "与所在段落内容相关的就保留" in source
+    assert "不要只保留一张" in source
+    assert "正文插图通常保留 2 到 3 张" in source
+
+
+
 def test_decode_nonempty_base64_image_rejects_empty_or_invalid_data() -> None:
     assert image_generation.decode_nonempty_base64_image("") is None
     assert image_generation.decode_nonempty_base64_image("not-base64") is None
