@@ -17,6 +17,9 @@ from app.storage.repositories import ContentRepository
 from app.tools.image_generation import GeneratedIllustration, ImageGenerationTool
 
 
+# 正文插图保底数量：模型把氛围类 AI 配图整批排除时，正文不能一张图都没有。
+MIN_INLINE_ILLUSTRATIONS = 2
+
 logger = logging.getLogger("news_agent.illustration_planner")
 MAX_AUTO_ILLUSTRATIONS = 3
 
@@ -162,6 +165,22 @@ def _plan_prompt(brief: ImageBrief | None, paragraphs: list[str], title: str) ->
     )
 
 
+def _is_source_asset(item: object) -> bool:
+    """是否为来源真实截图。
+
+    可靠的判据是插图行的 `provider`：AI 生成的图会写入供应商（如 `agnes`），
+    而从来源仓库/官方页面绑定的真实素材没有供应商。旧的命名前缀判据保留作兜底。
+    """
+    if getattr(item, "provider", None):
+        return False
+    name = str(getattr(item, "asset_name", "") or "")
+    prompt = str(getattr(item, "prompt", "") or "")
+    if name.startswith("source-") or prompt.startswith("source:"):
+        return True
+    # 没有供应商、也没有生成提示词 ⇒ 不是系统生成的图，即真实素材。
+    return not prompt and not getattr(item, "model", None)
+
+
 class IllustrationPlanner:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -238,6 +257,8 @@ class IllustrationPlanner:
                 "current_purpose": item.purpose,
                 "after_paragraph": item.placement_after_paragraph,
                 "prompt": item.prompt[:500],
+                # 真实截图（来源仓库/官方页面）与 AI 配图要能区分：正文优先用真实图。
+                "origin": "source" if _is_source_asset(item) else "generated",
             }
             for item in illustrations
         ]
@@ -250,8 +271,9 @@ class IllustrationPlanner:
         prompt = (
             "你是公众号草稿投递素材选择器。仅从候选图片中决定 1 张封面及 0 到 6 张正文插图。"
             "返回 JSON：cover_asset_id、inline_asset_ids。封面必须选择一个候选 asset_id；正文图可为空且不得包含封面。"
-            "选择口径：**逐个判断候选，与所在段落内容相关的就保留**；只有明显重复、或与文章主题无关的才排除。"
-            "除非确有理由（例如候选基本重复），**不要只保留一张**；正文插图通常保留 2 到 3 张，最多 6 张。"
+            "选择口径：**真实截图（origin=source）优先**——正文里能用的真实截图都要选上；" 
+            "再用 AI 配图（origin=generated）把每个主要段落补足，正文合计 2 到 3 张，最多 6 张。"
+            "**AI 配图是氛围图，不得因为“与文章主题不完全对应”就整批排除**；只有明显重复、或与主题严重冲突的才排除。"
             "封面选最能代表文章主题的一张。不得解释、不得创建新 ID、不得输出推理。"
             f"文章标题：{(draft.title_options_json or [''])[0]}；正文：{draft.body[:5000]}；候选："
             + json.dumps(candidates, ensure_ascii=False)
@@ -292,9 +314,16 @@ class IllustrationPlanner:
                     inline_asset_ids.append(asset_id)
                 if len(inline_asset_ids) == 6:
                     break
+            # 口径落地：真实截图必须进正文（模型常常只挑 AI 图），缺口再用 AI 配图补足。
+            inline_asset_ids = _apply_selection_policy(
+                inline_asset_ids, candidates, cover_asset_id,
+                minimum=MIN_INLINE_ILLUSTRATIONS,
+            )
             logger.info(
-                "publication_asset_selection_completed draft_id=%s inline_count=%s",
-                getattr(draft, "id", "unknown"), len(inline_asset_ids),
+                "publication_asset_selection_completed draft_id=%s inline_count=%s source_inline=%s",
+                getattr(draft, "id", "unknown"),
+                len(inline_asset_ids),
+                sum(1 for item in candidates if item.get("origin") == "source" and item["asset_id"] in inline_asset_ids),
             )
             return PublicationAssetSelection(cover_asset_id, inline_asset_ids, "llm")
         except Exception as exc:
@@ -303,6 +332,68 @@ class IllustrationPlanner:
                 getattr(draft, "id", "unknown"), type(exc).__name__,
             )
             raise PublicationAssetSelectionError("Agent 未能确定公众号投递素材") from exc
+
+
+def _apply_selection_policy(
+    inline_asset_ids: list[str],
+    candidates: list[dict],
+    cover_asset_id: str,
+    *,
+    minimum: int,
+    maximum: int = 6,
+) -> list[str]:
+    """把“真实截图优先、缺口用 AI 配图补足”落成确定性规则。
+
+    1. 保留模型选中的真实截图；
+    2. **强制包含其余真实截图**（只要不是封面就用上——它们才是项目本身的画面）；
+    3. 保留模型选中的 AI 配图；
+    4. 仍不足 `minimum` 时按段位补 AI 配图。
+    """
+    ordered = sorted(candidates, key=lambda entry: entry.get("after_paragraph", 0))
+    source_ids = [c["asset_id"] for c in ordered if c.get("origin") == "source" and c["asset_id"] != cover_asset_id]
+    generated_ids = [c["asset_id"] for c in ordered if c.get("origin") != "source" and c["asset_id"] != cover_asset_id]
+    picked: list[str] = []
+    for asset_id in inline_asset_ids:
+        if asset_id in source_ids and asset_id not in picked:
+            picked.append(asset_id)
+    for asset_id in source_ids:
+        if asset_id not in picked:
+            picked.append(asset_id)
+    for asset_id in inline_asset_ids:
+        if asset_id not in picked:
+            picked.append(asset_id)
+    if len(picked) < minimum:
+        for asset_id in generated_ids:
+            if asset_id not in picked:
+                picked.append(asset_id)
+            if len(picked) >= minimum:
+                break
+    return picked[:maximum]
+
+
+def _top_up_inline(
+    inline_asset_ids: list[str],
+    candidates: list[dict],
+    cover_asset_id: str,
+    *,
+    minimum: int,
+) -> list[str]:
+    """把正文插图补到至少 `minimum` 张：真实截图优先，其次按段位顺序补 AI 配图。
+
+    不改动模型已经选中的内容，只在不足时追加，因此“模型想留的图”永远保留。
+    """
+    if len(inline_asset_ids) >= minimum:
+        return inline_asset_ids
+    picked = list(inline_asset_ids)
+    ordered = sorted(
+        (item for item in candidates if item["asset_id"] != cover_asset_id and item["asset_id"] not in picked),
+        key=lambda item: (0 if item.get("origin") == "source" else 1, item.get("after_paragraph", 0)),
+    )
+    for item in ordered:
+        picked.append(item["asset_id"])
+        if len(picked) >= minimum:
+            break
+    return picked
 
 
 class AutoIllustrationTool:

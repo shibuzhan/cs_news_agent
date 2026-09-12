@@ -97,6 +97,24 @@ async def _download_image(client: httpx.AsyncClient, image: SourceImage) -> Down
     )
 
 
+async def _live_readme_text(source_url: Any) -> str:
+    """用 raw.githubusercontent 取实时 README（不走 API，不受 60 次/小时匿名配额限制）。
+
+    存储副本可能过旧（例如仓库后来补了 docs/media 截图），允许清单需要它能兜底，
+    否则用户点名的官方截图会被拒。
+    """
+    base = raw_github_base(source_url)
+    if not base:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=20), follow_redirects=True) as client:
+            response = await client.get(f"{base}README.md")
+            return response.text if response.status_code == 200 else ""
+    except Exception as exc:
+        logger.warning("source_media_live_readme_failed error_type=%s", type(exc).__name__)
+        return ""
+
+
 def build_source_media_tools(session_id: str):
     """构造来源图片 Tool（列出候选 / 下载并绑定）。"""
 
@@ -157,6 +175,11 @@ def build_source_media_tools(session_id: str):
             base = raw_github_base(draft.source_url) or str(draft.source_url or "")
             allowed = {item.url for item in extract_image_urls(readme, base_url=base, origin="readme")}
             if url not in allowed:
+                # 存储副本可能过旧（仓库后来补了 docs/media 截图）：用实时 README 兜底核对，
+                # 仍然只允许仓库/官方页面的图片，不放宽来源范围。
+                live = await _live_readme_text(draft.source_url)
+                allowed |= {item.url for item in extract_image_urls(live, base_url=base, origin="readme")}
+            if url not in allowed:
                 return {
                     "status": "rejected",
                     "reason": "只允许使用来源 README 或官方页面里的图片；该链接不在候选里。",
@@ -187,7 +210,8 @@ def build_source_media_tools(session_id: str):
                 downloaded.filename, downloaded.content, downloaded.content_type
             )
             asset = repository.create_publication_asset(
-                original_name=downloaded.filename,
+                # `source-` 前缀让素材选择器能区分“真实截图”与“AI 配图”（正文优先用真实图）。
+                original_name=f"source-{downloaded.filename}",
                 content_type=downloaded.content_type,
                 object_key=object_key,
                 size_bytes=len(downloaded.content),

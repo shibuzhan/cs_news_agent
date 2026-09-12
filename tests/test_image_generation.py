@@ -10,10 +10,11 @@ from app.services import image_text_guard
 from app.services.image_brief import load_brief
 
 
-def test_publication_asset_prompt_defaults_to_keeping_relevant_illustrations() -> None:
-    """投递素材选择的口径是“默认保留相关图”，不是“最少但足够”。
+def test_publication_asset_prompt_prefers_real_screenshots_and_fills_with_ai() -> None:
+    """素材选择口径：真实截图优先，缺口用 AI 配图补足（不是“最少但足够”）。
 
-    历史上提示词写着“选择最匹配、最少但足够的图片”，模型于是 3 张正文候选只留 1 张。
+    历史上提示词写着“选择最匹配、最少但足够的图片”，模型于是 3 张正文候选只留 1 张；
+    改成“相关就保留”后又出现把氛围类 AI 配图整批排除、正文 0 张的极端情况。
     """
     import inspect
 
@@ -22,9 +23,10 @@ def test_publication_asset_prompt_defaults_to_keeping_relevant_illustrations() -
     source = inspect.getsource(illustration_planner.IllustrationPlanner.decide_publication_assets)
 
     assert "最少但足够" not in source
-    assert "与所在段落内容相关的就保留" in source
-    assert "不要只保留一张" in source
-    assert "正文插图通常保留 2 到 3 张" in source
+    assert "真实截图（origin=source）优先" in source
+    assert "把每个主要段落补足" in source
+    assert "_apply_selection_policy(" in source  # 确定性口径落地
+
 
 
 
