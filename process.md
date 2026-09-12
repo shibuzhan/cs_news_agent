@@ -2856,3 +2856,20 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 286
+
+- 用户指令：明确系统形态要求——“所有流程应该全都围绕 agent 来做，这些操作应该都是 agent 调用工具/mcp/skill 完成，点击这些按钮逻辑应该是向 agent 发送明确的命令，在对话框内也应该有对应消息显示”；确认按 **A+B+C 完整 agent 化** 实施，顺序为“先上传 GitHub，再重建”。
+- 影响范围：新增 `app/agent_tools/draft_actions.py`、`app/services/agent_commands.py`、`tests/test_agent_commands.py`；`app/api/routes.py`（命令分发）、`app/agents/content_deep_agent.py`（注册动作工具与提示词）、`frontend/src/App.tsx`（按钮改发命令）；`tests/test_deep_agent_tools.py` 更新。**未发起付费调用**。
+- 处理结论 A（按钮＝对话命令）：新增 `parse_agent_command()`，识别“运行自动审核／重写文案／审核通过／撤销审核／废弃文案／复用配图／生成封面(正文第 N 段)插图”等明确命令，并解析 `draft=<id>` 与段位；前端发布页与生成记录页的按钮不再直连专用接口，而是**发送一条命令消息并跳转对话页**，消息与 Agent 回复都留在对话里。解析失败的文字仍走模型意图识别，两条路径共用同一执行链路。
+- 处理结论 B（执行＝Agent 工具）：新增 6 个受控动作工具——`run_auto_review`、`rewrite_draft`、`approve_draft`、`discard_draft`、`revoke_approval`、`generate_draft_illustration`。工具内复用既有服务与 ARQ 入队，长任务由工具自行创建可见运行；**草稿归属校验**：显式 `draft_id` 必须属于本会话生成过的草稿，否则拒绝；创建公众号草稿（对外副作用）不在工具内，仍由发布页明确确认。
+- 处理结论 C（回复与编排）：命令执行结果由模型按真实结果生成回复（`compose_task_reply`，失败回落工具文案）；动作工具同时注册进会话 DeepAgent，自然语言（“帮我审一下这篇”）也能触发同一批工具。
+- 处理结论（安全边界）：仅审核默认 `deliver=false`；只有命令里明确出现投递意图才 `deliver=true`；发布仍需人工在发布页确认。
+- 验证：后端 **246 项通过、0 失败**（新增 7 项：审核/重写/审核决定/配图命令解析、自然语言不被截走、动作工具注册、跨会话草稿被拒）；前端 `tsc -p tsconfig.app.json` 0 错误；容器内确认 6 个动作工具已注册、命令解析正确、自然语言回落模型；前端模块含 `dispatchAgentCommand` 与命令文案；重建前已确认**无任何进行中的审核/运行/图片任务**，app/worker/frontend 已重建、`/api/health` 正常。
+- 交付：本次与上一批改动已推送到 GitHub（`59ef852..1f6305f`、`1f6305f..0f02796`，作者为 GitHub noreply 身份）。
+- 遗留：发布页的“投递到公众号草稿”仍走受控接口（对外副作用保留人工确认）；若也要改成命令，需要先定义确认语义。
+- 授权状态：已确认并完成
+
+-->
