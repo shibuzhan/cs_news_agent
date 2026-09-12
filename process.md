@@ -3137,3 +3137,22 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 306
+
+- 用户指令：①“可以写一个小工具作为 tool”（指素材库清理）；②“这两张图挨一起了，是不是流程没写好？”（附公众号预览截图）。
+- 影响范围：`app/tools/illustration_planner.py`（同段单图）、`app/agent_tools/source_media_tools.py`（绑图避让已占用段落）、新增 `app/agent_tools/wechat_materials.py`（两个素材库工具）、`app/tools/wechat_official_account.py`（`list_permanent_images`、`delete_material`）、`agent_skills/wechat-official-account/scripts/wechat_official_api.py`（`del_material`）、`app/agents/content_deep_agent.py`（注册工具）、`app/services/agent_commands.py`（命令映射）、新增 `tests/test_material_cleanup_and_placement.py`；重建 app/worker。**付费调用：无**（素材库接口免费）。
+- 根因（两张图挨一起）：**流程没有“同一段落只放一张图”的约束**。该草稿第 2 段后同时绑了 `source-shorthand-guide.png` 与一张 AI 插图（我绑图时那段已被占用），而渲染器按位置分组后顺序输出，于是两张并排。不是渲染器 bug。
+- 处理结论①（选择层）：`_apply_selection_policy()` 改为**同段落只保留一张**（真实截图优先、其次模型选中的 AI 图、再按段位补足），候选位置取自 `after_paragraph`。
+- 处理结论②（绑定层）：新增 `_free_placement()`，`attach_source_image` 绑正文图时若目标段落已被占用，**自动顺延到下一个空段**并在结果里返回实际位置。
+- 处理结论③（素材库工具，均注册给会话 Agent 且有同步入口）：
+  - `list_wechat_materials`（只读）：盘点素材库图片，标出**没有任何投递记录引用**的可清理项；
+  - `delete_wechat_material(media_id)`（破坏性）：删除指定永久素材；**仍被投递记录引用的封面会被拒绝删除**，提示先重新投递换封面。
+  - 命令映射新增“清理素材库／素材库盘点”。
+- 验证：后端 **309 项通过、0 失败**（新增 6 项）；实测重新投递后正文插图位置 `[2, 3, 5]`——**无重复段落**（修复前第 2 段两张并排）；封面 `source-hero.png` 未变并复用了 media_id；素材库盘点工具实测返回“共 12 张，10 张无投递记录引用”。
+- 遗留（删除的风险提示）：盘点判据是“本系统投递记录是否引用”，若某张图是**已发表文章**的封面则不会被识别；真正删除前需人工确认，本次未删除任何素材。
+- 授权状态：已确认并完成
+
+-->

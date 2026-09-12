@@ -115,6 +115,24 @@ async def _live_readme_text(source_url: Any) -> str:
         return ""
 
 
+def _free_placement(repository: ContentRepository, draft_id: str, preferred: int) -> int:
+    """找一处还没被正文插图占用的段落位置。
+
+    同一段落绑两张图，渲染时会在正文里并排出现（真实反馈：“这两张图挨一起了”）。
+    """
+    taken = {
+        item.placement_after_paragraph
+        for item in repository.list_draft_illustrations(draft_id)
+        if item.purpose == "inline"
+    }
+    candidate = max(1, min(preferred, MAX_PLACEMENT))
+    for offset in range(MAX_PLACEMENT):
+        position = ((candidate - 1 + offset) % MAX_PLACEMENT) + 1
+        if position not in taken:
+            return position
+    return candidate
+
+
 def _demote_existing_covers(repository: ContentRepository, draft_id: str) -> list[str]:
     """把已有封面降级为正文插图，让新封面能真正生效。
 
@@ -179,12 +197,15 @@ def build_source_media_tools(session_id: str):
         """
         settings = get_settings()
         resolved_purpose = purpose if purpose in {"cover", "inline"} else "inline"
-        placement = 0 if resolved_purpose == "cover" else max(0, min(int(placement_after_paragraph), MAX_PLACEMENT))
+        requested_placement = max(0, min(int(placement_after_paragraph), MAX_PLACEMENT))
+        placement = 0 if resolved_purpose == "cover" else requested_placement
         with SessionLocal() as session:
             repository = ContentRepository(session)
             draft, reason = _resolve_draft(repository, session_id, draft_id)
             if draft is None:
                 return {"status": "rejected", "reason": reason}
+            if resolved_purpose == "inline":
+                placement = _free_placement(repository, draft.id, requested_placement or 1)
             readme = _readme_text(settings, repository, draft)
             base = raw_github_base(draft.source_url) or str(draft.source_url or "")
             allowed = {item.url for item in extract_image_urls(readme, base_url=base, origin="readme")}

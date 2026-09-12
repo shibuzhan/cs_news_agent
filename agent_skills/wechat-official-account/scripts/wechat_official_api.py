@@ -126,6 +126,17 @@ class WechatOfficialAccountApi:
             raise WechatOfficialAccountError("微信未返回封面素材 ID")
         return media_id
 
+    async def delete_permanent_material(self, media_id: str) -> None:
+        """写操作：删除永久素材（用于清理重复/无用的封面图，释放素材库配额）。"""
+        token = await self.get_access_token()
+        response = await self.client.post(
+            "/cgi-bin/material/del_material",
+            params={"access_token": token},
+            json={"media_id": media_id},
+        )
+        payload = self._json(response)
+        self._raise_for_error(response, payload)
+
     async def upload_inline_image(self, content: bytes, filename: str) -> str:
         """写操作：上传正文图片并返回微信可引用 URL。"""
         token = await self.get_access_token()

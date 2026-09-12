@@ -426,21 +426,30 @@ def _apply_selection_policy(
     ordered = sorted(candidates, key=lambda entry: entry.get("after_paragraph", 0))
     source_ids = [c["asset_id"] for c in ordered if c.get("origin") == "source" and c["asset_id"] != cover_asset_id]
     generated_ids = [c["asset_id"] for c in ordered if c.get("origin") != "source" and c["asset_id"] != cover_asset_id]
+    paragraph_of = {c["asset_id"]: c.get("after_paragraph", 0) for c in ordered}
     picked: list[str] = []
+
+    def _take(asset_id: str, used_paragraphs: set[int]) -> bool:
+        """同一段落只放一张图：两张图落在一起会在正文里并排出现。"""
+        paragraph = paragraph_of.get(asset_id, 0)
+        if paragraph in used_paragraphs:
+            return False
+        used_paragraphs.add(paragraph)
+        picked.append(asset_id)
+        return True
+
+    used: set[int] = set()
+    # 1) 真实截图优先（模型选中的在前，其余强制纳入），每段一张
+    for asset_id in [item for item in inline_asset_ids if item in source_ids] + source_ids:
+        _take(asset_id, used)
+    # 2) 模型选中的 AI 配图
     for asset_id in inline_asset_ids:
-        if asset_id in source_ids and asset_id not in picked:
-            picked.append(asset_id)
-    for asset_id in source_ids:
         if asset_id not in picked:
-            picked.append(asset_id)
-    for asset_id in inline_asset_ids:
-        if asset_id not in picked:
-            picked.append(asset_id)
+            _take(asset_id, used)
+    # 3) 仍不足 minimum 时按段位补 AI 配图
     if len(picked) < minimum:
         for asset_id in generated_ids:
-            if asset_id not in picked:
-                picked.append(asset_id)
-            if len(picked) >= minimum:
+            if _take(asset_id, used) and len(picked) >= minimum:
                 break
     return picked[:maximum]
 

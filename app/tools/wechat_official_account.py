@@ -148,6 +148,14 @@ class WechatOfficialAccountTool:
         )
         await self._call("update_draft", self._require_api().update_draft(media_id, article))
 
+    async def list_permanent_images(self, *, offset: int = 0, count: int = 20) -> dict[str, Any]:
+        """读取素材库图片（只读）。"""
+        return await self._call("list_permanent_images", self._require_api().list_permanent_images(offset=offset, count=count))
+
+    async def delete_material(self, media_id: str) -> None:
+        """删除永久素材（释放素材库配额）。"""
+        await self._call("delete_material", self._require_api().delete_permanent_material(media_id))
+
     async def list_remote_drafts(self, *, offset: int = 0, count: int = 20) -> tuple[int, list[WechatRemoteDraft]]:
         payload = await self._call("list_drafts", self._require_api().list_drafts(offset=offset, count=count))
         return remote_drafts_from_payload(payload)

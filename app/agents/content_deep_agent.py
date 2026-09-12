@@ -21,6 +21,7 @@ from app.agent_tools.conversation_context import build_conversation_context_tool
 from app.agent_tools.draft_actions import build_draft_action_tools
 from app.agent_tools.draft_assets import build_draft_asset_tools
 from app.agent_tools.source_media_tools import build_source_media_tools
+from app.agent_tools.wechat_materials import build_wechat_material_tools
 from app.config import (
     Settings,
     api_key_for,
