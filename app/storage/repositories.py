@@ -993,7 +993,12 @@ class ContentRepository:
                 row.error_message or "图片任务未生成，文字草稿已保留。", "review",
             )
         for row in self.session.scalars(
-            select(WechatPublicationJobRow).where(WechatPublicationJobRow.error_message.is_not(None))
+            select(WechatPublicationJobRow).where(
+                # 只有**真失败**状态才算投递失败。
+                # `delivery_stale`／`superseded` 等状态也会带说明文本（“配图已调整，旧选择失效”），
+                # 那不是错误，此前被这条同步逻辑当成“公众号投递失败”反复报出来。
+                WechatPublicationJobRow.state.in_(("draft_failed", "delivery_failed")),
+            )
         ):
             self.upsert_failure_notification(
                 "wechat_publication", row.id, "wechat", "公众号投递失败",
