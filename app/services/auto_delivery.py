@@ -253,10 +253,27 @@ async def auto_review_and_create_wechat_draft(
             pending_run_id = None
         else:
             run = repository.create_auto_review_run(draft_id, chat_agent_run_id)
+        _record_review_event(
+            repository, chat_agent_run_id, "正在审核文案",
+            "先跑规则检查（字数、段落、来源尾注），再调用审核模型；模型审核通常需要几分钟，请稍候。",
+            "running",
+            review_id=run.id, revision_count=revision_count,
+        )
         review = await run_in_threadpool(
             AutoReviewTool(settings, repository).invoke,
             draft_id,
             draft=_model_draft_snapshot(repository, draft_id),
+        )
+        # 模型审核通常要几分钟且没有流式输出：把“规则通过/模型返回”写成事件，界面才有进度可看。
+        _record_review_event(
+            repository, chat_agent_run_id, "审核模型已返回",
+            "评分 {score}/{full}；{count} 条意见。".format(
+                score=int(review.model_report.get("score") or 0),
+                full=getattr(settings, "auto_review_pass_score", 85),
+                count=len(review.model_report.get("issues") or []),
+            ),
+            "running",
+            review_id=run.id, revision_count=revision_count,
         )
         issues = revision_issues(review.rule_report, review.model_report)
         can_revise = bool(issues) and review.error_message is None and revision_count < MAX_AUTO_REVIEW_REVISIONS
