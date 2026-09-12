@@ -84,6 +84,8 @@ class ConversationIntent(StrEnum):
     # 用户回答 agent 的追问：现在就跑自动审核 / 复用已有配图。
     RUN_AUTO_REVIEW = "run_auto_review"
     REUSE_DRAFT_ASSETS = "reuse_draft_assets"
+    # 投递/更新公众号草稿箱（后台任务，绝不发表）。
+    PUBLISH_TO_WECHAT_DRAFT = "publish_to_wechat_draft"
 
 
 class ConversationRunStatus(StrEnum):

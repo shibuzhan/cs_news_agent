@@ -66,6 +66,7 @@ GENERATION_RECORD_INTENTS: tuple[str, ...] = (
     ConversationIntent.REGENERATE_DRAFT.value,
     ConversationIntent.GENERATE_DRAFT_IMAGE.value,
     ConversationIntent.RUN_AUTO_REVIEW.value,
+    ConversationIntent.PUBLISH_TO_WECHAT_DRAFT.value,
     "approve_draft",
     "discard_draft",
     "revoke_approval",
@@ -475,16 +476,19 @@ class ContentRepository:
     def create_chat_agent_run(
         self,
         session_id: str,
-        request_message_id: str,
-        intent: ConversationIntent,
+        request_message_id: str | None,
+        intent: ConversationIntent | str,
         auto_review_requested: bool = False,
         auto_illustration_requested: bool = False,
     ) -> ChatAgentRunRow:
         self.get_chat_session(session_id)
+        # 兼容枚举与字符串：Agent 工具里常常直接写字符串，取 .value 会抛
+        # AttributeError（真实故障：投递工具在对话里报“模型暂时不可用”，实为 'str' has no 'value'）。
+        intent_value = intent.value if isinstance(intent, ConversationIntent) else str(intent)
         row = ChatAgentRunRow(
             session_id=session_id,
             request_message_id=request_message_id,
-            intent=intent.value,
+            intent=intent_value,
             auto_review_requested=auto_review_requested,
             auto_illustration_requested=auto_illustration_requested,
             status=ConversationRunStatus.RUNNING.value,
@@ -776,8 +780,8 @@ class ContentRepository:
     def finish_chat_agent_run(
         self,
         run_id: str,
-        response_message_id: str,
-        status: ConversationRunStatus,
+        response_message_id: str | None,
+        status: ConversationRunStatus | str,
         summary: str,
         tool_results: list[dict] | None = None,
         error_message: str | None = None,
@@ -786,7 +790,8 @@ class ContentRepository:
         if row is None:
             raise RepositoryError(f"对话 Agent 运行记录不存在：{run_id}")
         row.response_message_id = response_message_id
-        row.status = status.value
+        # 与 create_chat_agent_run 一致：枚举与字符串都接受，避免调用方写字符串就崩。
+        row.status = status.value if isinstance(status, ConversationRunStatus) else str(status)
         row.summary = summary
         row.tool_results_json = tool_results or []
         row.error_message = error_message

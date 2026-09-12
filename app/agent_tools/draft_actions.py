@@ -14,7 +14,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from app.config import Settings, get_settings
-from app.domain.models import ReviewCommand, ReviewStatus
+from app.domain.models import ConversationIntent, ReviewCommand, ReviewStatus
 from app.jobs import (
     enqueue_auto_review_job,
     enqueue_draft_regeneration_job,
@@ -71,7 +71,7 @@ async def _start_review(
     if existing is not None:
         return {"status": "already_running", "message": "这篇的自动审核已经在处理中。", "draft_id": draft.id}
     review_run = repository.create_auto_review_run(draft.id, None, status="queued")
-    chat_run = repository.create_chat_agent_run(session_id, None, "run_auto_review", False, False)
+    chat_run = repository.create_chat_agent_run(session_id, None, ConversationIntent.RUN_AUTO_REVIEW, False, False)
     repository.add_chat_agent_event(
         chat_run.id, "自动审核中",
         "正在按规则与模型审核当前文案与配图，并按意见改稿一轮。",
@@ -211,7 +211,7 @@ def build_draft_action_tools(session_id: str):
             draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=REVIEWABLE_STATUSES)
             if draft is None:
                 return {"status": "rejected", "message": reason}
-            chat_run = repository.create_chat_agent_run(session_id, None, "generate_draft_image", False, True)
+            chat_run = repository.create_chat_agent_run(session_id, None, ConversationIntent.GENERATE_DRAFT_IMAGE, False, True)
             from app.tools.illustration_planner import style_for, subject_for
 
             task = repository.create_image_generation_job(
@@ -261,7 +261,7 @@ def build_draft_action_tools(session_id: str):
             existing = repository.get_wechat_publication_for_draft(draft.id)
             updating = bool(existing is not None and existing.wechat_draft_media_id)
             # 投递要上传图片并调用微信写接口，耗时远超对话请求时限：只入队，由后台完成并汇报。
-            chat_run = repository.create_chat_agent_run(session_id, None, "publish_to_wechat_draft", False, False)
+            chat_run = repository.create_chat_agent_run(session_id, None, ConversationIntent.PUBLISH_TO_WECHAT_DRAFT, False, False)
             repository.add_chat_agent_event(
                 chat_run.id, "投递任务已入队",
                 f"将{'原地覆盖' if updating else '创建'}公众号草稿（{_draft_label(draft)}），不会发表。",

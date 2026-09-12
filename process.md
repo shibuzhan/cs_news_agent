@@ -3000,3 +3000,21 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 297
+
+- 用户指令：第三次给出截图“怎么还是不行”（同一句请求仍是“对话模型暂时不可用”）。
+- 影响范围：`app/storage/repositories.py`（运行记录的意图/状态兼容 + 队列白名单）、`app/domain/models.py`（新增 `PUBLISH_TO_WECHAT_DRAFT` 意图）、`app/agent_tools/draft_actions.py`（改用枚举）、新增迁移 `migrations/versions/0025_run_request_message_nullable.py`、新增 `tests/test_run_intent_compat.py`；重建 app/worker 并执行迁移。**未发起付费调用**。
+- 根因（第三层，靠上一轮新增的完整堆栈日志才定位）：
+  1. `create_chat_agent_run()` 内部取 `intent.value`，而 Agent 工具传的是**字符串** → `AttributeError: 'str' object has no attribute 'value'`（`publish_to_wechat_draft` 一创建运行就崩；`run_auto_review`/`generate_draft_illustration` 同样写法，只是审核那条走的是路由分支才没暴露）。
+  2. 修掉①后，下一层又暴露：`chat_agent_runs.request_message_id` 是 **NOT NULL**，而 Agent 工具发起的运行没有用户消息 → `NotNullViolation`。
+- 处理结论①（意图/状态兼容）：`create_chat_agent_run` 与 `finish_chat_agent_run` 都改为同时接受枚举与字符串；新增 `ConversationIntent.PUBLISH_TO_WECHAT_DRAFT` 并加入生成记录队列白名单；三个 Agent 工具改用枚举。
+- 处理结论②（迁移）：新增 `0025_run_request_message` 把 `chat_agent_runs.request_message_id` 改为可空——Agent/后台任务发起的运行本就没有用户消息。
+- 施工事故与恢复：迁移版本号首版写成 40 字符（`0025_run_request_message_nullable`），而 `alembic_version.version_num` 是 `varchar(32)` → 启动迁移报 `StringDataRightTruncation`，**app 容器反复重启**；改短为 `0025_run_request_message` 后重建即恢复（DDL 事务回滚，未留下半迁移状态）。
+- 验证（重建后容器内）：容器全部 running、`/api/health` 正常、`alembic current` = 0025、`request_message_id` is_nullable = YES；建/结运行（枚举与字符串）均通过；`list_source_images`（含官方页抓取）→ ok；`attach_source_image` → **done**（下载→校验→入库→绑定，随后清理，草稿插图数回到 4）。后端 **272 项通过、0 失败**（新增 3 项运行意图兼容）。
+- 遗留：用户那条请求仍未由本人验证（需 1 次会话模型调用 + 后台投递覆盖远端草稿）。
+- 授权状态：已确认并完成
+
+-->
