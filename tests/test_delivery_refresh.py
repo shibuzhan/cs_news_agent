@@ -118,6 +118,20 @@ async def test_first_delivery_still_creates_draft(monkeypatch: pytest.MonkeyPatc
     assert repository.created == ["new-media-id"]
 
 
+def test_stale_delivery_allows_new_selection_and_keeps_media_id() -> None:
+    """已投递草稿被改后：允许重新选择图片，并保留 media_id 以便原地覆盖。
+
+    真实故障：`save_wechat_asset_selection` 见到 media_id 就提前返回，新选择被静默丢弃，
+    投递时报“已选择的封面图已删除或不可用”；`save_wechat_publication` 又只允许
+    `ready_to_publish`，已投递的草稿根本无法刷新素材。
+    """
+    source = __import__("pathlib").Path("app/storage/repositories.py").read_text(encoding="utf-8")
+
+    assert 'row.state != "delivery_stale"' in source
+    assert "refreshing_existing_draft" in source
+    assert "ReviewStatus.DRAFTBOX_CREATED.value," in source
+
+
 def test_publication_stale_marking_keeps_media_id_and_clears_selection() -> None:
     """已投递的草稿被修改后：保留 media_id、清空图片选择、标记 delivery_stale。"""
     source = (__import__("pathlib").Path("app/storage/repositories.py").read_text(encoding="utf-8"))

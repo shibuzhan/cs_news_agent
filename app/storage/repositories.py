@@ -870,9 +870,13 @@ class ContentRepository:
         return rows
 
     def delete_generation_run_audit(self, run_id: str) -> str:
-        """仅删除已结束生成任务的运行审计，保留草稿、插图和会话数据。"""
+        """仅删除已结束生成任务的运行审计，保留草稿、插图和会话数据。
+
+        生成记录队列里出现的运行（生成、附件成稿、配图、审核、投递、审核决定）都应可删除，
+        否则前端对这些条目点删除会直接报错。
+        """
         row = self.get_chat_agent_run(run_id)
-        if row.intent != ConversationIntent.COLLECT_NEWS.value:
+        if row.intent not in GENERATION_RECORD_INTENTS:
             raise RepositoryError("仅能删除生成队列中的任务记录")
         if row.status == ConversationRunStatus.RUNNING.value:
             raise RepositoryError("运行中的任务不能删除，请等待完成或超时收束")
@@ -1379,19 +1383,26 @@ class ContentRepository:
         inline_image_urls: list[dict[str, object]],
     ) -> WechatPublicationJobRow:
         draft = self.get_draft(draft_id)
-        if draft.status != ReviewStatus.READY_TO_PUBLISH.value:
-            raise InvalidReviewTransition("只有审核通过且尚未发布的草稿可以创建公众号草稿")
+        # 已投递的草稿也允许刷新投递素材：文案或配图改过之后要能覆盖远端草稿内容。
+        if draft.status not in {
+            ReviewStatus.READY_TO_PUBLISH.value,
+            ReviewStatus.DRAFTBOX_CREATED.value,
+        }:
+            raise InvalidReviewTransition("只有审核通过的文章可以创建或更新公众号草稿")
         # 文案重生成会先让未成功的旧投递素材失效；此处复用同一审计记录，
         # 避免 unique(draft_id) 使新图片无法进入后续投递。
         row = self.get_wechat_publication_for_draft(draft_id)
         if row is None:
             row = WechatPublicationJobRow(draft_id=draft_id)
             self.session.add(row)
+        # 远端草稿已存在时保留 media_id：重新投递走 draft/update 原地覆盖，而不是新建。
+        refreshing_existing_draft = bool(row.wechat_draft_media_id)
         row.cover_asset_id = cover_asset_id
         row.cover_media_id = cover_media_id
         row.inline_asset_ids_json = inline_asset_ids
         row.inline_image_urls_json = inline_image_urls
-        row.wechat_draft_media_id = None
+        if not refreshing_existing_draft:
+            row.wechat_draft_media_id = None
         row.state = "cover_uploaded"
         row.error_message = None
         self.session.flush()
@@ -1412,7 +1423,9 @@ class ContentRepository:
         if row is None:
             row = WechatPublicationJobRow(draft_id=draft_id)
             self.session.add(row)
-        if row.wechat_draft_media_id:
+        if row.wechat_draft_media_id and row.state != "delivery_stale":
+            # 已投递且未标记过期：不接受新的图片选择（历史不变式）。
+            # 标记为 delivery_stale 时说明用户在改已投递的草稿，必须允许重新选择。
             return row
         row.cover_asset_id = cover_asset_id
         row.cover_media_id = None

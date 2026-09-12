@@ -3018,3 +3018,22 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 298
+
+- 用户指令：指出“这段内容不是应该在聊天框里回复吗？现在的状态一团糟”，并贴出投递失败原因（“已更新到微信公众号草稿箱，但投递状态已失效：原先选定的封面图已被删除或不可用…”）。
+- 影响范围：`app/storage/repositories.py`（`save_wechat_asset_selection`、`save_wechat_publication`、`delete_generation_run_audit`）、`app/agent_tools/draft_actions.py`（新增 `_announce`）、新增 `tests/test_tool_runs_reply_in_chat.py`；重建 app/worker。**未发起付费调用**（刷新投递用到 1 次配图规划模型调用与微信素材上传）。
+- 事实①（投递为何失败）：`save_wechat_asset_selection()` 里有一条旧不变式——“已有远端草稿就直接返回”，导致标记过期后**重新选出的图片被静默丢弃**，封面仍为空，于是报“已选择的封面图已删除或不可用”。另外 `save_wechat_publication()` 只接受 `ready_to_publish`，已投递（`draftbox_created`）的草稿根本无法刷新素材。
+- 事实②（报告为何不在聊天框）：Agent 工具创建的运行**没有助手消息**（`has_reply=False`），`_report_wechat_delivery_result` 只能把结果写回不存在的消息，于是汇报留在运行摘要里。
+- 事实③（现场混乱）：那条失败记录未被后续成功刷新覆盖；我在诊断时创建的两条“自检运行”留在队列里；而删除接口只允许删除 `collect_news` 运行——队列扩容后，前端对审核/投递条目点删除会直接报错。
+- 处理结论①：`save_wechat_asset_selection` 仅在“已投递且未标记过期”时才拒绝新选择；`save_wechat_publication` 允许 `ready_to_publish` 与 `draftbox_created`，并在刷新时**保留 `wechat_draft_media_id`**（走 `draft/update` 原地覆盖而不是新建）。
+- 处理结论②：新增 `_announce()`——三个会创建后台运行的工具（审核、配图、投递）都先创建一条助手消息并把运行指向它，后台结束时的 `_report_*` 便更新到**对话里**。
+- 处理结论③：`delete_generation_run_audit` 改为接受队列内的全部运行类型（AGENT 生成记录白名单），修掉前端删除按钮对审核/投递条目报错的问题。
+- 处理结论④（现场收拾）：删除自检运行；把那条失败运行改写为“已由刷新投递解决”并补一条审计事件；在对话里补发一条最终结果消息（含远端 media_id 与本次使用的图片数量）。
+- 实测（真实执行刷新投递）：`delivery_stale` → **重新选图 → 上传封面与 2 张正文图 → `draft/update` 原地覆盖**，远端 `media_id` 保持 `lJDDFrVGnUHQ` 不变、状态回到 `draft_created`；草稿与素材未被破坏。
+- 验证：后端 **275 项通过、0 失败**（新增 2 项：工具运行必须有助手消息、`_announce` 行为）；容器内复核草稿/投递/队列状态；`/api/health` 正常。
+- 授权状态：已确认并完成
+
+-->
