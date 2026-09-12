@@ -30,6 +30,8 @@ def test_rewrite_and_review_decision_commands() -> None:
     assert parse_agent_command("撤销审核").name == "revoke_approval"
     assert parse_agent_command("废弃文案").name == "discard_draft"
     assert parse_agent_command("复用原配图").name == "reuse_draft_assets"
+    assert parse_agent_command("重新投递｜draft=abc12345").name == "publish_to_wechat_draft"
+    assert parse_agent_command("投递到公众号草稿").name == "publish_to_wechat_draft"
 
 
 def test_illustration_command_reads_purpose_and_paragraph() -> None:
@@ -60,6 +62,7 @@ def test_action_tools_are_registered_for_the_session() -> None:
         "discard_draft",
         "revoke_approval",
         "generate_draft_illustration",
+        "publish_to_wechat_draft",
     }
 
 

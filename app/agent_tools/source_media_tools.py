@@ -29,7 +29,12 @@ from app.storage.repositories import ContentRepository
 
 logger = logging.getLogger("news_agent.source_media_tools")
 
-EDITABLE_STATUSES = {ReviewStatus.PENDING_REVIEW.value, ReviewStatus.NEEDS_REVISION.value}
+# 配图可在待审核、需修改，以及“审核通过但尚未投递”时调整：改图会作废旧投递选择。
+EDITABLE_STATUSES = {
+    ReviewStatus.PENDING_REVIEW.value,
+    ReviewStatus.NEEDS_REVISION.value,
+    ReviewStatus.READY_TO_PUBLISH.value,
+}
 MAX_PLACEMENT = 20
 SOURCE_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
@@ -49,7 +54,7 @@ def _resolve_draft(repository: ContentRepository, session_id: str, draft_id: str
             return None, "本会话还没有当前文章：请先明确指定要操作的草稿。"
         draft = repository.get_draft(memory.active_draft_id)
     if draft.status not in EDITABLE_STATUSES:
-        return None, "当前文章不在可编辑状态（待审核或需修改），不能调整图片。"
+        return None, "当前文章已投递或已废弃，不能调整配图；如需修改请先撤回或重新生成。"
     return draft, ""
 
 
@@ -174,6 +179,10 @@ def build_source_media_tools(session_id: str):
             )
             repository.bind_publication_asset(draft.id, asset.id)
             illustration = repository.create_draft_illustration(draft.id, asset.id, resolved_purpose, placement)
+            # 配图变了，旧的投递素材选择就不再成立：作废以免投递用了过期的图。
+            repository.invalidate_unfinished_wechat_publication_for_regeneration(
+                draft.id, "当前文章配图已调整，原投递图片选择已失效；下次投递将只从当前保留图片重新确定。"
+            )
             session.commit()
             logger.info(
                 "source_image_attached draft_id=%s asset_id=%s purpose=%s bytes=%s",

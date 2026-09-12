@@ -1418,15 +1418,39 @@ class ContentRepository:
         self.session.flush()
         return row
 
+    def mark_wechat_publication_stale(self, draft_id: str, reason: str) -> bool:
+        """文案或配图在投递后又被修改：标记为“投递已过期”，下次投递原地覆盖远端草稿。
+
+        远端草稿不会被删除，media_id 保留，重新投递时用 `draft/update` 覆盖内容。
+        """
+        row = self.get_wechat_publication_for_draft(draft_id)
+        if row is None or not row.wechat_draft_media_id:
+            return False
+        row.state = "delivery_stale"
+        row.error_message = reason
+        # 图片可能已变：清空旧选择，重新投递时按当前图片重新确定并重新上传。
+        row.cover_asset_id = None
+        row.cover_media_id = None
+        row.inline_asset_ids_json = []
+        row.inline_image_urls_json = []
+        self.session.flush()
+        return True
+
     def invalidate_unfinished_wechat_publication_for_regeneration(
         self,
         draft_id: str,
         reason: str = "文案已重新生成，旧投递素材已失效；下次投递将重新选择当前图片。",
     ) -> bool:
-        """文案或配图变更后不得复用旧选择；成功草稿箱记录永远不改动。"""
+        """文案或配图变更后不得复用旧选择。
+
+        尚未投递时清空选择；**已经投递过时标记为过期**，由下次投递覆盖远端草稿内容，
+        而不是让远端草稿停留在一个已经过时的快照上。
+        """
         row = self.get_wechat_publication_for_draft(draft_id)
-        if row is None or row.wechat_draft_media_id:
+        if row is None:
             return False
+        if row.wechat_draft_media_id:
+            return self.mark_wechat_publication_stale(draft_id, reason)
         row.cover_asset_id = None
         row.cover_media_id = None
         row.inline_asset_ids_json = []
@@ -1446,6 +1470,16 @@ class ContentRepository:
         draft = self.get_draft(row.draft_id)
         draft.status = ReviewStatus.DRAFTBOX_CREATED.value
         self.record_draftbox_introduction(draft.source_item, draft)
+        self.session.flush()
+        return row
+
+    def mark_wechat_draft_updated(self, job_id: str) -> WechatPublicationJobRow:
+        """远端草稿已按当前文案与配图原地覆盖：回到已创建状态并保留 media_id。"""
+        row = self.get_wechat_publication(job_id)
+        row.state = "draft_created"
+        row.error_message = None
+        draft = self.get_draft(row.draft_id)
+        draft.status = ReviewStatus.DRAFTBOX_CREATED.value
         self.session.flush()
         return row
 

@@ -243,6 +243,46 @@ def build_draft_action_tools(session_id: str):
             "message": f"已开始为《{_draft_label(draft)}》生成{'封面图' if resolved == 'cover' else '正文插图'}。",
         }
 
+    @tool("publish_to_wechat_draft")
+    async def publish_to_wechat_draft(draft_id: str = "") -> dict[str, Any]:
+        """把当前已审核通过的文章投递到微信公众号草稿箱（绝不发表）。
+
+        远端草稿已存在时会**原地覆盖**内容与配图（`draft/update`），不会留下重复草稿；
+        文案或配图在投递后被修改过时，这一步会把远端草稿刷新到最新内容。
+        """
+        settings = get_settings()
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(
+                repository, session_id, draft_id,
+                allowed={ReviewStatus.READY_TO_PUBLISH.value, ReviewStatus.DRAFTBOX_CREATED.value},
+            )
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            if not settings.auto_wechat_draft_enabled:
+                return {"status": "rejected", "message": "公众号草稿投递开关未启用（AUTO_WECHAT_DRAFT_ENABLED=false）。"}
+            existing = repository.get_wechat_publication_for_draft(draft.id)
+            updating = bool(existing is not None and existing.wechat_draft_media_id)
+            try:
+                from app.services.auto_delivery import retry_agent_selected_wechat_draft
+
+                job = await retry_agent_selected_wechat_draft(settings, repository, draft.id)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                logger.warning("agent_tool_publish_failed draft_id=%s error_type=%s", draft.id, type(exc).__name__)
+                return {"status": "failed", "draft_id": draft.id, "message": f"投递失败：{exc}"}
+            action = "已更新公众号草稿" if updating else "已创建公众号草稿"
+            logger.info("agent_tool_publish_done draft_id=%s updated=%s job_id=%s", draft.id, updating, job.id)
+            return {
+                "status": "done",
+                "draft_id": draft.id,
+                "draft_title": _draft_label(draft),
+                "updated_remote": updating,
+                "job_state": job.state,
+                "message": f"{action}（{_draft_label(draft)}），未提交发表。",
+            }
+
     return [
         run_auto_review,
         rewrite_draft,
@@ -250,4 +290,5 @@ def build_draft_action_tools(session_id: str):
         discard_draft,
         revoke_approval,
         generate_draft_illustration,
+        publish_to_wechat_draft,
     ]

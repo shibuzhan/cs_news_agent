@@ -179,25 +179,56 @@ async def prepare_agent_selected_wechat_assets(
 async def retry_agent_selected_wechat_draft(
     settings: Settings, repository: ContentRepository, draft_id: str,
 ):
-    """只重试草稿箱投递，复用已审核文案和已生成图片，不触发生成或审核。"""
+    """重试/更新草稿箱投递：复用已审核文案，必要时按当前图片重新上传。
+
+    - 远端草稿已存在且标记为“投递已过期”：用 `draft/update` **原地覆盖**远端草稿内容；
+    - 尚未投递：走 `draft/add` 新建；
+    - 覆盖失败（例如远端草稿已被删除）时回退为新建，不让投递彻底失败。
+    """
     draft = repository.get_draft(draft_id)
-    if draft.status != "ready_to_publish":
-        raise RuntimeError("只有审核通过且尚未入草稿箱的文章可以重新投递")
+    if draft.status not in {"ready_to_publish", "draftbox_created"}:
+        raise RuntimeError("只有审核通过的文章可以投递或更新公众号草稿")
     job = repository.get_wechat_publication_for_draft(draft_id)
     if job is None or not job.cover_media_id:
         job = await prepare_agent_selected_wechat_assets(settings, repository, draft_id)
-    if job.wechat_draft_media_id:
-        return job
     if not job.cover_media_id:
-        raise RuntimeError("投递记录缺少公众号封面素材，无法重新投递")
+        raise RuntimeError("投递记录缺少公众号封面素材，无法投递")
+    title = (draft.title_options_json or ["未命名草稿"])[0]
+    digest = normalize_wechat_description(draft.summary_cn)
+    content_html = render_wechat_html(draft.body, job.inline_image_urls_json or [])
+    if job.wechat_draft_media_id:
+        try:
+            async with WechatOfficialAccountTool(settings) as client:
+                await client.update_draft(
+                    media_id=job.wechat_draft_media_id,
+                    title=title,
+                    digest=digest,
+                    content_html=content_html,
+                    source_url=draft.source_url,
+                    cover_media_id=job.cover_media_id,
+                )
+        except WechatOfficialAccountError as exc:
+            # 远端草稿可能已被删除：退化为新建，而不是让用户卡在过期状态。
+            logger.warning("wechat_draft_update_failed draft_id=%s job_id=%s error_type=%s", draft_id, job.id, type(exc).__name__)
+            repository.mark_wechat_status(job.id, "draft_failed", error_message=str(exc))
+            try:
+                async with WechatOfficialAccountTool(settings) as client:
+                    media_id = await client.create_draft(
+                        title=title, digest=digest, content_html=content_html,
+                        source_url=draft.source_url, cover_media_id=job.cover_media_id,
+                    )
+            except WechatOfficialAccountError as create_exc:
+                repository.mark_wechat_status(job.id, "draft_failed", error_message=str(create_exc))
+                raise
+            logger.info("wechat_draft_recreated draft_id=%s job_id=%s", draft_id, job.id)
+            return repository.mark_wechat_draft_created(job.id, media_id)
+        logger.info("wechat_draft_updated draft_id=%s job_id=%s media_id=%s", draft_id, job.id, job.wechat_draft_media_id)
+        return repository.mark_wechat_draft_updated(job.id)
     try:
         async with WechatOfficialAccountTool(settings) as client:
             media_id = await client.create_draft(
-                title=(draft.title_options_json or ["未命名草稿"])[0],
-                digest=normalize_wechat_description(draft.summary_cn),
-                content_html=render_wechat_html(draft.body, job.inline_image_urls_json or []),
-                source_url=draft.source_url,
-                cover_media_id=job.cover_media_id,
+                title=title, digest=digest, content_html=content_html,
+                source_url=draft.source_url, cover_media_id=job.cover_media_id,
             )
     except WechatOfficialAccountError as exc:
         repository.mark_wechat_status(job.id, "draft_failed", error_message=str(exc))

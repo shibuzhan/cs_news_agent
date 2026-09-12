@@ -2935,3 +2935,20 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 293
+
+- 用户指令：①“尝试测试”（要求实测来源截图链路）；②指出“目前审核通过就已经发送到草稿箱了，再修改没意义”；③确认策略“**有真实截图优先用真实截图**，保持通过即投递”，并追问“微信接口允许废弃草稿箱内容吗？如果允许则检测到草稿箱内容仍存在时废弃草稿箱内容上传新内容”；④“**还是优先读取存储的 readme，为空才实时重取**”。
+- 影响范围：`app/agent_tools/source_media_tools.py`、`app/agent_tools/draft_assets.py`、`app/storage/repositories.py`（`mark_wechat_publication_stale` / `mark_wechat_draft_updated` / 失效逻辑）、`app/services/auto_delivery.py`（重投递改为原地覆盖）、`app/agent_tools/draft_actions.py`（新增 `publish_to_wechat_draft`）、`app/services/agent_commands.py`（投递命令）、`tests/test_delivery_refresh.py`；重建 app/worker。**未发起付费调用**（测试只用免费 HTTP 与假客户端）。
+- 实测结果（端到端，网络恢复后）：容器可访问 GitHub API 与图片 CDN（200）；用草稿自身来源实取 README **35,217 字符 → 3 张候选图**，其中两张正是仓库 `docs/media/` 里的官方截图；`list_source_images` 与 `attach_source_image` 首次均被**状态门槛**拒绝（该草稿已是 `ready_to_publish`）。
+- 处理结论①（配图状态门槛）：配图工具改为允许“待审核 / 需修改 / **审核通过但未投递**”，并把提示改为“已投递或已废弃不能调整配图”；任何配图变更都会调用失效逻辑。
+- 处理结论②（回答微信接口能力）：官方接口支持 `draft/add`（新建）、`draft/update`（原地覆盖指定草稿）、`draft/delete`（删除）；我们已实现前两个，**未实现删除**。按用户要求采用**原地覆盖**（等价于“废弃旧内容+上传新内容”，且不产生孤儿草稿）。
+- 处理结论③（投递后再修改的处理）：原先 `invalidate_unfinished_wechat_publication_for_regeneration` 在已投递时**直接返回 False**（“成功草稿箱记录永远不改动”），这正是“改了没意义”的根源。现在：已投递时改为 `mark_wechat_publication_stale()`——保留 `media_id`、清空旧的图片选择并标记 `delivery_stale`；`retry_agent_selected_wechat_draft`（含新增 Agent 工具 `publish_to_wechat_draft`）在远端草稿存在时走 `draft/update` **原地覆盖**内容与配图，覆盖失败（远端已删）时**退化为新建**，不会让用户卡在过期状态。
+- 处理结论④（README 来源顺序）：按用户要求保持“**优先读存储的 README，为空才实时重取**”（`_readme_text` 现状：来源快照 → 来源正文）。副作用已知：存储副本较旧时候选图会少于实时 README（本次实测 1 vs 3）。
+- 验证：后端 **258 项通过、0 失败**（新增 4 项：远端草稿原地覆盖、远端缺失时退化为新建、首次投递仍为新建、过期标记保留 media_id 且清空选择）；重建前确认无活动任务；容器内确认 7 个动作工具已注册、`重新投递／投递到公众号草稿` 命令解析正确；`/api/health` 正常。
+- 遗留：①微信侧“删除草稿”未实现（当前用覆盖，不产生孤儿草稿）；②真实截图优先目前依赖 Skill 与提示词，尚未在生成流程里主动提示“要不要用官方截图”——若需要，可在审核前加一次询问。
+- 授权状态：已确认并完成
+
+-->

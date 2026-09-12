@@ -15,7 +15,12 @@ from app.storage.database import SessionLocal
 from app.storage.repositories import ContentRepository
 
 
-EDITABLE_STATUSES = {ReviewStatus.PENDING_REVIEW.value, ReviewStatus.NEEDS_REVISION.value}
+# 配图可在待审核、需修改，以及“审核通过但尚未投递”时调整：改图会作废旧投递选择。
+EDITABLE_STATUSES = {
+    ReviewStatus.PENDING_REVIEW.value,
+    ReviewStatus.NEEDS_REVISION.value,
+    ReviewStatus.READY_TO_PUBLISH.value,
+}
 MAX_PLACEMENT = 20
 
 
@@ -26,7 +31,7 @@ def _resolve_draft(repository: ContentRepository, session_id: str) -> tuple[Any 
         return None, "本会话还没有当前文章：请先明确指定要操作的草稿。"
     draft = repository.get_draft(memory.active_draft_id)
     if draft.status not in EDITABLE_STATUSES:
-        return None, "当前文章不在可编辑状态（待审核或需修改），不能调整配图。"
+        return None, "当前文章已投递或已废弃，不能调整配图；如需修改请先撤回或重新生成。"
     return draft, ""
 
 
@@ -78,6 +83,9 @@ def build_draft_asset_tools(session_id: str):
                 if item.purpose == "cover" and item.id != illustration_id:
                     repository.update_draft_illustration(draft.id, item.id, "inline", item.placement_after_paragraph or 1)
             updated = repository.update_draft_illustration(draft.id, target.id, "cover", 0)
+            repository.invalidate_unfinished_wechat_publication_for_regeneration(
+                draft.id, "当前文章配图已调整，原投递图片选择已失效；下次投递将只从当前保留图片重新确定。"
+            )
             session.commit()
             return {"status": "ok", "illustration": _illustration_view(updated, repository)}
 
@@ -95,6 +103,9 @@ def build_draft_asset_tools(session_id: str):
                 return {"status": "rejected", "reason": "该插图不属于当前文章。"}
             placement = max(0, min(int(placement_after_paragraph), MAX_PLACEMENT))
             updated = repository.update_draft_illustration(draft.id, target.id, "inline", placement)
+            repository.invalidate_unfinished_wechat_publication_for_regeneration(
+                draft.id, "当前文章配图已调整，原投递图片选择已失效；下次投递将只从当前保留图片重新确定。"
+            )
             session.commit()
             return {"status": "ok", "illustration": _illustration_view(updated, repository)}
 
@@ -129,6 +140,9 @@ def build_draft_asset_tools(session_id: str):
             resolved = purpose if purpose in {"cover", "inline"} else "inline"
             placement = max(0, min(int(placement_after_paragraph), MAX_PLACEMENT))
             row = repository.create_draft_illustration(draft.id, asset_id, resolved, placement)
+            repository.invalidate_unfinished_wechat_publication_for_regeneration(
+                draft.id, "当前文章配图已调整，原投递图片选择已失效；下次投递将只从当前保留图片重新确定。"
+            )
             session.commit()
             return {"status": "ok", "illustration": _illustration_view(row, repository)}
 

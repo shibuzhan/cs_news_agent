@@ -41,6 +41,9 @@ _PREFIXES: tuple[tuple[str, str, str], ...] = (
     ("重写本次生成的文案", "rewrite_draft", "重写文案"),
     ("重新生成文案", "rewrite_draft", "重写文案"),
     ("重写", "rewrite_draft", "重写文案"),
+    ("投递到公众号草稿", "publish_to_wechat_draft", "投递到公众号草稿箱"),
+    ("更新公众号草稿", "publish_to_wechat_draft", "更新公众号草稿"),
+    ("重新投递", "publish_to_wechat_draft", "重新投递到公众号草稿箱"),
     ("复用配图", "reuse_draft_assets", "复用原配图"),
     ("复用原配图", "reuse_draft_assets", "复用原配图"),
 )
