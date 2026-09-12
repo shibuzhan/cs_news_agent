@@ -221,6 +221,7 @@ class ContentDeepAgent:
             logger.warning(
                 "deep_agent_resolution_failed session_id=%s failure_kind=%s failure_stage=%s error_type=%s failure_reason=%s",
                 session_id, failure_kind, failure_stage, type(cause).__name__, failure_reason,
+                exc_info=cause,  # 只记类型无法排查：保留完整堆栈
             )
             return self._failed_resolution(failure_kind)
 

@@ -15,11 +15,13 @@ from app.storage.database import SessionLocal
 from app.storage.repositories import ContentRepository
 
 
-# 配图可在待审核、需修改，以及“审核通过但尚未投递”时调整：改图会作废旧投递选择。
+# 配图可在待审核、需修改、审核通过、以及**已投递进公众号草稿箱**时调整：
+# 已投递时改动会把投递标记为“已过期”，重新投递会原地覆盖远端草稿内容。
 EDITABLE_STATUSES = {
     ReviewStatus.PENDING_REVIEW.value,
     ReviewStatus.NEEDS_REVISION.value,
     ReviewStatus.READY_TO_PUBLISH.value,
+    ReviewStatus.DRAFTBOX_CREATED.value,
 }
 MAX_PLACEMENT = 20
 
@@ -31,7 +33,7 @@ def _resolve_draft(repository: ContentRepository, session_id: str) -> tuple[Any 
         return None, "本会话还没有当前文章：请先明确指定要操作的草稿。"
     draft = repository.get_draft(memory.active_draft_id)
     if draft.status not in EDITABLE_STATUSES:
-        return None, "当前文章已投递或已废弃，不能调整配图；如需修改请先撤回或重新生成。"
+        return None, "当前文章已发布或已废弃，不能调整配图；已投递公众号草稿的文章可以继续改，改完重新投递会覆盖远端草稿。"
     return draft, ""
 
 

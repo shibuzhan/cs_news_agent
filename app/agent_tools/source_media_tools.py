@@ -30,11 +30,13 @@ from app.storage.repositories import ContentRepository
 
 logger = logging.getLogger("news_agent.source_media_tools")
 
-# 配图可在待审核、需修改，以及“审核通过但尚未投递”时调整：改图会作废旧投递选择。
+# 配图可在待审核、需修改、审核通过、以及**已投递进公众号草稿箱**时调整：
+# 已投递时改动会把投递标记为“已过期”，重新投递会原地覆盖远端草稿内容。
 EDITABLE_STATUSES = {
     ReviewStatus.PENDING_REVIEW.value,
     ReviewStatus.NEEDS_REVISION.value,
     ReviewStatus.READY_TO_PUBLISH.value,
+    ReviewStatus.DRAFTBOX_CREATED.value,
 }
 MAX_PLACEMENT = 20
 SOURCE_IMAGE_MAX_BYTES = 8 * 1024 * 1024
@@ -57,7 +59,7 @@ def _resolve_draft(repository: ContentRepository, session_id: str, draft_id: str
             return None, "本会话还没有当前文章：请先明确指定要操作的草稿。"
         draft = repository.get_draft(memory.active_draft_id)
     if draft.status not in EDITABLE_STATUSES:
-        return None, "当前文章已投递或已废弃，不能调整配图；如需修改请先撤回或重新生成。"
+        return None, "当前文章已发布或已废弃，不能调整配图；已投递公众号草稿的文章可以继续改，改完重新投递会覆盖远端草稿。"
     return draft, ""
 
 
@@ -65,7 +67,20 @@ def _readme_text(settings: Settings, repository: ContentRepository, draft: Any) 
     """优先取会话来源快照；已删除时退回来源条目正文。"""
     source = draft.source_item
     try:
-        snapshot = DraftSourceSnapshotStore(settings, repository).restore_github_readme(draft.id, source)
+        # 快照存储要求 RawSourceItem（会读 .metadata 并 model_copy），
+        # 直接传 ORM 行会抛 AttributeError，这里按字段重建一次。
+        from app.domain.models import RawSourceItem
+
+        item = RawSourceItem(
+            source_kind=source.source_kind,
+            external_id=source.external_id,
+            title=source.title,
+            url=source.url,
+            source_name=source.source_name or "GitHub Trending",
+            summary=source.summary or "",
+            content=source.content or "",
+        )
+        snapshot = DraftSourceSnapshotStore(settings, repository).restore_github_readme(draft.id, item)
         if snapshot is not None and snapshot.content:
             return snapshot.content
     except Exception as exc:  # 快照读取失败不应阻断取图
@@ -103,7 +118,7 @@ def build_source_media_tools(session_id: str):
                 from app.tools.search_tools import ExaMcpSearchError, ExaMcpSearchTool
 
                 try:
-                    fetched = await ExaMcpSearchTool(settings).fetch([draft.source_url])
+                    fetched = await ExaMcpSearchTool(settings).fetch([str(draft.source_url or "")])
                     for entry in fetched:
                         images.extend(
                             extract_image_urls(str(entry.get("content") or ""), base_url=draft.source_url or "", origin="official_site")

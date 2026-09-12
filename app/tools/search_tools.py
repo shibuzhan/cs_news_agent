@@ -50,7 +50,12 @@ class ExaMcpSearchTool:
         """仅供后续明确的页面补全文本能力调用，不由当前生成流程自动触发。"""
         if not self.enabled:
             return []
-        cleaned = [url.strip() for url in urls if url.strip().startswith(("https://", "http://"))]
+        # 入参可能来自 Pydantic HttpUrl（草稿字段）而不是 str，必须先归一化再处理。
+        cleaned = [
+            text
+            for raw in urls
+            if (text := str(raw or "").strip()).startswith(("https://", "http://"))
+        ]
         cleaned = cleaned[: self._max_results]
         if not cleaned:
             return []

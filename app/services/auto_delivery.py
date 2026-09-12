@@ -78,7 +78,7 @@ def _model_draft_snapshot(repository: ContentRepository, draft_id: str) -> Simpl
     source = draft.source_item
     return SimpleNamespace(
         body=draft.body,
-        source_url=draft.source_url,
+        source_url=str(draft.source_url or ""),
         source_name=draft.source_name,
         title_options_json=list(draft.title_options_json or []),
         tags_json=list(draft.tags_json or []),
@@ -204,7 +204,7 @@ async def retry_agent_selected_wechat_draft(
                     title=title,
                     digest=digest,
                     content_html=content_html,
-                    source_url=draft.source_url,
+                    source_url=str(draft.source_url or ""),
                     cover_media_id=job.cover_media_id,
                 )
         except WechatOfficialAccountError as exc:
@@ -215,7 +215,7 @@ async def retry_agent_selected_wechat_draft(
                 async with WechatOfficialAccountTool(settings) as client:
                     media_id = await client.create_draft(
                         title=title, digest=digest, content_html=content_html,
-                        source_url=draft.source_url, cover_media_id=job.cover_media_id,
+                        source_url=str(draft.source_url or ""), cover_media_id=job.cover_media_id,
                     )
             except WechatOfficialAccountError as create_exc:
                 repository.mark_wechat_status(job.id, "draft_failed", error_message=str(create_exc))
@@ -228,7 +228,7 @@ async def retry_agent_selected_wechat_draft(
         async with WechatOfficialAccountTool(settings) as client:
             media_id = await client.create_draft(
                 title=title, digest=digest, content_html=content_html,
-                source_url=draft.source_url, cover_media_id=job.cover_media_id,
+                source_url=str(draft.source_url or ""), cover_media_id=job.cover_media_id,
             )
     except WechatOfficialAccountError as exc:
         repository.mark_wechat_status(job.id, "draft_failed", error_message=str(exc))

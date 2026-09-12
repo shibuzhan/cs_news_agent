@@ -2983,3 +2983,20 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 296
+
+- 用户指令：再次给出截图“怎么还是不行”（同一句请求再次报“对话模型暂时不可用”）。
+- 影响范围：`app/tools/search_tools.py`、`app/agent_tools/source_media_tools.py`、`app/services/auto_delivery.py`、`app/agents/content_deep_agent.py`（失败时记录完整堆栈）、新增 `tests/test_httpurl_compat.py`；重建 app/worker。**未发起付费调用**（验证只用了 1 次 Exa 检索读取，图像生成/审核均未触发）。
+- 根因（`AttributeError`，与模型和超时都无关）：草稿的 `source_url` 是 Pydantic **`HttpUrl` 对象**（本次会话里它已是 `str`，但另一条草稿上不是），而我把它直接传给了 `ExaMcpSearchTool.fetch()`，内部执行 `url.strip()` → `AttributeError: 'HttpUrl' object has no attribute 'strip'`；该异常未被捕获，直接冒泡成 `agent_invoke` 失败，上层归类为“模型不可用”，**归因完全误导**。
+- 处理结论①（HttpUrl 兼容）：`ExaMcpSearchTool.fetch()` 内部先把入参归一化为 `str`；`source_media_tools` 三处调用改为 `str(draft.source_url or "")`；投递路径的 `source_url` 同样转字符串（httpx 的 JSON 编码不接受 HttpUrl）。
+- 处理结论②（另一处同类缺陷）：`_readme_text` 之前把 **ORM 行**直接传给 `restore_github_readme()`，而该存储要求 `RawSourceItem`（会读 `.metadata` 并 `model_copy`）——改为按字段重建 `RawSourceItem`，不再依赖“异常被吞掉后回退”。
+- 处理结论③（可诊断性）：DeepAgent 失败日志改为 `exc_info=cause`，保留完整堆栈。此前只记 `error_type`，导致这类问题需要靠猜测定位（本次就是靠逐行复现才找到）。
+- 处理结论④（已投递草稿可继续改）：草稿已进公众号草稿箱（`draftbox_created`）时，配图工具此前直接拒绝，与用户“改完截图覆盖远端草稿”的诉求冲突。现在 `draftbox_created` 也允许调整配图；改动会把投递标记为 `delivery_stale`，重新投递用 `draft/update` 原地覆盖远端内容；只有 `published`（已发表）与 `discarded` 仍拒绝。
+- 验证：后端 **269 项通过、0 失败**（新增 4 项：检索工具接受 HttpUrl、来源工具强制字符串化并重建 RawSourceItem、投递 source_url 字符串化、失败日志保留堆栈）；重建后在容器内实测 `fetch([HttpUrl])` 不再抛异常；对**已投递**草稿执行 `list_source_images`（含官方页抓取）均返回 `ok`。重建前确认无活动任务。
+- 遗留：用户那条请求需要再试一次（1 次会话模型调用；若要求抓官方页则再加 1 次检索；投递在后台执行并覆盖远端草稿），未擅自触发。
+- 授权状态：已确认并完成
+
+-->
