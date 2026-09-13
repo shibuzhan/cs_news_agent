@@ -281,13 +281,38 @@ class ContentRepository:
         return row
 
     def update_chat_message(self, message_id: str, content: str) -> ChatMessageRow:
-        row = self.session.get(ChatMessageRow, message_id)
-        if row is None:
-            raise RepositoryError(f"聊天消息不存在：{message_id}")
-        row.content = content
-        self.get_chat_session(row.session_id).updated_at = utcnow()
+        """写入任务结果：**追加一条新消息**，不覆盖原来的占位消息。
+
+        真实反馈：“完成后应该新消息回复而不是把旧消息覆盖”——此前收尾汇报会改写
+        “好，正在为《…》生成…”那条占位消息，历史被抹掉、时间戳还对不上。
+        现在占位消息保留，结果作为新消息追加（同一会话、assistant 角色）。
+        """
+        original = self.session.get(ChatMessageRow, message_id)
+        if original is None:
+            raise RepositoryError(f"对话消息不存在：{message_id}")
+        row = ChatMessageRow(session_id=original.session_id, role="assistant", content=content)
+        self.session.add(row)
+        self.get_chat_session(original.session_id).updated_at = utcnow()
         self.session.flush()
         return row
+
+    def append_run_reply(self, run_id: str, text: str) -> str:
+        """给运行**追加**一条结果回复，并把 `response_message_id` 前移到新消息。
+
+        占位消息（“正在生成…”）保持不变；后续汇报继续追加，历史不会被覆盖。
+        返回新消息 id（供 `finish_chat_agent_run` 记录“最新回复”）。
+        """
+        run = self.get_chat_agent_run(run_id)
+        anchor_id = run.response_message_id or run.request_message_id
+        anchor = self.session.get(ChatMessageRow, anchor_id) if anchor_id else None
+        if anchor is None:
+            raise RepositoryError(f"运行没有可用的会话消息：{run_id}")
+        row = ChatMessageRow(session_id=anchor.session_id, role="assistant", content=text)
+        self.session.add(row)
+        self.session.flush()
+        run.response_message_id = row.id
+        self.flush()
+        return row.id
 
     def list_chat_messages(self, session_id: str) -> list[ChatMessageRow]:
         self.get_chat_session(session_id)
@@ -609,6 +634,20 @@ class ContentRepository:
         if since is not None:
             statement = statement.where(ImageGenerationJobRow.created_at >= since)
         return list(self.session.scalars(statement.order_by(ImageGenerationJobRow.created_at.asc())))
+
+    def count_active_image_jobs(self, draft_id: str, statuses: tuple[str, ...] = ("queued", "running")) -> int:
+        """该草稿还有多少个未进入终态的配图任务（用于“配图完成后自动审核”）。"""
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(ImageGenerationJobRow)
+                .where(
+                    ImageGenerationJobRow.draft_id == draft_id,
+                    ImageGenerationJobRow.status.in_(statuses),
+                )
+            )
+            or 0
+        )
 
     def update_image_generation_job(
         self,

@@ -78,13 +78,38 @@ def _announce(repository: ContentRepository, session_id: str, run: Any, pending:
 async def _start_review(
     settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *, deliver: bool
 ) -> dict[str, Any]:
+    from app.services.pending_reviews import ACTIVE_IMAGE_STATUSES, mark_pending_review
+
     repository.expire_stale_auto_review_run(draft.id, settings.collection_job_timeout_seconds)
     existing = repository.find_active_auto_review_run(draft.id)
     if existing is not None:
         return {"status": "already_running", "message": "这篇的自动审核已经在处理中。", "draft_id": draft.id}
-    review_run = repository.create_auto_review_run(draft.id, None, status="queued")
+    # 配图还在生成时不立刻审核：否则审核会看到“还没有正文插图”的草稿，
+    # 汇报也会与实际时序矛盾（真实反馈：“感觉这样不是很合理”）。
+    active_images = repository.count_active_image_jobs(draft.id, ACTIVE_IMAGE_STATUSES)
     chat_run = repository.create_chat_agent_run(session_id, None, ConversationIntent.RUN_AUTO_REVIEW, False, False)
+    if active_images:
+        mark_pending_review(repository, draft.id, deliver=deliver, chat_run_id=chat_run.id)
+        _announce(
+            repository, session_id, chat_run,
+            f"《{_draft_label(draft)}》还有 {active_images} 个配图任务在生成，配图完成后我会自动开始审核。",
+        )
+        repository.add_chat_agent_event(
+            chat_run.id, "审核已排队（等待配图）",
+            f"当前有 {active_images} 个配图任务未完成；它们结束后自动开始审核，无需再提醒我。",
+            "running",
+            metadata={"phase": "review", "state": "queued", "draft_ids": [draft.id], "pending_images": active_images},
+        )
+        return {
+            "status": "queued_after_images",
+            "draft_id": draft.id,
+            "draft_title": _draft_label(draft),
+            "pending_images": active_images,
+            "chat_run_id": chat_run.id,
+            "message": f"配图完成后会自动审核《{_draft_label(draft)}》（当前还有 {active_images} 个配图任务）。",
+        }
     _announce(repository, session_id, chat_run, f"好，正在审核《{_draft_label(draft)}》；通过后不会自动发表。")
+    review_run = repository.create_auto_review_run(draft.id, None, status="queued")
     repository.add_chat_agent_event(
         chat_run.id, "自动审核中",
         "正在按规则与模型审核当前文案与配图，并按意见改稿一轮。",

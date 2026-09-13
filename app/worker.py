@@ -603,7 +603,7 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
             run_id=chat_run_id,
         )
         if chat_run.response_message_id:
-            repository.update_chat_message(chat_run.response_message_id, reply)
+            repository.append_run_reply(chat_run_id, reply)
         repository.finish_chat_agent_run(
             chat_run_id, chat_run.response_message_id, ConversationRunStatus.COMPLETED, summary, [result]
         )
@@ -679,7 +679,7 @@ async def _report_wechat_delivery_result(chat_run_id: str, draft_id: str, *, upd
             run_id=chat_run_id,
         )
         if chat_run.response_message_id:
-            repository.update_chat_message(chat_run.response_message_id, reply)
+            repository.append_run_reply(chat_run_id, reply)
         repository.finish_chat_agent_run(
             chat_run_id, chat_run.response_message_id,
             ConversationRunStatus.FAILED if error else ConversationRunStatus.COMPLETED,
@@ -740,6 +740,39 @@ async def process_image_generation_job(_ctx: dict, image_task_id: str) -> None:
         await enqueue_collection_finalizer(settings, run_id, None)
 
 
+def _draft_report_facts(repository: ContentRepository, draft_ids: list[str]) -> list[dict[str, Any]]:
+    """汇报用事实：每篇草稿的标题/状态/版本、真实截图与 AI 配图数量、当前审核状态。
+
+    真实反馈：“感觉这样不是很合理”——报告说“本次采集未产出草稿…自动审核未被触发”，
+    实际是在**已有待审核草稿**上补了配图并已开始审核。事实齐了，模型才不会写出矛盾汇报。
+    """
+    facts: list[dict[str, Any]] = []
+    for draft_id in draft_ids:
+        try:
+            draft = repository.get_draft(draft_id)
+        except Exception:  # 草稿被删除时不影响收束
+            continue
+        illustrations = repository.list_draft_illustrations(draft_id)
+        real = sum(1 for item in illustrations if not item.provider)
+        active_review = repository.find_active_auto_review_run(draft_id)
+        history = repository.list_auto_review_runs(draft_id)
+        latest_review = active_review or (history[-1] if history else None)
+        facts.append(
+            {
+                "draft_id": draft_id,
+                "title": (draft.title_options_json or [""])[0],
+                "status": draft.status,
+                "version": draft.version,
+                "illustrations_total": len(illustrations),
+                "illustrations_from_source": real,
+                "illustrations_ai_generated": len(illustrations) - real,
+                "review_status": getattr(latest_review, "status", None) or "none",
+                "review_active": active_review is not None,
+            }
+        )
+    return facts
+
+
 async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_message_id: str | None = None) -> None:
     """所有图片任务终态后才审核/投递；多次入队通过 finalizing 事件幂等收束。"""
     with SessionLocal() as session:
@@ -761,6 +794,12 @@ async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_me
             None,
         )
         draft_ids = list((text_event.metadata_json if text_event else {}).get("draft_ids", []))
+        # 纯配图运行没有“文字生成”事件：此时草稿来自图片任务本身。
+        # 否则 facts 里 draft_ids 为空，汇报会写成“本次采集未产出草稿”，
+        # 完全掩盖了“在已有待审核草稿上补配图”这个事实。
+        if not draft_ids:
+            draft_ids = list(dict.fromkeys(task.draft_id for task in tasks))
+        run_intent = run.intent
         failed_image_tasks = [task for task in tasks if task.status in {"failed", "timed_out"}]
         if failed_image_tasks:
             repository.add_chat_agent_event(
@@ -818,6 +857,12 @@ async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_me
             repository.add_chat_agent_event(chat_run_id, "未启用自动审核", "本次任务未勾选自动审核。", metadata={"phase": "review", "state": "disabled"})
         summary = next((event.detail for event in reversed(repository.list_chat_agent_events(chat_run_id)) if event.metadata_json.get("phase") == "text"), "后台任务已完成")
         image_results = [{"task_id": task.id, "status": task.status, "illustration_id": task.illustration_id, "error": task.error_message} for task in tasks]
+        # 配图终态后，才真正发起此前排队的审核（对话 Agent 在配图未完成时请求过审核）。
+        from app.services.pending_reviews import launch_pending_reviews, pending_review_drafts
+
+        queued_reviews = pending_review_drafts(repository, draft_ids)
+        launched_reviews = await launch_pending_reviews(settings, repository, draft_ids)
+        drafts_facts = _draft_report_facts(repository, draft_ids)
         message_id = response_message_id or run.response_message_id
         final_status = (
             ConversationRunStatus.WAITING_CONFIRMATION
@@ -829,11 +874,18 @@ async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_me
             reply = await asyncio.to_thread(
                 compose_task_reply,
                 settings,
-                task="采集→配图→自动审核全流程结束",
+                task="生成配图" if run_intent == ConversationIntent.GENERATE_DRAFT_IMAGE.value else "采集→配图→自动审核全流程结束",
                 facts={
+                    "task_intent": run_intent,
                     "draft_ids": draft_ids,
+                    # 每篇草稿的标题/状态/版本、真实截图与 AI 配图数量、当前审核状态：
+                    # 报告据此说明“在已有草稿上做了什么”，不再用“未产出草稿”掩盖。
+                    "drafts": drafts_facts,
+                    "existing_draft_only": bool(draft_ids) and not text_event,
                     "auto_review_requested": run.auto_review_requested,
                     "auto_review_results": auto_results,
+                    "auto_review_queued_after_images": queued_reviews,
+                    "auto_review_launched_after_images": launched_reviews,
                     "images": {
                         "total": len(tasks),
                         "failed": sum(1 for task in tasks if task.status in {"failed", "timed_out"}),
@@ -845,8 +897,9 @@ async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_me
                 fallback=summary,
                 run_id=chat_run_id,
             )
-            repository.update_chat_message(message_id, reply)
-            repository.finish_chat_agent_run(chat_run_id, message_id, final_status, summary, [*image_results, *auto_results])
+            # 完成后**新消息回复**：占位消息保留，结果作为新消息追加并前移运行指针。
+            reply_message_id = repository.append_run_reply(chat_run_id, reply)
+            repository.finish_chat_agent_run(chat_run_id, reply_message_id, final_status, summary, [*image_results, *auto_results])
         session.commit()
     logger.info("collection_finalized chat_run_id=%s", chat_run_id)
 

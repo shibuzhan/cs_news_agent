@@ -346,6 +346,40 @@ def chat_agent_run_to_dict(
         return {"state": state, "label": latest.title}
 
     image_jobs = repository.list_image_generation_jobs(row.id)
+
+    def image_phase_progress() -> dict[str, str]:
+        """配图阶段按**图片任务的真实状态**显示。
+
+        真实反馈：纯配图运行里最后一条 image 事件是收束时的“未启用自动配图”，
+        状态块因此显示“未启用自动配图”，把真正生成过的图掩盖了。
+        """
+        if not image_jobs:
+            return phase_progress("image", "等待配图规划")
+        total = len(image_jobs)
+        done = sum(1 for job in image_jobs if job.status == "completed")
+        failed = sum(1 for job in image_jobs if job.status in {"failed", "timed_out"})
+        if failed:
+            return {"state": "failed", "label": f"配图 {done}/{total}（{failed} 张失败）"}
+        if done == total:
+            return {"state": "completed", "label": f"配图已完成（{done} 张）"}
+        return {"state": "running", "label": f"正在生成配图（{done}/{total}）"}
+
+    def text_phase_progress() -> dict[str, str]:
+        """文字阶段：草稿已存在就是“已生成”，不能因为本运行只做配图而显示“等待文字生成”。"""
+        from_events = phase_progress("text", "等待文字生成")
+        if from_events.get("state") == "running":
+            return from_events
+        for event in events:
+            values = event.metadata_json.get("draft_ids", [])
+            if not isinstance(values, list) or not values:
+                continue
+            try:
+                draft = repository.get_draft(values[0])
+            except Exception:  # 草稿已删除时退回事件推断
+                break
+            return {"state": "completed", "label": f"文案已生成（版本 {draft.version}）"}
+        return from_events
+
     # 事件元数据里的 draft_ids 是运行与草稿的唯一关联；前端据此在草稿条目上显示“审核中/重写中”。
     draft_ids: list[str] = []
     for event in events:
@@ -372,8 +406,8 @@ def chat_agent_run_to_dict(
         "image_jobs": [image_generation_job_to_dict(job) for job in image_jobs],
         "draft_ids": draft_ids[:20],
         "progress": {
-            "text": phase_progress("text", "等待文字生成"),
-            "image": phase_progress("image", "等待配图规划"),
+            "text": text_phase_progress(),
+            "image": image_phase_progress(),
             "review": phase_progress("review", "等待自动审核"),
         },
         "events": [
