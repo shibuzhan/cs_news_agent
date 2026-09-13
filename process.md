@@ -3173,3 +3173,20 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 308
+
+- 用户指令：“那比如我以后有不是尾图的其他偏好怎么办呢？”——要求偏好机制可扩展，不要每加一条偏好都要改代码。
+- 影响范围：`app/services/publication_preferences.py`（新增 `style_notes` 与 `preference_rules_block()`）、`app/agent_tools/publication_preferences.py`（新增 `add_style_preference`／`remove_style_preference`，`show_*` 一并展示）、`app/services/generator.py`、`app/tools/auto_review.py`、`app/tools/auto_revision.py`（三处提示词注入同一套偏好块）、新增 `tests/test_generic_style_preferences.py`。**未发起付费调用**。
+- 处理结论（分两层，避免“静默不生效”）：
+  - **文字层面的偏好**（措辞、结构、禁忌、必须包含什么）→ 存进 `app_settings` 的 `publication.style_notes`（JSON 数组、去重、上限 20 条／每条 300 字），并渲染成规则块**注入生成、改稿、审核三处提示词**（生成侧由 `_preference_rules()` 惰性读取，拿不到仓储时返回空串不影响成稿）。因此以后加这类偏好**不需要改代码**。
+  - **流程层面的新能力**（例如“每篇自动插一张数据表”）→ 仍需写代码；工具的返回文案明确告知生效范围（“对已生成的草稿需要重新生成或重写才会带上”），不假装已生效。
+- 新增工具：`add_style_preference(text)`、`remove_style_preference(text)`（均带同步入口并注册到会话 Agent）；`show_publication_preferences` 现在同时列出已记录的通用偏好。
+- 修复过程中的自伤与恢复：批量插入时把 `+ _preference_rules(...)` 插进了隐式字符串拼接中间，导致 `auto_review.py`／`auto_revision.py` 语法错误；改为在提示词表达式末尾插入，并补齐两个模块的 `_preference_rules()` 定义（`NameError` 已消除）。
+- 验证：后端 **314 项通过、0 失败**（新增 5 项：偏好增删去重、规则块渲染、三处注入、工具同步入口、空输入被拒）。
+- 阻塞（未变）：**Docker Desktop 仍处于停止状态**，迁移 0026、重建与结尾图导入／端到端验证仍待用户启动 Docker。
+- 授权状态：已确认并完成
+
+-->

@@ -23,6 +23,16 @@ from app.storage.repositories import ContentRepository
 logger = logging.getLogger("news_agent.auto_review")
 
 
+def _preference_rules(repository) -> str:
+    """运营者的长期偏好（app_settings）：生成、改稿、审核共用同一套，避免互相打架。"""
+    try:
+        from app.services.publication_preferences import preference_rules_block
+
+        return preference_rules_block(repository)
+    except Exception:
+        return ""
+
+
 @dataclass(frozen=True)
 class AutoReviewResult:
     passed: bool
@@ -212,7 +222,8 @@ class AutoReviewTool:
             "同一篇文章在多轮审核之间不要反复改变对同一处的判定。"
             "每条 description 必须可直接执行：写明是哪一段的什么问题、应该怎么改（例如“第 3 段的 41987 star 未说明统计口径，"
             "改为‘累计约 4.2 万 star’并注明来源为项目页面”），不要只描述现象或给笼统评价。"
-            + terminology_guidance() + "来源：" + draft.source_name + "；原文：" + draft.source_url
+            + terminology_guidance() + _preference_rules(self.repository)
+            + "来源：" + draft.source_name + "；原文：" + draft.source_url
             + "；标题：" + (draft.title_options_json or [""])[0] + "\n"
             # 审核必须看到与写作**同一份**证据：此前限制 6000 字符，导致 6000 字之后的
             # 事实（密钥、数量、平台细节）全被判成“来源证据中未出现”。

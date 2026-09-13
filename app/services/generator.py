@@ -40,6 +40,18 @@ _SOURCE_WRITING_SKILLS = {
 
 
 class DraftGenerator(Protocol):
+    def _preference_rules(self) -> str:
+        """运营者的长期偏好（app_settings）→ 提示词规则块；没有仓储时为空。"""
+        repository = getattr(self, "repository", None)
+        if repository is None:
+            return ""
+        try:
+            from app.services.publication_preferences import preference_rules_block
+
+            return preference_rules_block(repository)
+        except Exception:  # 偏好读不到不能影响成稿
+            return ""
+
     def generate(self, item: NormalizedItem) -> DraftContent: ...
 
 
@@ -298,6 +310,7 @@ class OpenAICompatibleDraftGenerator:
             "不得补充未经来源支持的数字、时间、人物或结论。正文 body 必须像面向普通科技读者的自然讲解，"
             + _natural_article_instruction(self.settings.draft_body_min_chars, self.settings.draft_body_max_chars)
             + terminology_guidance()
+            + self._preference_rules()
             + "来源专用写作规则：\n"
             + _source_writing_skill(item)
             + "\n"

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 
@@ -21,8 +22,59 @@ KEY_COVER_IN_BODY = "publication.cover_in_body"
 KEY_FOOTER_IMAGE_URL = "publication.footer_image_url"
 KEY_FOOTER_IMAGE_ASSET = "publication.footer_image_asset_id"
 KEY_FOOTER_TEXT_ENABLED = "publication.footer_text_enabled"
+# 通用长期偏好：任何“文字层面”的要求都能存进来，并被生成/改稿/审核三处提示词读取。
+# 这样新增偏好不需要改代码，除非它需要流程里不存在的新能力（那种情况会明确告诉用户）。
+KEY_STYLE_NOTES = "publication.style_notes"
 
 _TRUE = {"1", "true", "yes", "on", "是", "开"}
+MAX_STYLE_NOTES = 20
+MAX_STYLE_NOTE_CHARS = 300
+
+
+def load_style_notes(repository: ContentRepository) -> tuple[str, ...]:
+    loader = getattr(repository, "get_app_setting", None)
+    raw = loader(KEY_STYLE_NOTES) if callable(loader) else None
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return (raw.strip(),) if raw.strip() else ()
+    if isinstance(parsed, list):
+        return tuple(str(item).strip() for item in parsed if str(item).strip())
+    return ()
+
+
+def save_style_notes(repository: ContentRepository, notes: list[str], *, updated_by: str = "agent") -> tuple[str, ...]:
+    cleaned: list[str] = []
+    for note in notes:
+        text = str(note).strip()[:MAX_STYLE_NOTE_CHARS]
+        if text and text not in cleaned:
+            cleaned.append(text)
+    cleaned = cleaned[:MAX_STYLE_NOTES]
+    repository.set_app_setting(KEY_STYLE_NOTES, json.dumps(cleaned, ensure_ascii=False), updated_by=updated_by)
+    return tuple(cleaned)
+
+
+def add_style_note(repository: ContentRepository, note: str) -> tuple[str, ...]:
+    return save_style_notes(repository, [*load_style_notes(repository), note])
+
+
+def remove_style_note(repository: ContentRepository, note: str) -> tuple[str, ...]:
+    target = str(note).strip()
+    return save_style_notes(repository, [item for item in load_style_notes(repository) if item != target])
+
+
+def preference_rules_block(repository: ContentRepository) -> str:
+    """把长期偏好渲染成可直接拼进提示词的规则块；没有偏好时返回空串。
+
+    生成、改稿、审核三处共用，因此“以后有别的偏好”不必再改代码——只要它是文字层面的要求。
+    """
+    notes = load_style_notes(repository)
+    if not notes:
+        return ""
+    lines = "\n".join(f"- {note}" for note in notes)
+    return f"\n运营者的长期偏好（必须遵守，与以下规则冲突时以本节为准）：\n{lines}\n"
 
 
 @dataclass(frozen=True)

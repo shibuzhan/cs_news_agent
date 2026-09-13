@@ -18,7 +18,13 @@ from langchain_core.tools import tool
 from app.config import get_settings
 from app.domain.models import ReviewStatus
 from app.services.attachments import AttachmentError, PrivateAttachmentStore
-from app.services.publication_preferences import load_publication_preferences, save_publication_preferences
+from app.services.publication_preferences import (
+    add_style_note,
+    load_publication_preferences,
+    load_style_notes,
+    remove_style_note,
+    save_publication_preferences,
+)
 from app.services.wechat_official import WechatOfficialAccountError
 from app.storage.database import SessionLocal
 from app.storage.repositories import ContentRepository
@@ -27,12 +33,13 @@ from app.tools.wechat_official_account import WechatOfficialAccountTool
 logger = logging.getLogger(__name__)
 
 
-def _describe(preferences) -> dict[str, Any]:
+def _describe(preferences, repository) -> dict[str, Any]:
     return {
         "cover_in_body": preferences.cover_in_body,
         "footer_image": preferences.footer_image_url or "（未设置）",
         "footer_image_asset_id": preferences.footer_image_asset_id or "（未设置）",
         "footer_text_enabled": preferences.footer_text_enabled,
+        "style_notes": list(load_style_notes(repository)),
     }
 
 
@@ -41,7 +48,7 @@ def _impl_show_publication_preferences() -> dict[str, Any]:
         preferences = load_publication_preferences(ContentRepository(session))
     return {
         "status": "done",
-        "preferences": _describe(preferences),
+        "preferences": _describe(preferences, repository),
         "message": (
             f"当前长期排版偏好：封面{'也作为' if preferences.cover_in_body else '不作为'}正文首图；"
             f"固定结尾图{'已设置' if preferences.footer_image_url else '未设置'}；"
@@ -67,7 +74,7 @@ def _impl_set_publication_preferences(
         session.commit()
     return {
         "status": "done",
-        "preferences": _describe(preferences),
+        "preferences": _describe(preferences, repository),
         "message": "已保存长期排版偏好；之后每次投递都会生效（已有草稿需要重新投递一次才会更新）。",
     }
 
@@ -129,7 +136,7 @@ def _impl_set_article_footer_image(asset_id: str = "", url: str = "") -> dict[st
     return {
         "status": "done",
         "footer_image": name,
-        "preferences": _describe(preferences),
+        "preferences": _describe(preferences, repository),
         "message": (
             f"已把 {name} 设为每篇文章的固定结尾图，并默认不再输出文字尾注；"
             "之后每次投递都会自动加在文末（已有草稿需重新投递一次）。"
@@ -144,7 +151,34 @@ def _impl_clear_article_footer_image() -> dict[str, Any]:
             repository, footer_image_url="", footer_text_enabled=True, updated_by="agent"
         )
         session.commit()
-    return {"status": "done", "preferences": _describe(preferences), "message": "已清除固定结尾图，文字尾注恢复。"}
+    return {"status": "done", "preferences": _describe(preferences, repository), "message": "已清除固定结尾图，文字尾注恢复。"}
+
+
+def _impl_add_style_preference(text: str) -> dict[str, Any]:
+    note = str(text or "").strip()
+    if not note:
+        return {"status": "rejected", "reason": "请给出这条长期偏好的内容"}
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        notes = add_style_note(repository, note)
+        session.commit()
+    return {
+        "status": "done",
+        "style_notes": list(notes),
+        "message": (
+            "已记录这条长期偏好，并会注入到**生成、改稿、审核**三处提示词；"
+            "对已生成的草稿需要重新生成或重写才会带上。"
+        ),
+    }
+
+
+def _impl_remove_style_preference(text: str) -> dict[str, Any]:
+    target = str(text or "").strip()
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        notes = remove_style_note(repository, target)
+        session.commit()
+    return {"status": "done", "style_notes": list(notes), "message": "已移除该条长期偏好。"}
 
 
 def build_publication_preference_tools(session_id: str):  # noqa: ARG001 - 与其它工具构造器一致
@@ -174,8 +208,20 @@ def build_publication_preference_tools(session_id: str):  # noqa: ARG001 - 与�
         """清除固定结尾图，恢复文字尾注。"""
         return _impl_clear_article_footer_image()
 
+    @tool("add_style_preference")
+    def add_style_preference(text: str) -> dict[str, Any]:
+        """新增一条**长期**写作偏好（自然语言），会注入生成/改稿/审核；例如“正文不要用问句标题”。"""
+        return _impl_add_style_preference(text)
+
+    @tool("remove_style_preference")
+    def remove_style_preference(text: str) -> dict[str, Any]:
+        """移除一条已记录的长期写作偏好（按原文精确匹配）。"""
+        return _impl_remove_style_preference(text)
+
     return [
         show_publication_preferences,
+        add_style_preference,
+        remove_style_preference,
         set_publication_preferences,
         set_article_footer_image,
         clear_article_footer_image,

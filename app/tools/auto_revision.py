@@ -29,6 +29,16 @@ from app.storage.repositories import ContentRepository
 logger = logging.getLogger("news_agent.auto_revision")
 
 
+def _preference_rules(repository) -> str:
+    """运营者的长期偏好（app_settings）：生成、改稿、审核共用同一套，避免互相打架。"""
+    try:
+        from app.services.publication_preferences import preference_rules_block
+
+        return preference_rules_block(repository)
+    except Exception:
+        return ""
+
+
 class RevisionPayload(BaseModel):
     summary_cn: str = Field(min_length=1, max_length=1000)
     body: str = Field(min_length=1, max_length=10000)
@@ -138,6 +148,7 @@ class AutoRevisionTool:
             "不得使用“如果把它放在……的语境里看”“从某种角度看”“在一定程度上”这类翻译腔或空泛铺垫，"
             "能直接说清楚的就直接说；来源没有支持的细节就删掉或简化，不要用含糊措辞掩盖。"
             + terminology_guidance()
+            + _preference_rules(self.repository)
             + "不得把术语替换成无来源的近义说法。"
             "summary_cn 是 30 到 60 字、吸引点击但不夸张的一句话导语。\n"
             + search_section
