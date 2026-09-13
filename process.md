@@ -3156,3 +3156,20 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-12｜变更 307
+
+- 用户指令：①“封面图作为正文上方第一张图”；②“以这张图片固定作为每篇文章的结尾图以取代原来的文字”；③“可以让我的 agent 也有这样的长期修改能力吗”。
+- 影响范围：新增迁移 `0026_app_settings`（`app_settings` 键值表）与 `app/storage/tables.py::AppSettingRow`；`app/storage/repositories.py`（`list/get/set_app_setting`）、新增 `app/services/publication_preferences.py`、新增 `app/agent_tools/publication_preferences.py`（4 个工具）、`app/services/wechat_official.py::render_wechat_html`（结尾图 + 文字尾注开关）、`app/services/auto_delivery.py`（封面正文首图、结尾图 URL 准备与缓存）、`app/agents/content_deep_agent.py` + `app/services/agent_commands.py`（注册与命令）。**未发起付费调用**。
+- 处理结论①（长期修改能力）：新增 `app_settings` 表 + `PublicationPreferences`（`cover_in_body`／`footer_image_url`／`footer_image_asset_id`／`footer_text_enabled`），**偏好落库、重建容器不丢**；`save_publication_preferences()` 支持只改显式给出的项，设置结尾图时默认关闭文字尾注（即“以图取代文字”）。
+- 处理结论②（Agent 工具，均带同步入口并注册到会话 Agent）：`show_publication_preferences`、`set_publication_preferences(cover_in_body?, footer_text_enabled?)`、`set_article_footer_image(asset_id?|url?)`（下载入库→上传公众号→缓存 URL→写偏好）、`clear_article_footer_image`；命令映射新增“排版偏好”。
+- 处理结论③（渲染与投递）：`render_wechat_html(..., footer_image_url=None, include_text_footer=True)`——给定结尾图时在**文末**追加图片，并按开关决定是否保留“原文标题／原文链接”等文字尾注；投递时若偏好开启 `cover_in_body`，则把封面**也上传为正文图片**并插入位置 0（正文首图），URL 按素材 id 缓存复用，避免重复上传。
+- 兼容性处理：`load_publication_preferences()` 对缺少 `list_app_settings` 的仓储替身返回默认值；`ensure_cover_inline_url()` 用 `getattr(job, "cover_asset_id", None)`；同步更新既有测试中 `render_wechat_html` 的替身签名以接受新关键字。
+- 验证：后端 **309 项通过、0 失败**。
+- 阻塞（需要用户操作）：**Docker Desktop 已停止**（`com.docker.service: Stopped`，容器全部不在），因此迁移 0026、镜像重建、结尾图导入与端到端验证尚未执行。
+- 待办（Docker 恢复后）：①`alembic upgrade head`（0026）；②重建 app/worker；③用用户提供的“原项目地址／请点击阅读原文”图导入为固定结尾图；④重新投递 ECC 草稿并读回确认：正文首图=封面、文末=固定结尾图、无文字尾注。
+- 授权状态：已确认并完成
+
+-->
