@@ -11,6 +11,7 @@ import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -45,10 +46,11 @@ from app.services.attachments import (
     validate_image_attachment,
 )
 from app.services.agent_commands import parse_agent_command
-from app.services.plain_text import normalize_wechat_description
+from app.services.plain_text import SOURCE_FOOTER_PREFIXES, normalize_wechat_description
 from app.services.task_narration import compose_task_reply
 from app.services.review_feedback import normalized_review_report
 from app.services.source_snapshots import DraftSourceSnapshotStore
+from app.services.publication_preferences import load_publication_preferences
 from app.services.wechat_official import WechatOfficialAccountError, render_wechat_html
 from app.services.generator import build_generator
 from app.services.auto_delivery import (
@@ -95,10 +97,34 @@ from app.tools.attachment_tools import ExtractTextAttachmentTool
 from app.tools.files.workspace import SessionWorkspaceTool
 from app.tools.scripts.registry import RegisteredScriptError, run_registered_script
 from app.workflows.content_workflow import ContentPipeline
+from app.services.runtime_settings import (
+    ALLOWED_IMAGE_RATIOS,
+    ALLOWED_IMAGE_SIZES,
+    MODEL_TASKS,
+    RuntimeSettingsError,
+    encrypt_api_key,
+    serialize_runtime_options,
+    validate_runtime_options,
+    load_runtime_settings,
+)
 
 router = APIRouter()
 SessionDependency = Annotated[Session, Depends(get_session)]
 logger = logging.getLogger("news_agent.chat")
+
+
+class ModelProfileInput(BaseModel):
+    model_name: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(min_length=1, max_length=2048)
+    api_key: str | None = Field(default=None, max_length=4096)
+
+
+class ModelAssignmentInput(BaseModel):
+    profile_id: str | None = None
+
+
+class RuntimeSettingsInput(BaseModel):
+    values: dict[str, object]
 
 
 def source_to_dict(row: SourceItemRow) -> dict[str, Any]:
@@ -498,6 +524,7 @@ def publication_asset_to_dict(row: PublicationAssetRow, settings: Settings) -> d
 async def run_collection_agent(
     command: AgentCollectCommand, settings: Settings
 ) -> dict[str, Any]:
+    settings = load_runtime_settings(settings)
     timeout = httpx.Timeout(settings.request_timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         agent = ContentMainAgent(
@@ -512,12 +539,243 @@ def health(session: SessionDependency) -> dict[str, str]:
     return {"status": "ok", "database": "connected"}
 
 
+def _model_profile_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "model_name": row.model_name,
+        "base_url": row.base_url,
+        # 只暴露是否已保存，任何情况下都不暴露密钥、密文或其片段。
+        "has_api_key": bool(row.encrypted_api_key),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def _settings_response(repository: ContentRepository, settings: Settings) -> dict[str, Any]:
+    stored = repository.list_app_settings()
+    profiles = repository.list_model_profiles()
+    assignments = {
+        task: repository.get_app_setting(f"runtime.model.{task}.profile_id")
+        for task in MODEL_TASKS
+    }
+    projects = [
+        {
+            "id": introduction.id,
+            "name": source.title,
+            "source_url": source.url,
+        }
+        for introduction, source in repository.list_project_introductions()
+    ]
+    return {
+        "model_profiles": [_model_profile_to_dict(row) for row in profiles],
+        "task_assignments": assignments,
+        "runtime": serialize_runtime_options(settings, stored),
+        "image_options": {
+            "sizes": sorted(ALLOWED_IMAGE_SIZES),
+            "ratios": sorted(ALLOWED_IMAGE_RATIOS),
+            "reference_note": "候选值仅来自 Agnes 图片模型参考文档；当前确认比例为 4:3。",
+        },
+        "projects": projects,
+        "audits": [
+            {
+                "id": row.id,
+                "scope": row.scope,
+                "setting_key": row.setting_key,
+                "old_value": row.old_value,
+                "new_value": row.new_value,
+                "changed_by": row.changed_by,
+                "created_at": row.created_at,
+            }
+            for row in repository.list_runtime_setting_audits()
+        ],
+        "security": {
+            "model_profile_encryption_ready": bool((settings.model_profile_encryption_key or "").strip()),
+            "notice": "模型密钥只允许写入或覆盖，接口不会返回密钥、密文或其片段。",
+        },
+    }
+
+
+@router.get("/settings")
+def get_runtime_settings(
+    session: SessionDependency,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    return _settings_response(ContentRepository(session), settings)
+
+
+def _model_profile_storage_name(
+    repository: ContentRepository,
+    model_name: str,
+    *,
+    profile_id: str | None = None,
+) -> str:
+    """为数据库保留唯一内部名称；界面始终只展示 model_name。"""
+    normalized = model_name.strip()
+    existing = {row.name: row.id for row in repository.list_model_profiles()}
+    candidate, suffix = normalized, 2
+    while candidate in existing and existing[candidate] != profile_id:
+        candidate = f"{normalized} · {suffix}"
+        suffix += 1
+    return candidate
+
+
+@router.post("/settings/model-profiles")
+def create_model_profile(
+    payload: ModelProfileInput,
+    session: SessionDependency,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    repository = ContentRepository(session)
+    try:
+        encrypted_key = encrypt_api_key(settings, payload.api_key or "")
+        row = repository.save_model_profile(
+            profile_id=None,
+            name=_model_profile_storage_name(repository, payload.model_name), model_name=payload.model_name.strip(),
+            base_url=payload.base_url.strip(), encrypted_api_key=encrypted_key, replace_api_key=True,
+        )
+        repository.add_runtime_setting_audit("model_profile", row.id, None, "已创建（密钥已写入）")
+        session.commit()
+        return _model_profile_to_dict(row)
+    except RuntimeSettingsError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail="模型档案名称已存在或格式不正确") from exc
+
+
+@router.patch("/settings/model-profiles/{profile_id}")
+def update_model_profile(
+    profile_id: str,
+    payload: ModelProfileInput,
+    session: SessionDependency,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    repository = ContentRepository(session)
+    existing = repository.get_model_profile(profile_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="模型档案不存在")
+    try:
+        replace_key = payload.api_key is not None and bool(payload.api_key.strip())
+        encrypted_key = encrypt_api_key(settings, payload.api_key or "") if replace_key else None
+        row = repository.save_model_profile(
+            profile_id=profile_id,
+            name=_model_profile_storage_name(repository, payload.model_name, profile_id=profile_id),
+            model_name=payload.model_name.strip(),
+            base_url=payload.base_url.strip(), encrypted_api_key=encrypted_key, replace_api_key=replace_key,
+        )
+        repository.add_runtime_setting_audit(
+            "model_profile", row.id, "已更新", "已更新（密钥已覆盖）" if replace_key else "已更新"
+        )
+        session.commit()
+        return _model_profile_to_dict(row)
+    except RuntimeSettingsError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/settings/model-profiles/{profile_id}")
+def delete_model_profile(profile_id: str, session: SessionDependency) -> dict[str, str]:
+    repository = ContentRepository(session)
+    bound = [task for task in MODEL_TASKS if repository.get_app_setting(f"runtime.model.{task}.profile_id") == profile_id]
+    if bound:
+        raise HTTPException(status_code=400, detail=f"该档案仍被 {', '.join(bound)} 使用，请先改回环境变量或选择其他档案")
+    try:
+        repository.delete_model_profile(profile_id)
+        repository.add_runtime_setting_audit("model_profile", profile_id, "已存在", "已删除")
+        session.commit()
+        return {"deleted_id": profile_id}
+    except RepositoryError as exc:
+        session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/settings/model-tasks/{task}")
+def assign_model_task(task: str, payload: ModelAssignmentInput, session: SessionDependency) -> dict[str, str | None]:
+    if task not in MODEL_TASKS:
+        raise HTTPException(status_code=404, detail="未知模型任务")
+    repository = ContentRepository(session)
+    if payload.profile_id and repository.get_model_profile(payload.profile_id) is None:
+        raise HTTPException(status_code=404, detail="模型档案不存在")
+    key = f"runtime.model.{task}.profile_id"
+    old = repository.get_app_setting(key)
+    repository.set_app_setting(key, payload.profile_id or "", updated_by="运营人员")
+    repository.add_runtime_setting_audit("model_assignment", task, old or "环境变量", payload.profile_id or "环境变量")
+    session.commit()
+    return {"task": task, "profile_id": payload.profile_id}
+
+
+@router.post("/settings/model-profiles/{profile_id}/test")
+async def test_model_profile(
+    profile_id: str,
+    session: SessionDependency,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, str]:
+    """用户点击后才发起一次极小模型请求；失败信息经脱敏后仅返回操作结论。"""
+    profile = ContentRepository(session).get_model_profile(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="模型档案不存在")
+    from app.services.runtime_settings import decrypt_api_key
+
+    api_key = decrypt_api_key(settings, profile.encrypted_api_key)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="该模型档案没有可用密钥，请重新写入 API Key 并确认加密密钥未变更")
+    try:
+        from langchain_openai import ChatOpenAI
+
+        async def check() -> None:
+            model = ChatOpenAI(model=profile.model_name, api_key=api_key, base_url=profile.base_url, timeout=15, max_retries=0)
+            await model.ainvoke("请只回复 OK")
+
+        await check()
+        return {"status": "ok", "message": "模型连通性正常"}
+    except Exception as exc:
+        logger.warning("model_profile_connection_failed profile_id=%s error_type=%s", profile_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="模型连通性检测失败，请检查 Base URL、模型名、API Key 与网络") from exc
+
+
+@router.patch("/settings/runtime")
+def update_runtime_settings(
+    payload: RuntimeSettingsInput,
+    session: SessionDependency,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    repository = ContentRepository(session)
+    try:
+        values = validate_runtime_options(payload.values)
+        for field, value in values.items():
+            key = f"runtime.{field}"
+            old = repository.get_app_setting(key)
+            repository.set_app_setting(key, value, updated_by="运营人员")
+            repository.add_runtime_setting_audit("runtime", field, old, value)
+        session.commit()
+        return _settings_response(repository, settings)
+    except RuntimeSettingsError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/settings/projects/{introduction_id}")
+def delete_project_introduction(introduction_id: str, session: SessionDependency) -> dict[str, str]:
+    repository = ContentRepository(session)
+    try:
+        repository.delete_project_introduction(introduction_id)
+        repository.add_runtime_setting_audit("deduplication", introduction_id, "已在去重库", "已移出")
+        session.commit()
+        return {"deleted_id": introduction_id}
+    except RepositoryError as exc:
+        session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/collections/{source_name}")
 async def collect_source(
     source_name: str,
     settings: Annotated[Settings, Depends(get_settings)],
     limit: int = Query(default=25, ge=1, le=50),
 ) -> dict[str, Any]:
+    settings = load_runtime_settings(settings)
     if source_name == "all":
         sources: list[SourceKind] = []
     else:
@@ -546,6 +804,7 @@ async def collect_with_main_agent(
     command: AgentCollectCommand,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
+    settings = load_runtime_settings(settings)
     try:
         command.limit = min(command.limit, settings.collect_limit)
         return await run_collection_agent(command, settings)
@@ -1984,6 +2243,34 @@ def delete_wechat_publication_asset(
         raise
     logger.info("wechat_publication_asset_deleted asset_id=%s", asset_id)
     return {"deleted_id": asset_id}
+
+
+@router.get("/wechat/publication-preferences")
+def read_publication_preferences(
+    session: SessionDependency,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """长期排版偏好（只读）：前端预览必须与实际投递用同一套规则。
+
+    否则会出现“预览里还有文字尾注、投递出去的却没有”这种不一致。
+    """
+    repository = ContentRepository(session)
+    preferences = load_publication_preferences(repository)
+    footer_asset = (
+        repository.get_publication_asset(preferences.footer_image_asset_id)
+        if preferences.footer_image_asset_id
+        else None
+    )
+    return {
+        "cover_in_body": preferences.cover_in_body,
+        "footer_text_enabled": preferences.footer_text_enabled,
+        "footer_image_configured": preferences.footer_image_configured,
+        "footer_image_name": footer_asset.original_name if footer_asset else None,
+        "footer_image_download_url": (
+            publication_asset_to_dict(footer_asset, settings)["download_url"] if footer_asset else None
+        ),
+        "footer_text_prefixes": list(SOURCE_FOOTER_PREFIXES),
+    }
 
 
 @router.get("/wechat/publications")

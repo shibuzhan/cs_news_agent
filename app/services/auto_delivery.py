@@ -13,6 +13,7 @@ from app.services.attachments import AttachmentError, PrivateAttachmentStore
 from app.services.plain_text import extract_name_queries, normalize_wechat_description
 from app.services.publication_preferences import load_publication_preferences
 from app.services.source_snapshots import DraftSourceSnapshotStore
+from app.services.runtime_settings import load_runtime_settings
 from app.services.wechat_official import WechatOfficialAccountError, render_wechat_html
 from app.storage.repositories import ContentRepository
 from app.tools.auto_review import AutoReviewTool
@@ -365,6 +366,7 @@ async def auto_review_and_create_wechat_draft(
     `deliver=False` 表示“仅审核”：不选投递素材、不创建公众号草稿，只给出审核意见与
     按意见进行的一轮改稿。只要审核给出可执行意见，**通过与否都会先改稿一轮再复审**。
     """
+    settings = load_runtime_settings(settings)
     revision_count = 0
     if review_run_id:
         selection_run = repository.mark_auto_review_run_running(review_run_id)

@@ -8,6 +8,7 @@ import re
 
 from datetime import datetime, timedelta
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -43,6 +44,7 @@ from app.storage.tables import (
     DraftIllustrationRow,
     DraftPublicationAssetRow,
     ImageGenerationJobRow,
+    ModelProfileRow,
     NotificationRow,
     PublicationRecordRow,
     PublicationAssetRow,
@@ -51,6 +53,7 @@ from app.storage.tables import (
     PublishPlanRow,
     SchedulePlanRow,
     SourceItemRow,
+    RuntimeSettingAuditRow,
     TrendingSnapshotRow,
     WechatPublicationJobRow,
     utcnow,
@@ -114,6 +117,17 @@ class ContentRepository:
     def __init__(self, session: Session):
         self.session = session
 
+    def _apply_source_update(self, existing: SourceItemRow, item: NormalizedItem) -> None:
+        existing.title = item.title
+        existing.url = str(item.url)
+        existing.summary = item.summary
+        existing.content = item.content
+        existing.published_at = item.published_at
+        existing.hot_score = item.hot_score
+        existing.metrics_json = item.metrics
+        existing.metadata_json = item.metadata
+        existing.fetched_at = utcnow()
+
     def save_source(self, item: NormalizedItem) -> SaveSourceResult:
         existing = self.session.scalar(
             select(SourceItemRow).where(
@@ -122,15 +136,7 @@ class ContentRepository:
             )
         )
         if existing:
-            existing.title = item.title
-            existing.url = str(item.url)
-            existing.summary = item.summary
-            existing.content = item.content
-            existing.published_at = item.published_at
-            existing.hot_score = item.hot_score
-            existing.metrics_json = item.metrics
-            existing.metadata_json = item.metadata
-            existing.fetched_at = utcnow()
+            self._apply_source_update(existing, item)
             self.session.flush()
             return SaveSourceResult(existing, is_new=False, is_duplicate=True)
 
@@ -158,8 +164,31 @@ class ContentRepository:
             metrics_json=item.metrics,
             metadata_json=item.metadata,
         )
-        self.session.add(row)
-        self.session.flush()
+        try:
+            # 用 SAVEPOINT 包住插入：并发采集（两个后台任务同时抓同一来源）下，
+            # “先查后插”会双双查到不存在，随后其中一个撞上 uq_source_external_id。
+            # 真实故障：IntegrityError 让整个采集任务失败，错误还被收尾异常掩盖。
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            if row in self.session:
+                self.session.expunge(row)
+            winner = self.session.scalar(
+                select(SourceItemRow).where(
+                    SourceItemRow.source_kind == item.source_kind.value,
+                    SourceItemRow.external_id == item.external_id,
+                )
+            )
+            if winner is None:
+                raise
+            logger.info(
+                "source_insert_raced source=%s external_id=%s",
+                item.source_kind.value, item.external_id,
+            )
+            self._apply_source_update(winner, item)
+            self.session.flush()
+            return SaveSourceResult(winner, is_new=False, is_duplicate=True)
         return SaveSourceResult(row, is_new=True, is_duplicate=canonical is not None)
 
     def create_collection_run(
@@ -753,7 +782,7 @@ class ContentRepository:
         detail: str = "",
         status: str = "completed",
         metadata: dict | None = None,
-    ) -> ChatAgentEventRow:
+    ) -> ChatAgentEventRow | None:
         # 锁定父运行记录，保证 Web 请求和后台 Worker 写同一运行记录时序号连续。
         run = self.session.scalar(
             select(ChatAgentRunRow)
@@ -761,7 +790,10 @@ class ContentRepository:
             .with_for_update()
         )
         if run is None:
-            raise RepositoryError(f"对话 Agent 运行记录不存在：{run_id}")
+            # 运行记录可能已被运营者在“生成记录”里删除：事件只是过程留痕，
+            # 不能因为父记录不存在就让后台任务失败（真实故障：真正的采集冲突被这条异常掩盖）。
+            logger.warning("chat_agent_event_skipped run_gone run_id=%s title=%s", run_id, title)
+            return None
         sequence = self.session.scalar(
             select(func.coalesce(func.max(ChatAgentEventRow.sequence) + 1, 1)).where(
                 ChatAgentEventRow.run_id == run_id
@@ -994,6 +1026,54 @@ class ContentRepository:
             row.updated_by = updated_by
         self.session.flush()
         return row
+
+    def list_model_profiles(self) -> list[ModelProfileRow]:
+        return list(self.session.scalars(select(ModelProfileRow).order_by(ModelProfileRow.name)))
+
+    def get_model_profile(self, profile_id: str) -> ModelProfileRow | None:
+        return self.session.get(ModelProfileRow, profile_id)
+
+    def save_model_profile(
+        self, *, profile_id: str | None, name: str, model_name: str, base_url: str,
+        encrypted_api_key: str | None = None, replace_api_key: bool = False,
+    ) -> ModelProfileRow:
+        row = self.session.get(ModelProfileRow, profile_id) if profile_id else None
+        if row is None:
+            row = ModelProfileRow(
+                name=name, model_name=model_name, base_url=base_url,
+                encrypted_api_key=encrypted_api_key,
+            )
+            self.session.add(row)
+        else:
+            row.name, row.model_name, row.base_url = name, model_name, base_url
+            if replace_api_key:
+                row.encrypted_api_key = encrypted_api_key
+        self.session.flush()
+        return row
+
+    def delete_model_profile(self, profile_id: str) -> None:
+        row = self.session.get(ModelProfileRow, profile_id)
+        if row is None:
+            raise RepositoryError("模型档案不存在")
+        self.session.delete(row)
+        self.session.flush()
+
+    def add_runtime_setting_audit(
+        self, scope: str, setting_key: str, old_value: str | None, new_value: str | None,
+        *, changed_by: str = "运营人员",
+    ) -> RuntimeSettingAuditRow:
+        row = RuntimeSettingAuditRow(
+            scope=scope, setting_key=setting_key, old_value=old_value,
+            new_value=new_value, changed_by=changed_by,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def list_runtime_setting_audits(self, limit: int = 30) -> list[RuntimeSettingAuditRow]:
+        return list(self.session.scalars(
+            select(RuntimeSettingAuditRow).order_by(RuntimeSettingAuditRow.created_at.desc()).limit(limit)
+        ))
 
     def sync_failure_notifications(self) -> int:
         """将已有失败审计补齐为通知，兼容通知中心上线前的历史记录。"""
@@ -1317,6 +1397,21 @@ class ContentRepository:
         self.session.add(row)
         self.session.flush()
         return row
+
+    def list_project_introductions(self) -> list[tuple[ProjectIntroductionRow, SourceItemRow]]:
+        """设置页仅展示已入去重库的项目名称与其原始链接。"""
+        return list(self.session.execute(
+            select(ProjectIntroductionRow, SourceItemRow)
+            .join(SourceItemRow, SourceItemRow.id == ProjectIntroductionRow.source_item_id)
+            .order_by(ProjectIntroductionRow.introduced_at.desc())
+        ).all())
+
+    def delete_project_introduction(self, introduction_id: str) -> None:
+        row = self.session.get(ProjectIntroductionRow, introduction_id)
+        if row is None:
+            raise RepositoryError("已生成项目记录不存在")
+        self.session.delete(row)
+        self.session.flush()
 
     def record_draftbox_introduction(
         self, source: SourceItemRow, draft: DraftRow,

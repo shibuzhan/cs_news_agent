@@ -106,7 +106,7 @@ def remove_style_note(repository: ContentRepository, note: str) -> tuple[str, ..
     return save_style_notes(repository, [item for item in load_style_notes(repository) if item != target])
 
 
-def preference_rules_block(repository: ContentRepository) -> str:
+def preference_rules_block(repository: ContentRepository | None = None) -> str:
     """把长期偏好渲染成可直接拼进提示词的规则块；都没有时返回空串。
 
     来源两处，顺序即优先级：
@@ -116,7 +116,9 @@ def preference_rules_block(repository: ContentRepository) -> str:
     生成、改稿、审核三处共用，因此新增偏好不必改代码——只要它是文字层面的要求。
     """
     guide = load_style_guide()
-    notes = load_style_notes(repository)
+    # 文案生成器也会在脱离工作流的离线调用中使用本函数：此时没有数据库会话，
+    # 仍应保留仓库中的长文风格说明，而不是因为短条目不可读就完全丢弃偏好。
+    notes = load_style_notes(repository) if repository is not None else ()
     if not guide and not notes:
         return ""
     sections: list[str] = ["\n运营者的长期偏好（必须遵守，与以下规则冲突时以本节为准）："]

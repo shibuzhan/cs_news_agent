@@ -20,6 +20,7 @@ from app.services.attachments import (
 )
 from app.services.image_brief import FALLBACK_SCENE, load_brief, pick_object, pick_style
 from app.services.image_text_guard import ImageTextInspectionError, cjk_text, detect_visible_text
+from app.services.runtime_settings import load_runtime_settings
 from app.storage.repositories import ContentRepository
 
 
@@ -132,7 +133,7 @@ class ImageGenerationTool:
     """Agnes 兼容图片接口的最小适配器；仅接受项目配置的固定地址。"""
 
     def __init__(self, settings: Settings, repository: ContentRepository):
-        self.settings = settings
+        self.settings = load_runtime_settings(settings)
         self.repository = repository
 
     async def invoke(

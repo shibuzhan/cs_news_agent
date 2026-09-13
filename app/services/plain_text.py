@@ -28,7 +28,10 @@ _EVIDENCE_NEGATIVE_HINTS = (
 # GitHub 文案的文末固定提示（来源地址由公众号“阅读原文”承载）。
 GITHUB_SOURCE_HINT = "点击查看原文跳转项目地址"
 # 正文末尾的来源性行：不计入自然段、不加段首缩进、不算正文长度。
-_SOURCE_FOOTER_PREFIXES = ("原文标题：", "原文链接：", "来源链接：", GITHUB_SOURCE_HINT)
+# 公开为 `SOURCE_FOOTER_PREFIXES`：渲染、审核与**前端预览**必须用同一套判定，
+# 否则会出现“预览里还有文字尾注、投递出去的却没有”。
+SOURCE_FOOTER_PREFIXES = ("原文标题：", "原文链接：", "来源链接：", GITHUB_SOURCE_HINT)
+_SOURCE_FOOTER_PREFIXES = SOURCE_FOOTER_PREFIXES
 # 外部名称候选：1 到 3 个拉丁字母词，首词大写（Claude Code、OpenCode、AgentShield…）。
 _NAME_PATTERN = re.compile(r"\b[A-Z][A-Za-z0-9]*(?:[.+#-][A-Za-z0-9]+)*(?:\s+[A-Z][A-Za-z0-9]*(?:[.+#-][A-Za-z0-9]+)*){0,2}\b")
 # 常见英文虚词与目标读者已知的通用技术语汇，不作为需要联网说明的名称。

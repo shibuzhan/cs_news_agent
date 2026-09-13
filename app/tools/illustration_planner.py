@@ -186,7 +186,8 @@ def _is_source_asset(item: object) -> bool:
 
 class IllustrationPlanner:
     def __init__(self, settings: Settings):
-        self.settings = settings
+        from app.services.runtime_settings import load_runtime_settings
+        self.settings = load_runtime_settings(settings)
 
     def decide(self, draft) -> IllustrationPlan:
         paragraphs = _paragraphs(draft.body)

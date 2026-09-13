@@ -109,7 +109,8 @@ def _search_evidence_section(search_evidence: list[dict] | None) -> str:
 
 class AutoRevisionTool:
     def __init__(self, settings: Settings, repository: ContentRepository):
-        self.settings = settings
+        from app.services.runtime_settings import load_runtime_settings
+        self.settings = load_runtime_settings(settings)
         self.repository = repository
 
     def invoke(

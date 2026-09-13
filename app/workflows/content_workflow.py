@@ -95,6 +95,10 @@ class ContentPipeline:
         self.session = session
         self.repository = ContentRepository(session)
         self.generator = generator
+        # 生成器需要同一工作流会话中的短偏好；长文风格文件即使没有仓储也可独立读取。
+        # 使用属性注入避免把数据库会话带入模型客户端或 Agent 构造阶段。
+        if hasattr(generator, "repository"):
+            generator.repository = self.repository
         self.graph = build_content_graph(generator)
         self.source_snapshots = (
             DraftSourceSnapshotStore(settings, self.repository) if settings is not None else None

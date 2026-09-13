@@ -2187,6 +2187,36 @@
 
 <!--
 
+### 2026-09-13｜变更 316
+
+- 用户指令：读取当前按任务模型配置，并写入系统设置页的模型档案数据库。
+- 实施方式：只在 app 容器内读取当前 `Settings` 的模型名、Base URL 与 API Key；相同三元配置合并为一个加密模型档案，再绑定到相应任务。不会输出 Key、不会调用模型、不会覆盖未命名的手工档案。
+- 验证：完成后读取设置接口，核对档案数量与 5 个任务绑定状态。
+- 授权状态：已确认，实施中
+-->
+
+<!--
+
+### 2026-09-13｜变更 314
+
+- 用户指令：同步私有 `.env` 与 `.env.example` 的模型档案加密主密钥配置。
+- 影响范围：私有 `.env` 新增 `MODEL_PROFILE_ENCRYPTION_KEY`（新生成的 Fernet 密钥）；`.env.example` 保持空占位并补充“不要提交、不要随意更换”的说明。
+- 安全边界：未读取、展示或改写任何已有 API Key；主密钥不会写入代码、数据库审计、运行日志或提交模板。
+- 验证：待重启 app/worker 读取新环境变量后检查设置接口。
+- 授权状态：已确认，实施中
+-->
+
+<!--
+
+### 2026-09-13｜变更 315
+
+- 变更 314 完成记录：已重建 app 与 worker 使新环境变量生效；本机 `/api/settings` 返回 `model_profile_encryption_ready=true`，说明设置页现在可以加密保存模型 API Key。
+- 验证边界：未创建模型档案、未测试模型连通性、未调用模型或公众号接口。
+- 授权状态：已确认并完成
+-->
+
+<!--
+
 ### 2026-09-11｜变更 241
 
 - 用户指令：检查公众号 MCP 上传失败原因，将提示移动至草稿箱内容而非自动审核区，草稿预览展示封面和正文插图整体效果；确认后要求微信公众号 MCP 功能可独立配置为不走代理。
@@ -3209,6 +3239,16 @@
 
 <!--
 
+### 2026-09-13｜变更 311
+
+- 用户指令：确认修复“文案生成器长期风格偏好注入可能触发 AttributeError”、Compose 默认正文长度/图片尺寸不一致，以及核验思考模型 JSON 结构化模式。
+- 影响范围：`app/services/publication_preferences.py`、`app/services/generator.py`、`app/workflows/content_workflow.py`、`docker-compose.yml`、`tests/test_generic_style_preferences.py`；重建 app/worker。不会读取或改写私有 `.env`，不会调用模型、图片或微信接口。
+- 处理结论：①将 `preference_rules_block()` 改为可无仓储调用——无数据库会话时仍读取 `preferences/style.md`，正常工作流则同时注入数据库 `style_notes`；②将 `_preference_rules()` 正确实现为 `OpenAICompatibleDraftGenerator` 的实例方法，并由 `ContentPipeline` 注入同一会话的 `ContentRepository`，避免 `AttributeError`；③app/worker 两处 Compose 默认值统一为正文 1200 字、Agnes `1K + 4:3`；④已重建 app/worker，容器内确认内容与审核结构化模式均为 `json`，不发送 `tool_choice`。静态编译与 Compose 校验通过；容器健康接口返回 200/数据库已连接；本地模拟断言确认风格文件回退、数据库短偏好注入与工作流仓储注入均有效。宿主机 `.venv` 启动受系统权限拒绝，未能在宿主机运行 pytest。
+- 授权状态：已确认
+-->
+
+<!--
+
 ### 2026-09-13｜变更 310
 
 - 用户指令链：问“偏好怎么存储” → 问“比直接存一个 md 当提示词更好吗” → 追问“agent 不能读取本地 md 吗？每次读取一下不就行了吗” → 确认“按修正版做”。
@@ -3218,6 +3258,86 @@
 - 施工自伤与修复：脚本给 worker 插挂载时产生了重复 `volumes:` 键（`docker compose config` 报 “mapping key volumes already defined”）→ 删除重复块并把挂载并入两个服务各自的 volumes；随后 `docker compose config` 通过，确认 app 与 worker 都挂载到同一目录。
 - 验证：后端 **317 项通过、0 失败**（新增：模板注释被视为空、文件+短条目同时注入且文件优先、两个新工具的读写）；重建后容器内确认 `/app/preferences/style.md` 存在且模板注释不生效（0 字符）。
 - 遗留：本轮未实测“工具写入 → 宿主机 git diff”（下一步立即验证）。
+- 授权状态：已确认并完成
+
+-->
+
+<!--
+
+### 2026-09-13｜变更 312
+
+- 用户指令：将已提出的“系统设置”能力全部实现：模型档案与任务路由、已生成项目去重记录、草稿箱留言、Agnes 插图规格，以及写作/审核/自动化/来源设置、脱敏连通性检测与配置审计。
+- 影响范围：新增 `app/services/runtime_settings.py`、迁移 `0027_runtime_settings_center.py`；`app/config.py`、仓储/API、前端设置页、Compose 与 `.env.example`、依赖清单。模型密钥用私有 `.env` 的 `MODEL_PROFILE_ENCRYPTION_KEY` 加密后才可落库，API 仅返回“是否已保存”，不会返回明文、密文或片段。
+- 运行边界：数据库设置在每一项新任务启动时读取；已运行任务保持原配置。未绑定模型档案或数据库不可用时始终回退既有 `.env`。设置页面不会自动调用模型或微信；模型连通性检测仅在用户点击按钮后执行一次最小请求。
+- 候选约束：插图尺寸严格来自 Agnes 参考文档（1K/2K/3K/4K）；当前参考只确认项目使用的 4:3 比例，不编造其他比例。
+- 验证：待完成迁移与容器重建后继续记录。
+- 授权状态：已确认，实施中
+-->
+
+<!--
+
+### 2026-09-13｜变更 313
+
+- 变更 312 完成记录：新增“系统设置”页面及 API，支持创建/编辑/删除加密模型档案、按对话/文案/审核/配图规划/证据筛选绑定档案、用户主动触发的脱敏连通性检测、Agnes 图片尺寸与比例、草稿箱留言、写作字数、审核阈值、自动化默认项、采集上限与 RSS；展示并可移出“已生成项目”去重记录；所有非机密配置变更写入审计。
+- 密钥边界：新增 `cryptography` 依赖和 `MODEL_PROFILE_ENCRYPTION_KEY` 占位；未填写私有 .env 主密钥时，页面明确禁止保存模型 API Key，既有按任务环境变量配置不受影响。新档案不会自动测试或发起模型调用。
+- 运行验证：迁移已执行至 **0027_runtime_settings_center (head)**；app/worker/frontend 已重建并运行；本机 `/api/health` 返回数据库 connected，`/api/settings` 返回 5 个任务路由、Agnes 1K/2K/3K/4K 与 4:3 候选、脱敏安全状态；后端静态编译、前端生产构建、差异检查、设置模块 3 项单测均通过。未调用真实模型、图片、搜索或公众号接口。
+- 授权状态：已确认并完成
+-->
+
+<!--
+
+### 2026-09-13｜变更 317
+
+- 用户指令：读取当前按任务模型配置，并写入系统设置页的模型档案数据库。
+- 完成结果：已导入 4 个加密模型档案并完成 5 个任务绑定：日常对话使用 `deepseek-v4-flash`；文案生成使用 `qwen3.8-max-0902`；自动审核使用 `qwen3.8-27b`；配图规划使用 `deepseek-flash`；证据筛选复用配图规划档案。
+- 安全边界：API Key 仅以加密形式写入数据库；导入过程未输出 Key、未实际调用模型，也未覆盖已有的手工命名模型档案。
+- 验证结果：`/api/settings` 已确认存在 4 个模型档案、5 个任务绑定，且每个档案均已保存 API Key。
+- 授权状态：已确认并完成
+-->
+
+<!--
+
+### 2026-09-13｜变更 318
+
+- 用户指令：简化系统设置中的模型管理，仅保留“新增模型”入口并以弹窗录入；移除档案改名字段；已保存 API Key 以黑色圆点掩码显示；此前“环境变量导入”档案仅保留模型名。
+- 影响范围：`frontend/src/App.tsx`、`frontend/src/api.ts`、`frontend/src/styles.css`、`app/api/routes.py` 与 `scripts/import_env_model_profiles.py`。
+- 实施结果：新增与编辑均改为弹窗；模型名成为唯一页面展示名和任务下拉文本；后端按模型名自动维护数据库内部唯一名称，支持不同地址的同名模型而不新增用户可见别名；已保存密钥在列表及编辑弹窗中显示固定圆点，只有点“更换”才可输入新 Key。
+- 数据处理：已重新执行本地导入整理脚本，4 个已有档案已由“环境变量导入”名称改为 `deepseek-flash`、`deepseek-v4-flash`、`qwen3.8-27b`、`qwen3.8-max-0902`；5 个任务绑定与加密密钥均保留。
+- 验证：Python 静态编译、前端生产构建、差异检查均通过；app、worker、frontend 已重建并运行。未调用模型、图片或公众号接口。
+- 授权状态：已确认并完成
+
+-->
+
+<!--
+
+### 2026-09-13｜变更 319
+
+- 用户指令：“检查原因，而且为什么会，。”（针对 23:24 那次“内容生成执行失败，请查看生成记录后重试”）。
+- 影响范围：`app/storage/repositories.py`（`save_source` 保存点重试、`_apply_source_update`、`add_chat_agent_event` 容错）、`app/worker.py`（`_finish_failed_run` 容错）、`app/services/runtime_settings.py`（防御式读取，该文件由并行会话新增）、`tests/test_collection_concurrency_recovery.py`（新增）、`tests/test_model_routing.py` 与 `tests/test_content_task_agents.py`（隔离数据库模型档案）。**未发起付费调用**。
+- 根因①（真正的失败）：**两个采集任务并发运行**（15:24:20 与 15:24:35 各一个），而 `save_source` 是“先查后插”：两边都查到“不存在”，其中一个随后撞上 `uq_source_external_id` → `IntegrityError` → 整个采集任务失败（运行 601s/586s 后）。
+- 根因②（错误被掩盖）：任务失败后要写回 chat run，但该记录（`2f8fa2a8…`）**已被删除**（运营者在生成记录里清理过），`add_chat_agent_event` / `finish_chat_agent_run` 直接抛 `RepositoryError`，把真正的 `IntegrityError` 顶掉了——所以用户看到的只是笼统的“内容生成执行失败”。
+- 处理结论①（幂等插入）：`save_source` 的插入改为 `begin_nested()` 保存点 + `except IntegrityError` 兜底：撞约束时重新查出已存在的行、复用 `_apply_source_update()` 更新并记 `source_insert_raced` 日志，任务不再失败。
+- 处理结论②（收尾不掩盖真相）：`add_chat_agent_event` 在父运行不存在时只记 `chat_agent_event_skipped` 并返回 `None`（不再抛错）；`_finish_failed_run` 用 `except RepositoryError` + `rollback` + `failed_run_finish_skipped` 兜底。
+- 处理结论③（防御式设置读取）：`runtime_settings` 是并行会话新增的文件，它读 `app_settings` 表做运行期覆盖——**表一旦有行就会走到 `settings.draft_body_min_chars`**，而测试用的是裁剪过的 settings → 24 项失败。改为 `getattr` + 检查 `model_copy` 可调用后再用。
+- 处理结论④（模型路由测试失效的原因，需告知用户）：今天 05:38 有会话把环境变量**导入成数据库“模型档案”**（`runtime.model.<task>.profile_id`），此后 `model_for()` 优先返回档案里的模型；5 个用例假定只走环境变量故失败 → 加自动 fixture 屏蔽档案查询（这些用例只覆盖环境变量回退链）。**运营提示：改 `.env` 里的模型不再直接生效，需要在系统设置里重新导入/更新档案。**
+- 验证：后端 **326 项通过、0 失败**；app/worker 已重建；`alembic current` = `0027_runtime_settings_center`。
+- 并行会话警告：本仓库工作区同时存在另一会话（Codex）的未提交改动（`app/api/routes.py`、`frontend/*`、`scripts/import_env_model_profiles.py`、`app/services/runtime_settings.py`、`migrations/versions/0027_*` 等）。本轮**未提交 git**，避免把对方的在途修改一并卷入。
+- 授权状态：已确认并完成
+
+-->
+
+<!--
+
+### 2026-09-13｜变更 320
+
+- 用户指令：①“内容生成执行失败，请查看生成记录后重试。；未生成新的草稿。另外这个提示一个句号一个分号什么原因”；②“我不是要求文末用图片取代原本的点击查看原文跳转项目地址文字吗？为什么还是这样”；③“然后封面图也在预览中显示在标题下方”。
+- 影响范围：`app/worker.py`（两处文案拼接）、`app/services/plain_text.py`（公开 `SOURCE_FOOTER_PREFIXES`）、`app/api/routes.py`（新增只读接口 `GET /wechat/publication-preferences`）、`frontend/src/App.tsx` / `api.ts` / `types.ts`（预览接入偏好、封面移到标题下方、文末渲染结尾图）；新增 `tests/test_message_punctuation.py`、`tests/test_preview_matches_delivery.py`。**未发起付费调用**（仅微信只读接口）。
+- 结论①（标点瑕疵）：`_generation_failure_detail()` 的基础句**自带句号**又拼了分号 → `。；`；`collection_memory_summary()` 同样问题。改为拼接前 `rstrip("。；;. ")`。实测输出：`内容生成执行失败，请查看生成记录后重试；未生成新的草稿。`
+- 结论②（尾注为何还在）：**远端草稿是对的**（读回 ECC 草稿：5 张图、无“点击查看原文”、无“原文链接”）；问题在**应用内预览**——它按空行切分 `draft.body` 直接渲染，既不识别尾注行也不认识固定结尾图，于是显得“没生效”。渲染层（`render_wechat_html`）此前已正确跳过尾注行。
+- 结论③（预览与投递对齐）：新增只读接口返回 `cover_in_body`／`footer_text_enabled`／`footer_image_configured`／`footer_image_name`／`footer_image_download_url`／`footer_text_prefixes`；前端预览据此（a）隐藏尾注行（前缀来自后端，避免两处规则漂移）、（b）文末渲染固定结尾图并注明“文字尾注已由结尾图取代”、（c）**封面图移到标题下方**（紧随标题、摘要之前），且优先使用**投递已选定**的封面素材，与实际发出去的一致。
+- 验证：后端 **334 项通过、0 失败**（新增 4 项：渲染器在有结尾图时丢弃文字尾注、GitHub 提示行判定、前端镜像同一规则、接口字段齐全）；前端 `tsc` 0 错误；重建后实测 `GET /api/wechat/publication-preferences` 返回 200，字段为：`cover_in_body=true`、`footer_text_enabled=false`、`footer_image_configured=true`、`footer_image_name=footer-original-project.png`；前端模块确认已含取偏好／隐藏尾注／标题下封面／文末结尾图四处逻辑。
+- 施工自伤与修复：脚本插入 `routes.py` 的 import 未真正生效（`NameError: load_publication_preferences`，接口 500）→ 用编辑工具补上导入后恢复正常。
+- 并行会话警告（未变）：工作区仍混有另一会话的未提交改动，本轮**未提交 git**。
 - 授权状态：已确认并完成
 
 -->

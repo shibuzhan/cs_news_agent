@@ -19,8 +19,9 @@ from app.services.generator import GenerationError, build_generator
 from app.services.model_errors import sanitize_failure_text
 from app.services.source_snapshots import DraftSourceSnapshotStore
 from app.services.task_narration import compose_task_reply
+from app.services.runtime_settings import load_runtime_settings
 from app.storage.database import SessionLocal
-from app.storage.repositories import ContentRepository
+from app.storage.repositories import RepositoryError, ContentRepository
 from app.storage.tables import ChatAgentRunRow
 from app.tools.illustration_planner import (
     IllustrationPlanner,
@@ -93,7 +94,9 @@ def collection_memory_summary(result, summary: str) -> str:
         reasons.append(f"{skipped} 条未进入生成候选")
     if not reasons:
         reasons.append("没有符合生成条件的新候选")
-    return f"{summary}；{'；'.join(reasons)}。"
+    # 与失败提示同理：summary 可能已以句号结尾，拼接前先去掉句末标点。
+    base = summary.strip().rstrip("。；;. ")
+    return f"{base}；{'；'.join(reasons)}。"
 
 
 def image_tasks_need_manual_attention(tasks) -> bool:
@@ -119,16 +122,28 @@ def _raw_source_from_draft(draft) -> RawSourceItem:
 
 
 def _finish_failed_run(chat_run_id: str, response_message_id: str, detail: str, title: str) -> None:
-    """取消与普通异常都必须结束父运行，避免前端无限显示生成中。"""
+    """取消与普通异常都必须结束父运行，避免前端无限显示生成中。
+
+    运行记录可能已被运营者在“生成记录”里删除：此时收尾只能放弃写入，
+    **不能因为找不到记录再抛一次异常**——那会把真正的失败原因掩盖掉
+    （真实故障：采集并发冲突的 IntegrityError 被收尾时的 RepositoryError 顶替）。
+    """
     with SessionLocal() as session:
         repository = ContentRepository(session)
-        repository.update_chat_message(response_message_id, detail)
-        repository.add_chat_agent_event(chat_run_id, title, detail, "failed", metadata={"phase": "text", "state": "failed"})
-        repository.finish_chat_agent_run(chat_run_id, response_message_id, ConversationRunStatus.FAILED, "处理失败", [], detail)
-        repository.upsert_failure_notification(
-            "chat_agent_run", chat_run_id, "generation", "文案生成失败", detail, "review",
-        )
-        session.commit()
+        try:
+            repository.update_chat_message(response_message_id, detail)
+            repository.add_chat_agent_event(chat_run_id, title, detail, "failed", metadata={"phase": "text", "state": "failed"})
+            repository.finish_chat_agent_run(chat_run_id, response_message_id, ConversationRunStatus.FAILED, "处理失败", [], detail)
+            repository.upsert_failure_notification(
+                "chat_agent_run", chat_run_id, "generation", "文案生成失败", detail, "review",
+            )
+            session.commit()
+        except RepositoryError as exc:
+            session.rollback()
+            logger.warning(
+                "failed_run_finish_skipped chat_run_id=%s error_type=%s detail=%s",
+                chat_run_id, type(exc).__name__, detail[:120],
+            )
 
 
 def _generation_failure_detail(exc: Exception, *, preserved_draft: bool = False) -> str:
@@ -136,9 +151,11 @@ def _generation_failure_detail(exc: Exception, *, preserved_draft: bool = False)
     if isinstance(exc, GenerationError):
         detail = str(exc)
     else:
-        detail = "内容生成执行失败，请查看生成记录后重试。"
+        detail = "内容生成执行失败，请查看生成记录后重试"
+    # 去掉句末标点再拼接：否则会出现“……后重试。；未生成……”这种句号后跟分号的瑕疵。
+    base = detail.strip().rstrip("。；;. ")
     suffix = "原草稿与历史版本未被覆盖。" if preserved_draft else "未生成新的草稿。"
-    return f"{detail}；{suffix}"
+    return f"{base}；{suffix}"
 
 
 def _regenerate_draft_in_thread(settings: Settings, draft_id: str, raw) -> dict:
@@ -167,10 +184,11 @@ async def process_collection_job(
         target or "-",
     )
     try:
-        timeout = httpx.Timeout(settings.request_timeout_seconds)
+        job_settings = load_runtime_settings(settings)
+        timeout = httpx.Timeout(job_settings.request_timeout_seconds)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             agent = ContentMainAgent(
-                build_source_tools(client, settings), build_generator(settings), settings=settings
+                build_source_tools(client, job_settings), build_generator(job_settings), settings=job_settings
             )
             result = await agent.run(
                 AgentCollectCommand(

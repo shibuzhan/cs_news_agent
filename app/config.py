@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     review_openai_api_key: str | None = None
     illustration_planner_openai_api_key: str | None = None
     evidence_selector_openai_api_key: str | None = None
+    # 设置页新增的模型档案密钥使用 Fernet 加密后才会落库。此密钥仅来自私有 .env，绝不通过 API 返回。
+    model_profile_encryption_key: str | None = None
     llm_model: str | None = None
     # 按任务拆分模型：留空时回退到既有 LLM_MODEL，升级配置不会中断现有调用。
     conversation_llm_model: str | None = None
@@ -200,8 +202,8 @@ def model_for(
     task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
 ) -> str | None:
     """兼容测试替身与旧调用方的任务模型选择入口。"""
-    configured = getattr(settings, f"{task}_llm_model", None)
-    return configured or getattr(settings, "llm_model", None)
+    configured = _stored_model_profile_value(settings, task, "model_name")
+    return configured or getattr(settings, f"{task}_llm_model", None) or getattr(settings, "llm_model", None)
 
 
 def base_url_for(
@@ -209,8 +211,8 @@ def base_url_for(
     task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
 ) -> str | None:
     """兼容测试替身与旧调用方的任务服务地址选择入口。"""
-    configured = getattr(settings, f"{task}_openai_base_url", None)
-    return configured or getattr(settings, "openai_base_url", None)
+    configured = _stored_model_profile_value(settings, task, "base_url")
+    return configured or getattr(settings, f"{task}_openai_base_url", None) or getattr(settings, "openai_base_url", None)
 
 
 def api_key_for(
@@ -218,8 +220,22 @@ def api_key_for(
     task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
 ) -> str | None:
     """任务密钥优先；留空时兼容既有 OPENAI_API_KEY。"""
-    configured = getattr(settings, f"{task}_openai_api_key", None)
-    return configured or getattr(settings, "openai_api_key", None)
+    configured = _stored_model_profile_value(settings, task, "api_key")
+    return configured or getattr(settings, f"{task}_openai_api_key", None) or getattr(settings, "openai_api_key", None)
+
+
+def _stored_model_profile_value(
+    settings: Settings,
+    task: Literal["conversation", "content", "review", "illustration_planner", "evidence_selector"],
+    field: Literal["model_name", "base_url", "api_key"],
+) -> str | None:
+    """读取设置页的模型绑定；数据库不可用时必须无感回退到 .env。"""
+    try:
+        from app.services.runtime_settings import model_profile_value
+
+        return model_profile_value(settings, task, field)
+    except Exception:
+        return None
 
 
 @lru_cache

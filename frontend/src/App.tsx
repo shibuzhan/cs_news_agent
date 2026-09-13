@@ -1,9 +1,9 @@
 import { Component, type ErrorInfo, useCallback, useEffect, useRef, useState } from "react";
-import { Bell, Check, ChevronDown, CircleAlert, CircleCheck, Download, FileText, Image, LoaderCircle, MessageSquareText, Paperclip, Plus, RefreshCw, Send, ShieldCheck, Trash2, X } from "lucide-react";
+import { Bell, Check, ChevronDown, CircleAlert, CircleCheck, Download, FileText, Image, LoaderCircle, MessageSquareText, Paperclip, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X } from "lucide-react";
 import { api } from "./api";
-import type { AgentRun, Attachment, AutoReviewRun, ChatMessage, ChatSession, Conversation, Draft, DraftIllustration, DraftRevision, Notification, WechatPublicationJob, WechatRemoteDraft } from "./types";
+import type { AgentRun, Attachment, AutoReviewRun, ChatMessage, ChatSession, Conversation, Draft, DraftIllustration, DraftRevision, ModelProfile, Notification, RuntimeSettingsSnapshot, WechatPublicationJob, WechatRemoteDraft, PublicationPreferences } from "./types";
 
-type View = "chat" | "review" | "publishing";
+type View = "chat" | "review" | "publishing" | "settings";
 
 class PageErrorBoundary extends Component<{ children: React.ReactNode }, { failed: boolean; detail: string }> {
   state = { failed: false, detail: "" };
@@ -154,6 +154,7 @@ function AppShell({ view, setView, children }: { view: View; setView: (view: Vie
         <button className={view === "chat" ? "nav-item active" : "nav-item"} onClick={() => setView("chat")}><MessageSquareText size={18} /> 与 Agent 对话</button>
         <button className={view === "review" ? "nav-item active" : "nav-item"} onClick={() => setView("review")}><ShieldCheck size={18} /> 生成记录</button>
         <button className={view === "publishing" ? "nav-item active" : "nav-item"} onClick={() => setView("publishing")}><Send size={18} /> 发布情况</button>
+        <button className={view === "settings" ? "nav-item active" : "nav-item"} onClick={() => setView("settings")}><Settings size={18} /> 系统设置</button>
       </nav>
     </aside>
     <section className="workspace"><NotificationCenter onNavigate={setView} />{children}</section>
@@ -193,6 +194,13 @@ function ChatPage() {
     }).catch((error: Error) => { if (!cancelled) setNotice(error.message); });
     return () => { cancelled = true; };
   }, [reload]);
+
+  useEffect(() => {
+    api.getRuntimeSettings().then((snapshot) => {
+      setAutoReview(snapshot.runtime.auto_review_default);
+      setAutoIllustration(snapshot.runtime.auto_illustration_default);
+    }).catch(() => { /* 设置服务不可用时保留安全默认值 */ });
+  }, []);
 
   async function createConversation() {
     const session = await api.createChatSession();
@@ -634,15 +642,21 @@ function previewParagraphs(body: string) {
   return body.replace(/\r/g, "").split(/\n\s*\n/).map((paragraph) => paragraph.trim()).filter(Boolean);
 }
 
-function PublicationArticlePreview({ draft, job, illustrations }: { draft: Draft; job: WechatPublicationJob | null; illustrations: DraftIllustration[] }) {
+function PublicationArticlePreview({ draft, job, illustrations, preferences }: { draft: Draft; job: WechatPublicationJob | null; illustrations: DraftIllustration[]; preferences: PublicationPreferences | null }) {
   const currentAssetIds = new Set(illustrations.map((item) => item.asset_id));
   // 预览展示**草稿自己的全部插图**；投递选择只作为提示（否则未入选的插图会像“丢了”一样）。
-  const cover = illustrations.find((item) => item.purpose === "cover")
-    || (job?.cover_asset_id ? illustrations.find((item) => item.asset_id === job.cover_asset_id) : undefined);
+  // 封面优先用**投递已选定**的那张（与实际发出去的一致），没有选择时再退回草稿里的封面行。
+  const cover = (job?.cover_asset_id ? illustrations.find((item) => item.asset_id === job.cover_asset_id) : undefined)
+    || illustrations.find((item) => item.purpose === "cover");
   const inlineIllustrations = illustrations.filter((item) => item.purpose === "inline");
   const selectedInlineIds = (job?.inline_asset_ids || []).filter((assetId) => currentAssetIds.has(assetId));
   const deliveryCovers = job?.cover_asset_id && currentAssetIds.has(job.cover_asset_id) ? 1 : 0;
-  const paragraphs = previewParagraphs(draft.body);
+  // 与后端 render_wechat_html 一致：配了固定结尾图且关闭文字尾注时，尾注行不再显示。
+  const hideFooterText = Boolean(preferences?.footer_image_configured && !preferences?.footer_text_enabled);
+  const isFooterLine = (paragraph: string) =>
+    (preferences?.footer_text_prefixes || ["原文标题：", "原文链接：", "来源链接：", "点击查看原文跳转项目地址"])
+      .some((prefix) => paragraph.startsWith(prefix));
+  const paragraphs = previewParagraphs(draft.body).filter((paragraph) => !(hideFooterText && isFooterLine(paragraph)));
   // 与后端渲染一致：插图只出现在正文开头或段落之间，越界位置前移到“最后一段之前”。
   const maxPosition = Math.max(paragraphs.length - 1, 0);
   const clampPosition = (value: number) => Math.min(Math.max(value, 0), maxPosition);
@@ -654,17 +668,21 @@ function PublicationArticlePreview({ draft, job, illustrations }: { draft: Draft
   const inlineCount = inlineIllustrations.length;
 
   return <article className="article-preview article-preview-with-images">
-    <h2>{draft.title_options[0]}</h2>
-    <p className="preview-summary">{draft.summary_cn}</p>
+    {/* 插图统计说明放标题上方（运营核对用，不属于文章内容） */}
     {illustrations.length > 0 && <p className="muted">{`草稿共 ${illustrations.length} 张插图（封面 ${cover ? 1 : 0} 张、正文 ${inlineCount} 张）；投递将使用封面 ${deliveryCovers} 张、正文插图 ${selectedInlineIds.length} 张${selectedInlineIds.length < inlineCount ? "（其余插图仅在草稿中保留，不会上传）" : ""}。`}</p>}
-    {cover && <img className="publication-preview-cover" src={cover.asset.download_url} alt="文章封面预览" />}
+    <h2>{draft.title_options[0]}</h2>
+    {/* 摘要紧接标题，封面再跟在摘要下方——与公众号“标题 → 摘要 → 正文首图=封面”的阅读顺序一致 */}
+    <p className="preview-summary">{draft.summary_cn}</p>
+    {cover && <img className="publication-preview-cover" src={cover.asset.download_url} alt={preferences?.cover_in_body ? "封面（同时作为正文首图）" : "文章封面预览"} />}
     <div className="preview-body">
       {(inlineByParagraph[0] || []).map((item) => <img className="publication-preview-inline" key={item.id} src={item.asset.download_url} alt="正文插图：正文开头" />)}
       {paragraphs.map((paragraph, index) => <div className="preview-paragraph" key={`${index}-${paragraph}`}>
         <p>{paragraph}</p>
         {(inlineByParagraph[index + 1] || []).map((item) => <img className="publication-preview-inline" key={item.id} src={item.asset.download_url} alt={`正文插图：第 ${index + 1} 段后`} />)}
       </div>)}
+      {preferences?.footer_image_download_url && <img className="publication-preview-inline" src={preferences.footer_image_download_url} alt="文末固定结尾图（每篇文章都一样）" />}
     </div>
+    {preferences?.footer_image_configured && <p className="muted">{`文末固定结尾图：${preferences.footer_image_name || "已设置"}；文字尾注${preferences.footer_text_enabled ? "仍保留" : "已由结尾图取代"}。`}</p>}
   </article>;
 }
 
@@ -672,6 +690,8 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [jobs, setJobs] = useState<WechatPublicationJob[]>([]);
   const [selectedDraftId, setSelectedDraftId] = useState("");
+  // 长期排版偏好：预览必须与实际投递同一套规则（尾注行是否隐藏、结尾图）。
+  const [preferences, setPreferences] = useState<PublicationPreferences | null>(null);
   const [autoReviews, setAutoReviews] = useState<AutoReviewRun[]>([]);
   const [illustrations, setIllustrations] = useState<DraftIllustration[]>([]);
   const [remoteDrafts, setRemoteDrafts] = useState<WechatRemoteDraft[] | null>(null);
@@ -690,8 +710,10 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
 
   const reload = useCallback(async () => {
     try {
-      const [nextDrafts, nextJobs] = await Promise.all([api.listDrafts(), api.listWechatPublications()]);
-      setDrafts(nextDrafts); setJobs(nextJobs);
+      const [nextDrafts, nextJobs, preferences] = await Promise.all([
+        api.listDrafts(), api.listWechatPublications(), api.getPublicationPreferences(),
+      ]);
+      setDrafts(nextDrafts); setJobs(nextJobs); setPreferences(preferences);
       if (!selectedDraftId) setSelectedDraftId(nextJobs[0]?.draft_id || nextDrafts[0]?.id || "");
     } catch (error) { setDeliveryNotice(error instanceof Error ? error.message : "加载草稿箱投递记录失败"); }
   }, [selectedDraftId]);
@@ -752,11 +774,98 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
     <div className="publish-layout">
       <aside className="publish-list"><div className="panel-heading"><h2>文章投递</h2><span>{drafts.length}</span></div>{drafts.map((draft) => { const deliveryJob = jobs.find((job) => job.draft_id === draft.id); const deliveryFailed = deliveryJob?.state === "draft_failed"; return <button className={selectedDraftId === draft.id ? "draft-item selected" : "draft-item"} key={draft.id} onClick={() => setSelectedDraftId(draft.id)}><span className="status-dot" data-status={deliveryFailed ? "failed" : draft.status} /><div><b>{draft.title_options[0]}</b><small>{deliveryFailed ? `投递失败 · ${new Date(deliveryJob.updated_at).toLocaleString()}` : statusLabel(draft.status)}</small></div></button>; })}</aside>
       <section className="publish-editor"><h2>自动审核</h2><p className="muted">审核会一次列出完整问题并给出评分；只要给出可执行意见，无论是否通过都会先按意见改稿一轮再复审。“仅运行审核”不会创建公众号草稿。</p><section className="illustration-record"><div className="panel-heading"><b>审核记录</b><span>{autoReviews.length}</span></div>{autoReviews.length ? autoReviews.map((item, index) => <article className="review-result" key={item.id}><b>{index === 0 ? "最近结果 · " : "历史记录 · "}{autoReviewStatusLabel(item.status)}</b><AutoReviewFeedback item={item} />{item.error_message && <p>{item.error_message}</p>}<small>{new Date(item.created_at).toLocaleString()}</small></article>) : <p className="muted">尚未运行自动审核。</p>}{canRetryDraftboxDelivery ? <button className="primary-button" disabled={busy} onClick={() => void retryDraftboxDelivery()}><RefreshCw size={16} /> 重新投递草稿箱</button> : <div className="publish-actions publish-flow"><button className="ghost-button" disabled={busy || reviewInProgress || !selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)} onClick={() => void runReview(false)}>{reviewInProgress ? <><LoaderCircle className="spin" size={16} /> 审核进行中</> : "仅运行审核（改稿不投递）"}</button><button className="primary-button" disabled={busy || reviewInProgress || !selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)} onClick={() => void runReview(true)}>审核并投递草稿箱</button></div>}{(selectedDraft?.status === "ready_to_publish" || selectedDraft?.status === "draftbox_created") && <div className="publish-actions"><button className="ghost-button" disabled={busy} onClick={() => { if (window.confirm("将作废当前投递配图选择，按“真实截图优先”重新选择；已投递的公众号草稿会原地覆盖。继续吗？")) void onAgentCommand(`重新选择配图｜draft=${selectedDraft.id}`); }}><RefreshCw size={16} /> 重新选择配图</button></div>}</section>{reviewNotice && <p className="notice">{reviewNotice}</p>}</section>
-      <section className="publication-preview"><div className="panel-heading"><h2>草稿预览</h2><span>{selectedJob ? publishingStateLabel(selectedJob.state) : selectedDraft ? statusLabel(selectedDraft.status) : "未选择"}</span></div>{selectedDraft ? <PublicationArticlePreview draft={selectedDraft} job={selectedJob} illustrations={illustrations} /> : <div className="empty compact">请选择文章</div>}</section>
+      <section className="publication-preview"><div className="panel-heading"><h2>草稿预览</h2><span>{selectedJob ? publishingStateLabel(selectedJob.state) : selectedDraft ? statusLabel(selectedDraft.status) : "未选择"}</span></div>{selectedDraft ? <PublicationArticlePreview draft={selectedDraft} job={selectedJob} illustrations={illustrations} preferences={preferences} /> : <div className="empty compact">请选择文章</div>}</section>
     </div>
     {(selectedJob || canRetryDraftboxDelivery || deliveryNotice) && <section className="remote-status-panel draftbox-status-panel"><div className="panel-heading"><h2>当前草稿箱投递</h2><span>{selectedJob ? publishingStateLabel(selectedJob.state) : "投递失败"}</span></div>{selectedJob && <p className="muted">投递：{new Date(selectedJob.created_at).toLocaleString()}；更新：{new Date(selectedJob.updated_at).toLocaleString()}</p>}{selectedJob?.wechat_draft_media_id && <p className="muted">公众号草稿已创建，流程已完成并进入去重记录。</p>}{selectedJob?.error_message && <p className="notice">{selectedJob.error_message}</p>}{deliveryNotice && <p className="notice">{deliveryNotice}</p>}{canRetryDraftboxDelivery && <p className="muted">审核已通过，但草稿箱投递失败；可在上方点击“重新投递草稿箱”。该操作会复用审核前已确定的图片，不会重新选择、审核、生成文案或生成图片。</p>} {!canRetryDraftboxDelivery && <p className="muted">重新投递会复用审核前已确定的图片，不会重新审核、生成文案或生成图片。</p>}</section>}
     <section className="remote-status-panel"><div className="panel-heading"><h2>公众号草稿箱</h2><span>只读同步</span></div><p className="muted">同步只读取草稿箱，不会创建、修改或发表文章。</p><button className="ghost-button" disabled={busy} onClick={() => void syncRemoteDrafts()}><RefreshCw size={15} /> 同步草稿箱</button>{remoteDraftsNotice && <p className="notice">{remoteDraftsNotice}</p>}{remoteDrafts !== null && <div className="remote-status-grid"><article><b>草稿箱（{remoteDraftTotal}）</b>{remoteDrafts.length ? remoteDrafts.map((item) => <div className="remote-item" key={item.media_id}><strong>{item.title}</strong><span>状态：草稿箱中</span><small>创建：{item.created_at}；更新：{item.updated_at}</small></div>) : <p className="muted">草稿箱为空</p>}</article></div>}</section>
   </>;
+}
+
+function SettingsPage() {
+  const apiKeyMask = "••••••••••••";
+  const [snapshot, setSnapshot] = useState<RuntimeSettingsSnapshot | null>(null);
+  const [runtime, setRuntime] = useState<Record<string, string | number | boolean>>({});
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [profileDialogOpen, setProfileDialogOpen] = useState(false);
+  const [editingApiKey, setEditingApiKey] = useState(false);
+  const [profile, setProfile] = useState({ model_name: "", base_url: "", api_key: "", has_api_key: false });
+
+  const reload = useCallback(async () => {
+    const next = await api.getRuntimeSettings();
+    setSnapshot(next);
+    setRuntime(next.runtime);
+  }, []);
+
+  useEffect(() => { void reload().catch((error: Error) => setNotice(error.message)); }, [reload]);
+
+  async function run(action: () => Promise<unknown>, success: string) {
+    setBusy(true); setNotice("");
+    try { await action(); await reload(); setNotice(success); }
+    catch (error) { setNotice(error instanceof Error ? error.message : "操作失败"); }
+    finally { setBusy(false); }
+  }
+
+  function closeProfileDialog() {
+    setProfileDialogOpen(false);
+    setEditingId(null);
+    setEditingApiKey(false);
+    setProfile({ model_name: "", base_url: "", api_key: "", has_api_key: false });
+  }
+
+  function openCreateProfile() {
+    setEditingId(null);
+    setEditingApiKey(true);
+    setProfile({ model_name: "", base_url: "", api_key: "", has_api_key: false });
+    setProfileDialogOpen(true);
+  }
+
+  function editProfile(item: ModelProfile) {
+    setEditingId(item.id);
+    setEditingApiKey(false);
+    setProfile({ model_name: item.model_name, base_url: item.base_url, api_key: "", has_api_key: item.has_api_key });
+    setProfileDialogOpen(true);
+  }
+
+  async function saveProfile() {
+    const updating = Boolean(editingId);
+    await run(async () => {
+      if (editingId) {
+        await api.updateModelProfile(editingId, {
+          model_name: profile.model_name,
+          base_url: profile.base_url,
+          ...(editingApiKey && profile.api_key.trim() ? { api_key: profile.api_key } : {}),
+        });
+      } else {
+        await api.createModelProfile({ model_name: profile.model_name, base_url: profile.base_url, api_key: profile.api_key });
+      }
+      closeProfileDialog();
+    }, updating ? "模型档案已更新" : "模型档案已创建");
+  }
+
+  if (!snapshot) return <section className="settings-page"><h1>系统设置</h1><p className="muted">正在读取本地设置…</p>{notice && <p className="notice">{notice}</p>}</section>;
+  const updateRuntime = (key: string, value: string | number | boolean) => setRuntime((current) => ({ ...current, [key]: value }));
+  const tasks: Array<[string, string]> = [["conversation", "日常对话"], ["content", "文案生成"], ["review", "自动审核"], ["illustration_planner", "配图规划"], ["evidence_selector", "证据筛选"]];
+
+  return <section className="settings-page">
+    <header className="page-heading"><div><p className="eyebrow">本地运行配置</p><h1>系统设置</h1><p>修改只影响之后新建的任务；运行中的采集、生成、审核和投递不会被中断。</p></div><button className="ghost-button" disabled={busy} onClick={() => void run(reload, "设置已刷新")}><RefreshCw size={16} /> 刷新设置</button></header>
+    {notice && <p className="notice">{notice}</p>}
+    <section className="settings-grid">
+      <article className="settings-card wide"><div className="panel-heading"><div><b>模型档案与任务分配</b><small>密钥只可写入或覆盖，不会回显。未选择档案的任务继续使用 .env 中的原有配置。</small></div><button className="primary-button compact-action" disabled={busy} onClick={openCreateProfile}><Plus size={16} /> 新增模型</button></div>
+        {!snapshot.security.model_profile_encryption_ready && <p className="notice">需先在私有 .env 中填写 MODEL_PROFILE_ENCRYPTION_KEY，才可保存新的模型 API Key。</p>}
+        <div className="profile-list">{snapshot.model_profiles.length ? snapshot.model_profiles.map((item) => <article className="settings-row model-profile-row" key={item.id}><div><b>{item.model_name}</b><small>{item.base_url}</small></div><div className="profile-key-state" title={item.has_api_key ? "API Key 已保存" : "尚未填写 API Key"}><span>API Key</span><strong>{item.has_api_key ? apiKeyMask : "未填写"}</strong></div><div className="inline-actions"><button className="text-button" disabled={busy} onClick={() => editProfile(item)}>编辑</button><button className="text-button" disabled={busy} onClick={() => void run(() => api.testModelProfile(item.id), "模型连通性正常")}>测试连通性</button><button className="danger-link" disabled={busy} onClick={() => { if (window.confirm("删除该模型档案不会影响环境变量配置，确定继续吗？")) void run(() => api.deleteModelProfile(item.id), "模型档案已删除"); }}>删除</button></div></article>) : <p className="muted">尚未创建模型档案，可继续使用 .env 中按任务设置的模型。</p>}</div>
+        <div className="task-routing">{tasks.map(([task, label]) => <label key={task}><span>{label}</span><select value={snapshot.task_assignments[task] || ""} disabled={busy} onChange={(event) => void run(() => api.assignModelTask(task, event.target.value || null), `${label} 路由已保存`)}><option value="">环境变量默认</option>{snapshot.model_profiles.map((item) => <option key={item.id} value={item.id}>{item.model_name}</option>)}</select></label>)}</div>
+      </article>
+      <article className="settings-card"><div className="panel-heading"><div><b>图片与微信草稿箱</b><small>{snapshot.image_options.reference_note}</small></div></div><label>插图尺寸<select value={String(runtime.image_generation_size || "")} onChange={(event) => updateRuntime("image_generation_size", event.target.value)}>{snapshot.image_options.sizes.map((value) => <option key={value}>{value}</option>)}</select></label><label>插图比例<select value={String(runtime.image_generation_ratio || "")} onChange={(event) => updateRuntime("image_generation_ratio", event.target.value)}>{snapshot.image_options.ratios.map((value) => <option key={value}>{value}</option>)}</select></label><label>图片最长等待秒数<input type="number" min="60" value={String(runtime.image_generation_timeout_seconds || "")} onChange={(event) => updateRuntime("image_generation_timeout_seconds", Number(event.target.value))} /></label><label className="setting-check"><input type="checkbox" checked={Boolean(runtime.wechat_open_comment)} onChange={(event) => updateRuntime("wechat_open_comment", event.target.checked)} /> 上传草稿箱时开启留言</label><label className="setting-check"><input type="checkbox" checked={Boolean(runtime.wechat_only_fans_can_comment)} disabled={!runtime.wechat_open_comment} onChange={(event) => updateRuntime("wechat_only_fans_can_comment", event.target.checked)} /> 仅关注后可留言</label><label className="setting-check"><input type="checkbox" checked={Boolean(runtime.publication_vision_selection_enabled)} onChange={(event) => updateRuntime("publication_vision_selection_enabled", event.target.checked)} /> 投递前启用图片视觉选择</label></article>
+      <article className="settings-card"><div className="panel-heading"><div><b>写作、审核与自动化</b><small>这些值会作为新文案的质量门槛与界面默认开关。</small></div></div><label>正文最少字数<input type="number" min="100" value={String(runtime.draft_body_min_chars || "")} onChange={(event) => updateRuntime("draft_body_min_chars", Number(event.target.value))} /></label><label>正文最多字数<input type="number" min="100" value={String(runtime.draft_body_max_chars || "")} onChange={(event) => updateRuntime("draft_body_max_chars", Number(event.target.value))} /></label><label>审核通过分数<input type="number" min="0" max="100" value={String(runtime.auto_review_pass_score || "")} onChange={(event) => updateRuntime("auto_review_pass_score", Number(event.target.value))} /></label><label className="setting-check"><input type="checkbox" checked={Boolean(runtime.auto_illustration_default)} onChange={(event) => updateRuntime("auto_illustration_default", event.target.checked)} /> 对话默认勾选自动配图</label><label className="setting-check"><input type="checkbox" checked={Boolean(runtime.auto_review_default)} onChange={(event) => updateRuntime("auto_review_default", event.target.checked)} /> 对话默认勾选自动审核</label></article>
+      <article className="settings-card"><div className="panel-heading"><div><b>采集来源</b><small>仅调整本项目已有的受控来源；不会允许任意 URL 采集。</small></div></div><label>单次采集上限<input type="number" min="1" max="50" value={String(runtime.collect_limit || "")} onChange={(event) => updateRuntime("collect_limit", Number(event.target.value))} /></label><label>官方 RSS 地址（每行一个）<textarea value={String(runtime.rss_feeds || "").replace(/,/g, "\n")} onChange={(event) => updateRuntime("rss_feeds", event.target.value.split("\n").map((item) => item.trim()).filter(Boolean).join(","))} /></label></article>
+    </section>
+    <div className="settings-actions"><button className="primary-button" disabled={busy} onClick={() => void run(() => api.updateRuntimeSettings(runtime), "运行设置已保存，将在下一项新任务生效")}>保存运行设置</button></div>
+    <section className="settings-card"><div className="panel-heading"><div><b>已生成项目去重记录</b><small>仅展示项目名称与原文链接。删除后该来源可再次进入采集候选。</small></div><span>{snapshot.projects.length}</span></div><div className="project-settings-list">{snapshot.projects.length ? snapshot.projects.map((project) => <article className="settings-row" key={project.id}><a href={project.source_url} target="_blank" rel="noreferrer">{project.name} ↗</a><button className="danger-link" disabled={busy} onClick={() => { if (window.confirm("移出后该项目可能再次被采集生成，确定继续吗？")) void run(() => api.deleteProjectIntroduction(project.id), "项目已移出去重记录"); }}>移出</button></article>) : <p className="muted">还没有进入公众号草稿箱的项目记录。</p>}</div></section>
+    <section className="settings-card"><div className="panel-heading"><div><b>最近配置变更</b><small>不会记录或显示任何 API Key 内容。</small></div></div><div className="audit-list">{snapshot.audits.length ? snapshot.audits.map((audit) => <article key={audit.id}><b>{audit.setting_key}</b><span>{audit.old_value || "未设置"} → {audit.new_value || "未设置"}</span><small>{new Date(audit.created_at).toLocaleString()} · {audit.changed_by}</small></article>) : <p className="muted">尚无设置变更记录。</p>}</div></section>
+    {profileDialogOpen && <div className="settings-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) closeProfileDialog(); }}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="model-profile-dialog-title"><div className="panel-heading"><div><p className="eyebrow">模型连接配置</p><h2 id="model-profile-dialog-title">{editingId ? "编辑模型" : "新增模型"}</h2><small>模型名会作为页面显示名称；API Key 只会加密保存。</small></div><button className="icon-button" aria-label="关闭" disabled={busy} onClick={closeProfileDialog}><X size={18} /></button></div><label>模型名<input autoFocus value={profile.model_name} placeholder="例如：qwen3.8-27b" onChange={(event) => setProfile({ ...profile, model_name: event.target.value })} /></label><label>Base URL<input value={profile.base_url} placeholder="https://api.example.com/v1" onChange={(event) => setProfile({ ...profile, base_url: event.target.value })} /></label><label>API Key<div className="api-key-input-row"><input type="password" value={editingApiKey ? profile.api_key : (profile.has_api_key ? apiKeyMask : "")} readOnly={!editingApiKey} placeholder="填写 API Key" onChange={(event) => setProfile({ ...profile, api_key: event.target.value })} />{editingId && !editingApiKey && <button type="button" className="text-button" disabled={busy} onClick={() => { setEditingApiKey(true); setProfile({ ...profile, api_key: "" }); }}>更换</button>}</div><small>{editingApiKey && editingId ? "留空则保留已保存的密钥。" : "密钥不会被回显。"}</small></label><div className="settings-modal-actions"><button className="ghost-button" disabled={busy} onClick={closeProfileDialog}>取消</button><button className="primary-button" disabled={busy || !profile.model_name.trim() || !profile.base_url.trim() || (!editingId && !profile.api_key.trim())} onClick={() => void saveProfile()}>{editingId ? "保存修改" : "保存模型"}</button></div></section></div>}
+  </section>;
 }
 
 export function App() {
@@ -778,5 +887,5 @@ export function App() {
       window.alert(error instanceof Error ? error.message : "命令发送失败");
     }
   }
-  return <PageErrorBoundary><AppShell view={view} setView={setView}>{view === "chat" ? <ChatPage /> : view === "review" ? <GenerationRecordPage onAgentCommand={dispatchAgentCommand} /> : <PublishingPage onAgentCommand={dispatchAgentCommand} />}</AppShell></PageErrorBoundary>;
+  return <PageErrorBoundary><AppShell view={view} setView={setView}>{view === "chat" ? <ChatPage /> : view === "review" ? <GenerationRecordPage onAgentCommand={dispatchAgentCommand} /> : view === "publishing" ? <PublishingPage onAgentCommand={dispatchAgentCommand} /> : <SettingsPage />}</AppShell></PageErrorBoundary>;
 }

@@ -36,6 +36,8 @@ class DeterministicConversationModel:
 
 class OpenAICompatibleConversationModel:
     def __init__(self, settings: Settings):
+        from app.services.runtime_settings import load_runtime_settings
+        settings = load_runtime_settings(settings)
         client = OpenAI(
             api_key=api_key_for(settings, "conversation"),
             base_url=base_url_for(settings, "conversation") or None,

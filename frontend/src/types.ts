@@ -202,3 +202,47 @@ export type PublicationAsset = {
   created_at: string;
   download_url: string;
 };
+
+export type ModelProfile = {
+  id: string;
+  name: string;
+  model_name: string;
+  base_url: string;
+  has_api_key: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RuntimeSettingsSnapshot = {
+  model_profiles: ModelProfile[];
+  task_assignments: Record<string, string | null>;
+  runtime: {
+    draft_body_min_chars: number;
+    draft_body_max_chars: number;
+    auto_review_pass_score: number;
+    wechat_open_comment: boolean;
+    wechat_only_fans_can_comment: boolean;
+    publication_vision_selection_enabled: boolean;
+    image_generation_size: string;
+    image_generation_ratio: string;
+    image_generation_timeout_seconds: number;
+    collect_limit: number;
+    rss_feeds: string;
+    auto_review_default: boolean;
+    auto_illustration_default: boolean;
+  };
+  image_options: { sizes: string[]; ratios: string[]; reference_note: string };
+  projects: Array<{ id: string; name: string; source_url: string }>;
+  audits: Array<{ id: string; scope: string; setting_key: string; old_value: string | null; new_value: string | null; changed_by: string; created_at: string }>;
+  security: { model_profile_encryption_ready: boolean; notice: string };
+};
+
+// 长期排版偏好（只读）：预览与实际投递共用同一套规则。
+export interface PublicationPreferences {
+  cover_in_body: boolean;
+  footer_text_enabled: boolean;
+  footer_image_configured: boolean;
+  footer_image_name: string | null;
+  footer_image_download_url: string | null;
+  footer_text_prefixes: string[];
+}

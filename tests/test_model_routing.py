@@ -5,6 +5,16 @@ import pytest
 from app.config import api_key_for, base_url_for, model_for, structured_output_mode_for
 
 
+@pytest.fixture(autouse=True)
+def _isolate_from_stored_model_profiles(monkeypatch):
+    """这些用例覆盖“环境变量回退链”，必须屏蔽数据库里的模型档案。
+
+    真实情况：运营者在系统设置里把环境变量导入为模型档案后，
+    `model_for()` 优先返回档案里的模型，这些用例会因为读到真实配置而失败。
+    """
+    monkeypatch.setattr("app.config._stored_model_profile_value", lambda *args, **kwargs: None)
+
+
 def test_task_models_fall_back_to_legacy_llm_model() -> None:
     settings = SimpleNamespace(llm_model="legacy-model")
 

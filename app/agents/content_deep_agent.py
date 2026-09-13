@@ -33,6 +33,7 @@ from app.config import (
 from app.domain.models import ConversationDecision, ConversationIntent
 from app.paths import agent_skills_dir
 from app.services.model_errors import schema_error_fields
+from app.services.runtime_settings import load_runtime_settings
 
 
 logger = logging.getLogger("news_agent.content_deep_agent")
@@ -184,7 +185,8 @@ class ContentDeepAgent:
     """会话级 DeepAgent：以持久 checkpoint 输出一次受限业务决策。"""
 
     def __init__(self, settings: Settings):
-        self.settings = settings
+        # 每次后台会话开始读取一次设置；运行中任务不会被设置页的后续修改打断。
+        self.settings = load_runtime_settings(settings)
 
     async def resolve(
         self, session_id: str, content: str, has_attachment: bool,

@@ -1,6 +1,7 @@
 alembic>=1.13,<2
 arq>=0.26,<1
 beautifulsoup4>=4.12,<5
+cryptography>=43,<46
 deepagents>=0.5,<1
 fastapi>=0.115,<1
 feedparser>=6.0,<7

@@ -101,6 +101,36 @@ def test_style_guide_and_notes_both_land_in_the_prompt_block(tmp_path, monkeypat
     assert block.index("不要用问句开头。") < block.index("- 语气克制")  # 文件优先
 
 
+def test_generation_preference_block_keeps_style_guide_without_repository(tmp_path, monkeypatch) -> None:
+    """生成器被单独调用时，至少必须保留仓库文件中的长期风格。"""
+    from app.services.publication_preferences import save_style_guide
+
+    monkeypatch.setenv("NEWS_AGENT_PREFERENCES_DIR", str(tmp_path))
+    save_style_guide("## 长期风格\n开头直接交代主体。")
+
+    generator = object.__new__(generator_module.OpenAICompatibleDraftGenerator)
+    generator.repository = None
+    generator.model = "test-model"
+
+    assert "开头直接交代主体。" in generator._preference_rules()
+
+
+def test_pipeline_injects_repository_for_generation_preferences() -> None:
+    """正常生成流程必须把同一数据库仓储交给生成器，以读取 style_notes。"""
+    from app.workflows.content_workflow import ContentPipeline
+
+    class _Generator:
+        repository = None
+
+        def generate(self, _item):
+            raise AssertionError("此用例不执行生成节点")
+
+    generator = _Generator()
+    pipeline = ContentPipeline(object(), generator)
+
+    assert generator.repository is pipeline.repository
+
+
 def test_style_guide_tools_read_and_write_the_repo_file(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("NEWS_AGENT_PREFERENCES_DIR", str(tmp_path))
     tools = {tool.name: tool for tool in tools_module.build_publication_preference_tools("session-1")}

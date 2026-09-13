@@ -40,18 +40,6 @@ _SOURCE_WRITING_SKILLS = {
 
 
 class DraftGenerator(Protocol):
-    def _preference_rules(self) -> str:
-        """运营者的长期偏好（app_settings）→ 提示词规则块；没有仓储时为空。"""
-        repository = getattr(self, "repository", None)
-        if repository is None:
-            return ""
-        try:
-            from app.services.publication_preferences import preference_rules_block
-
-            return preference_rules_block(repository)
-        except Exception:  # 偏好读不到不能影响成稿
-            return ""
-
     def generate(self, item: NormalizedItem) -> DraftContent: ...
 
 
@@ -285,6 +273,22 @@ class OpenAICompatibleDraftGenerator:
         self.model = selected_model
         self.settings = settings
         self.writer = RestrictedContentTaskAgent(settings, "content")
+        # 由 ContentPipeline 在持有数据库会话后注入；直接离线调用仍可读取 style.md。
+        self.repository = None
+
+    def _preference_rules(self) -> str:
+        """读取长期写作偏好，不让偏好存储故障阻断正文生成。"""
+        try:
+            from app.services.publication_preferences import preference_rules_block
+
+            return preference_rules_block(self.repository)
+        except Exception as exc:  # 偏好读取失败只降级为无偏好，不伪造规则。
+            logger.warning(
+                "publication_preferences_unavailable model=%s error_type=%s",
+                self.model,
+                type(exc).__name__,
+            )
+            return ""
 
     def generate(self, item: NormalizedItem) -> DraftContent:
         logger.info(
@@ -513,6 +517,8 @@ class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
 
 
 def build_generator(settings: Settings) -> DraftGenerator:
+    from app.services.runtime_settings import load_runtime_settings
+    settings = load_runtime_settings(settings)
     if settings.llm_enabled and api_key_for(settings, "content") and model_for(settings, "content"):
         if settings.enhanced_generation_enabled:
             return ResilientDraftGenerator(EnhancedDraftGenerator(settings))

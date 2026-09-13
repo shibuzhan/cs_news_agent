@@ -1,4 +1,4 @@
-import type { AgentRun, Attachment, AutoReviewRun, ChatMessage, ChatSession, Conversation, Draft, DraftIllustration, DraftRevision, ImageGenerationJob, Notification, NotificationList, PublicationAsset, WechatPublicationJob, WechatRemoteDraft, WechatRemoteList } from "./types";
+import type { AgentRun, Attachment, AutoReviewRun, ChatMessage, ChatSession, Conversation, Draft, DraftIllustration, DraftRevision, ImageGenerationJob, ModelProfile, Notification, NotificationList, PublicationAsset, PublicationPreferences, RuntimeSettingsSnapshot, WechatPublicationJob, WechatRemoteDraft, WechatRemoteList } from "./types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api";
 
@@ -15,6 +15,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getRuntimeSettings: () => request<RuntimeSettingsSnapshot>("/settings"),
+  createModelProfile: (payload: { model_name: string; base_url: string; api_key: string }) => request<ModelProfile>("/settings/model-profiles", { method: "POST", body: JSON.stringify(payload) }),
+  updateModelProfile: (id: string, payload: { model_name: string; base_url: string; api_key?: string }) => request<ModelProfile>(`/settings/model-profiles/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  deleteModelProfile: (id: string) => request<{ deleted_id: string }>(`/settings/model-profiles/${id}`, { method: "DELETE" }),
+  testModelProfile: (id: string) => request<{ status: string; message: string }>(`/settings/model-profiles/${id}/test`, { method: "POST" }),
+  assignModelTask: (task: string, profileId: string | null) => request<{ task: string; profile_id: string | null }>(`/settings/model-tasks/${task}`, { method: "POST", body: JSON.stringify({ profile_id: profileId }) }),
+  updateRuntimeSettings: (values: Record<string, unknown>) => request<RuntimeSettingsSnapshot>("/settings/runtime", { method: "PATCH", body: JSON.stringify({ values }) }),
+  deleteProjectIntroduction: (id: string) => request<{ deleted_id: string }>(`/settings/projects/${id}`, { method: "DELETE" }),
   createChatSession: (title = "新对话") =>
     request<ChatSession>("/chat/sessions", { method: "POST", body: JSON.stringify({ title }) }),
   listChatSessions: () => request<ChatSession[]>("/chat/sessions"),
@@ -94,6 +102,7 @@ export const api = {
   },
   deleteWechatPublicationAsset: (id: string) => request<{ deleted_id: string }>(`/wechat/assets/${id}`, { method: "DELETE" }),
   listWechatPublications: () => request<WechatPublicationJob[]>("/wechat/publications"),
+  getPublicationPreferences: () => request<PublicationPreferences>("/wechat/publication-preferences"),
   listRemoteWechatDrafts: () => request<WechatRemoteList<WechatRemoteDraft>>("/wechat/remote-drafts"),
   prepareWechatPublication: (id: string) =>
     request<WechatPublicationJob>(`/wechat/publications/${id}/prepare`, { method: "POST" }),

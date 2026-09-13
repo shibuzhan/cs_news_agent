@@ -496,6 +496,37 @@ class AppSettingRow(Base):
     )
 
 
+class ModelProfileRow(Base):
+    """设置页维护的 OpenAI 兼容模型档案；密钥字段始终为加密密文。"""
+
+    __tablename__ = "model_profiles"
+    __table_args__ = (UniqueConstraint("name", name="uq_model_profile_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(100))
+    model_name: Mapped[str] = mapped_column(String(200))
+    base_url: Mapped[str] = mapped_column(String(2048))
+    encrypted_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class RuntimeSettingAuditRow(Base):
+    """仅记录配置变动元数据；密钥等机密一律记录为已更新。"""
+
+    __tablename__ = "runtime_setting_audits"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scope: Mapped[str] = mapped_column(String(80), index=True)
+    setting_key: Mapped[str] = mapped_column(String(160), index=True)
+    old_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    new_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by: Mapped[str] = mapped_column(String(60), default="运营人员")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class NotificationRow(Base):
     """面向运营页面的失败通知；不替代底层任务和发布审计。"""
 
