@@ -480,6 +480,22 @@ class ChatAgentEventRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AppSettingRow(Base):
+    """长期运行偏好（键值）：让 Agent 的“长期修改”落到数据库而不是每次重建都丢。
+
+    首个使用者是文章排版偏好：封面是否同时作为正文首图、固定结尾图、是否保留文字尾注。
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_by: Mapped[str] = mapped_column(String(60), default="agent")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class NotificationRow(Base):
     """面向运营页面的失败通知；不替代底层任务和发布审计。"""
 

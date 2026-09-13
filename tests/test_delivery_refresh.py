@@ -77,7 +77,12 @@ def _patch_wechat(monkeypatch, *, update_fails: bool = False, create_fails: bool
             return "new-media-id"
 
     monkeypatch.setattr(auto_delivery, "WechatOfficialAccountTool", _Client)
-    monkeypatch.setattr(auto_delivery, "render_wechat_html", lambda body, urls: "<p>渲染</p>")
+    monkeypatch.setattr(
+        auto_delivery,
+        "render_wechat_html",
+        # 允许新增的 footer_image_url / include_text_footer 关键字（固定结尾图与文字尾注开关）。
+        lambda body, urls, **kwargs: "<p>渲染</p>",
+    )
     monkeypatch.setattr(auto_delivery, "normalize_wechat_description", lambda value: "摘要")
     return calls
 

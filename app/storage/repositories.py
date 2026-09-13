@@ -26,6 +26,7 @@ from app.domain.models import (
     ReviewStatus,
 )
 from app.storage.tables import (
+    AppSettingRow,
     AgentRunRow,
     AttachmentProcessingRow,
     AutoReviewRunRow,
@@ -971,6 +972,26 @@ class ContentRepository:
             row.is_read = False
             row.read_at = None
             row.dismissed_at = None
+        self.session.flush()
+        return row
+
+    def list_app_settings(self) -> dict[str, str]:
+        """读取全部长期偏好（键值）。"""
+        return {row.key: row.value for row in self.session.scalars(select(AppSettingRow))}
+
+    def get_app_setting(self, key: str, default: str | None = None) -> str | None:
+        row = self.session.get(AppSettingRow, key)
+        return row.value if row is not None else default
+
+    def set_app_setting(self, key: str, value: str, *, updated_by: str = "agent") -> AppSettingRow:
+        """写入/覆盖一条长期偏好（Agent 的“长期修改”落库，重建容器也不会丢）。"""
+        row = self.session.get(AppSettingRow, key)
+        if row is None:
+            row = AppSettingRow(key=key, value=value, updated_by=updated_by)
+            self.session.add(row)
+        else:
+            row.value = value
+            row.updated_by = updated_by
         self.session.flush()
         return row
 

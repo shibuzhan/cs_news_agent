@@ -29,14 +29,24 @@ class WechatRemoteDraft:
     updated_at: str
 
 
-def render_wechat_html(body: str, inline_image_urls: list[str | dict[str, Any]]) -> str:
+def render_wechat_html(
+    body: str,
+    inline_image_urls: list[str | dict[str, Any]],
+    *,
+    footer_image_url: str | None = None,
+    include_text_footer: bool = True,
+) -> str:
     """将纯文本受审核文案转为最小安全 HTML；不解析 Markdown。
 
     插图只出现在正文开头或段落之间：位置被夹在 0 到“最后一段之前”，
-    因此文末（最后一个正文段之后、含来源尾注之前）永远不会追加图片。
-    位置 0 表示正文开头，缺失或非法位置按 0 处理。
+    因此文末（最后一个正文段之后）只有**固定结尾图**。位置 0 表示正文开头。
+
+    `footer_image_url` 给定时：文末追加该图，并按 `include_text_footer` 决定是否保留
+    “原文标题／原文链接”这类文字尾注（用户要求“以固定结尾图取代原来的文字”）。
     """
     lines = [line.strip() for line in normalize_plain_text(body).splitlines() if line.strip()]
+    if footer_image_url and not include_text_footer:
+        lines = [line for line in lines if not is_source_footer_line(line)]
     content_paragraphs = sum(1 for line in lines if not is_source_footer_line(line))
     max_position = max(content_paragraphs - 1, 0)
     positioned: dict[int, list[str]] = {}
@@ -67,6 +77,9 @@ def render_wechat_html(body: str, inline_image_urls: list[str | dict[str, Any]])
         paragraph_index += 1
         for url in positioned.get(paragraph_index, []):
             blocks.append(f'<p><img src="{html.escape(url, quote=True)}" /></p>')
+    footer_url = _wechat_inline_image_url(footer_image_url)
+    if footer_url:
+        blocks.append(f'<p><img src="{html.escape(footer_url, quote=True)}" /></p>')
     return "".join(blocks)
 
 

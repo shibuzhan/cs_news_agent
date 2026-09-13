@@ -11,6 +11,7 @@ from app.config import Settings
 from app.domain.models import ReviewCommand
 from app.services.attachments import AttachmentError, PrivateAttachmentStore
 from app.services.plain_text import extract_name_queries, normalize_wechat_description
+from app.services.publication_preferences import load_publication_preferences
 from app.services.source_snapshots import DraftSourceSnapshotStore
 from app.services.wechat_official import WechatOfficialAccountError, render_wechat_html
 from app.storage.repositories import ContentRepository
@@ -206,6 +207,53 @@ async def prepare_agent_selected_wechat_assets(
     )
 
 
+async def ensure_cover_inline_url(settings: Settings, repository: ContentRepository, draft_id: str, job) -> str | None:
+    """把封面图也上传为**正文图片**并缓存 URL（供“封面作为正文首图”使用）。
+
+    正文只能引用 uploadimg 返回的微信地址；封面的永久素材 media_id 不能直接用在正文里。
+    结果缓存在偏好表里按素材 id 复用，避免每次投递重复上传。
+    """
+    asset_id = getattr(job, "cover_asset_id", None)
+    if not asset_id:
+        return None
+    cache_key = f"publication.cover_inline_url.{asset_id}"
+    cached = repository.get_app_setting(cache_key)
+    if cached:
+        return cached
+    asset = repository.get_publication_asset(asset_id)
+    try:
+        content = PrivateAttachmentStore(settings).read(asset.object_key)
+        async with WechatOfficialAccountTool(settings) as client:
+            url = await client.upload_inline_image(content, asset.original_name)
+    except (AttachmentError, WechatOfficialAccountError, RuntimeError) as exc:
+        logger.warning("cover_inline_upload_failed draft_id=%s error_type=%s", draft_id, type(exc).__name__)
+        return None
+    repository.set_app_setting(cache_key, url, updated_by="delivery")
+    return url
+
+
+async def ensure_footer_image_url(
+    settings: Settings, repository: ContentRepository, preferences
+) -> str | None:
+    """准备固定结尾图的微信正文地址：优先用缓存，必要时上传一次。"""
+    if not preferences.footer_image_configured or not preferences.footer_image_asset_id:
+        return preferences.footer_image_url
+    cached = repository.get_app_setting("publication.footer_inline_url")
+    if cached:
+        return cached
+    asset = repository.get_publication_asset(preferences.footer_image_asset_id)
+    try:
+        content = PrivateAttachmentStore(settings).read(asset.object_key)
+        async with WechatOfficialAccountTool(settings) as client:
+            url = await client.upload_inline_image(content, asset.original_name)
+    except (AttachmentError, WechatOfficialAccountError, RuntimeError) as exc:
+        logger.warning("footer_image_upload_failed error_type=%s", type(exc).__name__)
+        return preferences.footer_image_url
+    repository.set_app_setting("publication.footer_inline_url", url, updated_by="delivery")
+    repository.set_app_setting("publication.footer_image_url", url, updated_by="delivery")
+    return url
+
+
 def release_source_snapshot_after_delivery(settings: Settings, repository: ContentRepository, draft_id: str) -> bool:
     """投递进公众号草稿箱后释放来源快照。
 
@@ -240,7 +288,22 @@ async def retry_agent_selected_wechat_draft(
         raise RuntimeError("投递记录缺少公众号封面素材，无法投递")
     title = (draft.title_options_json or ["未命名草稿"])[0]
     digest = normalize_wechat_description(draft.summary_cn)
-    content_html = render_wechat_html(draft.body, job.inline_image_urls_json or [])
+    preferences = load_publication_preferences(repository)
+    inline_payload = list(job.inline_image_urls_json or [])
+    if preferences.cover_in_body and not any(
+        isinstance(entry, dict) and entry.get("after_paragraph") == 0 for entry in inline_payload
+    ):
+        # 用户要求：封面图同时作为正文上方第一张图（位置 0 = 正文开头）。
+        cover_inline_url = await ensure_cover_inline_url(settings, repository, draft_id, job)
+        if cover_inline_url:
+            inline_payload.insert(0, {"url": cover_inline_url, "after_paragraph": 0})
+    footer_image_url = await ensure_footer_image_url(settings, repository, preferences)
+    content_html = render_wechat_html(
+        draft.body,
+        inline_payload,
+        footer_image_url=footer_image_url,
+        include_text_footer=preferences.footer_text_enabled,
+    )
     if job.wechat_draft_media_id:
         try:
             async with WechatOfficialAccountTool(settings) as client:

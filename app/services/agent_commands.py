@@ -41,6 +41,7 @@ _PREFIXES: tuple[tuple[str, str, str], ...] = (
     ("重写本次生成的文案", "rewrite_draft", "重写文案"),
     ("重新生成文案", "rewrite_draft", "重写文案"),
     ("重写", "rewrite_draft", "重写文案"),
+    ("排版偏好", "show_publication_preferences", "查看长期排版偏好"),
     ("清理素材库", "list_wechat_materials", "盘点素材库可清理项"),
     ("素材库盘点", "list_wechat_materials", "盘点素材库可清理项"),
     ("重新选择配图", "reselect_publication_assets", "重新选择投递配图"),
