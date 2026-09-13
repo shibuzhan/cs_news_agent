@@ -18,6 +18,7 @@ from langchain_core.tools import tool
 from app.config import get_settings
 from app.domain.models import ReviewStatus
 from app.services.attachments import AttachmentError, PrivateAttachmentStore
+from app.services.source_media import SourceImageError
 from app.services.publication_preferences import (
     add_style_note,
     load_publication_preferences,
@@ -45,14 +46,17 @@ def _describe(preferences, repository) -> dict[str, Any]:
 
 def _impl_show_publication_preferences() -> dict[str, Any]:
     with SessionLocal() as session:
-        preferences = load_publication_preferences(ContentRepository(session))
+        repository = ContentRepository(session)
+        preferences = load_publication_preferences(repository)
+        described = _describe(preferences, repository)
     return {
         "status": "done",
-        "preferences": _describe(preferences, repository),
+        "preferences": described,
         "message": (
             f"当前长期排版偏好：封面{'也作为' if preferences.cover_in_body else '不作为'}正文首图；"
             f"固定结尾图{'已设置' if preferences.footer_image_url else '未设置'}；"
             f"文字尾注{'保留' if preferences.footer_text_enabled else '已由结尾图取代'}。"
+            + (f"另有 {len(described['style_notes'])} 条长期写作偏好。" if described["style_notes"] else "")
         ),
     }
 
@@ -81,8 +85,6 @@ def _impl_set_publication_preferences(
 
 def _resolve_footer_asset(session, repository: ContentRepository, asset_id: str, url: str) -> tuple[str, str]:
     """确定结尾图素材：优先用给定素材 id，其次把给定图片链接下载入库。"""
-    from app.services.source_media import SourceImage, SourceImageError, download_image
-
     settings = get_settings()
     if asset_id:
         asset = repository.get_publication_asset(asset_id)
@@ -91,8 +93,16 @@ def _resolve_footer_asset(session, repository: ContentRepository, asset_id: str,
         raise ValueError("请提供素材 id 或图片链接")
     import asyncio
 
-    image = SourceImage(url=url, alt="", origin="footer")
-    downloaded = asyncio.run(download_image(image, settings))
+    import httpx
+
+    from app.agent_tools.source_media_tools import _download_image  # 复用同一套下载+魔数校验
+    from app.services.source_media import SourceImage
+
+    async def _fetch():
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=25), follow_redirects=True) as client:
+            return await _download_image(client, SourceImage(url=url, alt="", origin="footer"))
+
+    downloaded = asyncio.run(_fetch())
     store = PrivateAttachmentStore(settings)
     object_key, content_hash = store.upload(downloaded.filename, downloaded.content, downloaded.content_type)
     asset = repository.create_publication_asset(
@@ -111,7 +121,7 @@ def _impl_set_article_footer_image(asset_id: str = "", url: str = "") -> dict[st
         repository = ContentRepository(session)
         try:
             resolved_id, name = _resolve_footer_asset(session, repository, asset_id.strip(), url.strip())
-        except (ValueError, SourceImageError, AttachmentError) as exc:
+        except (ValueError, AttachmentError, SourceImageError) as exc:
             return {"status": "rejected", "reason": f"结尾图不可用：{exc}"}
         asset = repository.get_publication_asset(resolved_id)
         try:

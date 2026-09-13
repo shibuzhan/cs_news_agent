@@ -3190,3 +3190,19 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-13｜变更 309
+
+- 用户指令：“Docker Desktop 已启动”（恢复部署并完成变更 307／308 的落地与验证）。
+- 影响范围：`app/agent_tools/publication_preferences.py`（修复 `_describe` 作用域、结尾图下载改用既有 `_download_image`、`SourceImageError` 导入）；迁移 0026 已执行；重建 app/worker。**付费调用：无**（微信接口与图片处理均免费；未调用任何模型）。
+- 执行结果①（部署）：容器全部 running；`alembic current` = **0026_app_settings**；`app_settings` 表就绪；配置复核：视觉选图 true、留言 true、GitHub 令牌已生效。
+- 执行结果②（固定结尾图）：把用户提供的“原项目地址／请点击阅读原文”图（1,129,724 bytes，PNG 魔数校验通过）导入私有素材库（素材 `af3a1056…`），再**用 Agent 工具** `set_article_footer_image(asset_id=…)` 完成：上传公众号 → 写入长期偏好。偏好现为 `cover_in_body=true`、`footer_image`（mmbiz URL）、`footer_text_enabled=false`。
+- 执行结果③（端到端验证，读回远端草稿 HTML）：正文图片 5 张——**首图=封面**、其后 3 张正文插图、**文末=固定结尾图**；“原文标题／原文链接”文字尾注**已消失**；正文 7 段；`need_open_comment=1`、`only_fans_can_comment=0`。
+- 过程中发现的真实情况：更新远端草稿时报 `provider_code=40007`（media_id 不存在，用户此前已在草稿箱删除该篇）→ 系统按既有设计**退化为新建草稿**，未让流程卡死；复核远端草稿箱现仅 1 篇（新建的 ECC 草稿），本地记录的 media_id 与之—致。
+- 修复的自伤：`_impl_show_publication_preferences` 中 `_describe(preferences, repository)` 的 `repository` 未定义（批量替换所致）→ 已把描述构造移入会话块；结尾图 URL 分支引用了不存在的 `download_image` → 改为复用 `source_media_tools._download_image`。
+- 验证：后端 **314 项通过、0 失败**。
+- 授权状态：已确认并完成
+
+-->
