@@ -1,18 +1,23 @@
-"""长期排版偏好：Agent 可以持久修改，之后每篇文章都按它排版。
+"""长期偏好：Agent 可以持久修改，之后每篇文章都按它排版。
 
-三项偏好：
-- `cover_in_body`：封面图同时作为**正文首图**（默认开，用户要求）；
-- `footer_image_url` / `footer_image_asset_id`：**固定结尾图**；
-- `footer_text_enabled`：是否保留原来的**文字尾注**（设置了结尾图后默认关闭，即“以图取代文字”）。
+分两类存放（各取所长）：
+- **结构化开关与指针**（`cover_in_body`、结尾图素材 id、微信 URL）→ `app_settings` 表：
+  这些要由**代码确定性执行**，不能靠模型理解散文；
+- **长文风格说明** → **仓库文件** `preferences/style.md`（挂载进容器）：
+  表达力强、Git 可直接评审，读取由应用代码完成（与读 `agent_skills/*/SKILL.md` 同一机制），
+  因此不需要给对话 Agent 文件系统权限。
 
-值放在 `app_settings` 表里，因此容器重建也不会丢。
+读取顺序：`preferences/style.md` → 数据库短条目 `style_notes`（两者都为空则不注入）。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from app.storage.repositories import ContentRepository
 
@@ -26,9 +31,45 @@ KEY_FOOTER_TEXT_ENABLED = "publication.footer_text_enabled"
 # 这样新增偏好不需要改代码，除非它需要流程里不存在的新能力（那种情况会明确告诉用户）。
 KEY_STYLE_NOTES = "publication.style_notes"
 
+STYLE_GUIDE_FILENAME = "style.md"
+PREFERENCES_DIR_ENV = "NEWS_AGENT_PREFERENCES_DIR"
+_TEMPLATE_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
 _TRUE = {"1", "true", "yes", "on", "是", "开"}
 MAX_STYLE_NOTES = 20
 MAX_STYLE_NOTE_CHARS = 300
+
+
+def preferences_dir() -> Path:
+    """偏好目录：容器内为挂载点 /app/preferences，宿主机为仓库 preferences/。"""
+    override = os.environ.get(PREFERENCES_DIR_ENV)
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[2] / "preferences"
+
+
+def style_guide_path() -> Path:
+    return preferences_dir() / STYLE_GUIDE_FILENAME
+
+
+def load_style_guide() -> str:
+    """读取长文风格说明；文件缺失、为空或只剩模板注释时返回空串（走回退）。"""
+    try:
+        raw = style_guide_path().read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return _TEMPLATE_COMMENT.sub("", raw).strip()
+
+
+def save_style_guide(markdown: str) -> int:
+    """写入长文风格说明（原子替换），返回写入的字节数。"""
+    path = style_guide_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = markdown if markdown.endswith("\n") else f"{markdown}\n"
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+    return len(payload.encode("utf-8"))
 
 
 def load_style_notes(repository: ContentRepository) -> tuple[str, ...]:
@@ -66,15 +107,24 @@ def remove_style_note(repository: ContentRepository, note: str) -> tuple[str, ..
 
 
 def preference_rules_block(repository: ContentRepository) -> str:
-    """把长期偏好渲染成可直接拼进提示词的规则块；没有偏好时返回空串。
+    """把长期偏好渲染成可直接拼进提示词的规则块；都没有时返回空串。
 
-    生成、改稿、审核三处共用，因此“以后有别的偏好”不必再改代码——只要它是文字层面的要求。
+    来源两处，顺序即优先级：
+    1. **仓库文件** `preferences/style.md`（长文风格说明，Git 可评审，Agent 可用工具改）；
+    2. 数据库短条目 `style_notes`（快速记录）。
+
+    生成、改稿、审核三处共用，因此新增偏好不必改代码——只要它是文字层面的要求。
     """
+    guide = load_style_guide()
     notes = load_style_notes(repository)
-    if not notes:
+    if not guide and not notes:
         return ""
-    lines = "\n".join(f"- {note}" for note in notes)
-    return f"\n运营者的长期偏好（必须遵守，与以下规则冲突时以本节为准）：\n{lines}\n"
+    sections: list[str] = ["\n运营者的长期偏好（必须遵守，与以下规则冲突时以本节为准）："]
+    if guide:
+        sections.append(guide)
+    if notes:
+        sections.append("\n".join(f"- {note}" for note in notes))
+    return "\n".join(sections) + "\n"
 
 
 @dataclass(frozen=True)

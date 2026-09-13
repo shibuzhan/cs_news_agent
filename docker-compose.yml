@@ -147,6 +147,8 @@ services:
       - ./.local-certs:/opt/news-agent-local-ca:ro
       - ./runtime_logs:/app/runtime_logs
       - agent_workspace_data:/app/agent_workspace
+      # 长期写作偏好：仓库文件挂载进容器，Agent 改完会落回宿主机（Git 可见 diff）。
+      - ./preferences:/app/preferences
     restart: unless-stopped
 
   frontend:
@@ -261,6 +263,8 @@ services:
       - ./.local-certs:/opt/news-agent-local-ca:ro
       - ./runtime_logs:/app/runtime_logs
       - agent_workspace_data:/app/agent_workspace
+      # 长期写作偏好：仓库文件挂载进容器，Agent 改完会落回宿主机（Git 可见 diff）。
+      - ./preferences:/app/preferences
     restart: unless-stopped
 
   workspace-init:

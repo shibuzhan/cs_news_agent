@@ -3206,3 +3206,18 @@
 - 授权状态：已确认并完成
 
 -->
+
+<!--
+
+### 2026-09-13｜变更 310
+
+- 用户指令链：问“偏好怎么存储” → 问“比直接存一个 md 当提示词更好吗” → 追问“agent 不能读取本地 md 吗？每次读取一下不就行了吗” → 确认“按修正版做”。
+- 澄清（我此前的表述不准）：①读 `agent_skills/*/SKILL.md` 的**是应用代码**（`generator.py` 用普通文件 I/O 读取后拼进提示词），与对话 Agent 有无文件工具无关；②对话 Agent 的文件系统工具（`read_file`/`write_file`/`ls`/`grep`/`execute` 等）是**被刻意排除**的；③`app` 服务其实**已有挂载**（`./runtime_logs`、`agent_workspace_data`、`./.local-certs`），我先前说“没有挂载”不准确——真正的阻碍是容器内文件不落在宿主机仓库。
+- 影响范围：`docker-compose.yml`（app/worker 增加 `./preferences:/app/preferences`）、新增 `preferences/style.md`（模板，全部内容在 HTML 注释里 → 当前**不生效**）、`app/services/publication_preferences.py`（`preferences_dir()`／`style_guide_path()`／`load_style_guide()`／`save_style_guide()`，规则块改为“仓库 md 优先 + 数据库短条目”）、`app/agent_tools/publication_preferences.py`（新增 `show_style_guide`／`update_style_guide`，工具总数 8）、新增测试 3 项。**未发起付费调用**。
+- 设计结论（修正版，取代上一版“存数据库”）：**长文风格说明存仓库文件**（Git 唯一真相源、可直接评审、Agent 用专用工具写、挂载后重建不丢）；**结构化开关与指针仍存数据库**（代码要确定性执行）；读取仍由应用代码完成，**不需要给 Agent 文件系统权限**。
+- 施工自伤与修复：脚本给 worker 插挂载时产生了重复 `volumes:` 键（`docker compose config` 报 “mapping key volumes already defined”）→ 删除重复块并把挂载并入两个服务各自的 volumes；随后 `docker compose config` 通过，确认 app 与 worker 都挂载到同一目录。
+- 验证：后端 **317 项通过、0 失败**（新增：模板注释被视为空、文件+短条目同时注入且文件优先、两个新工具的读写）；重建后容器内确认 `/app/preferences/style.md` 存在且模板注释不生效（0 字符）。
+- 遗留：本轮未实测“工具写入 → 宿主机 git diff”（下一步立即验证）。
+- 授权状态：已确认并完成
+
+-->

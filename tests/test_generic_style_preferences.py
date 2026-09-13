@@ -69,6 +69,51 @@ def test_rules_block_is_injected_into_generation_review_and_revision() -> None:
     assert "_preference_rules(self.repository)" in inspect.getsource(auto_revision.AutoRevisionTool.invoke)
 
 
+def test_style_guide_file_is_read_and_template_comments_are_ignored(tmp_path, monkeypatch) -> None:
+    """长文风格说明读仓库文件；只有模板注释时视为空（不生效）。"""
+    from app.services.publication_preferences import load_style_guide, save_style_guide, style_guide_path
+
+    monkeypatch.setenv("NEWS_AGENT_PREFERENCES_DIR", str(tmp_path))
+    assert load_style_guide() == ""                      # 文件不存在
+    assert style_guide_path() == tmp_path / "style.md"
+
+    save_style_guide("<!-- 说明：这里只是模板 -->")
+    assert load_style_guide() == ""                      # 只有注释 → 不生效
+
+    save_style_guide("<!-- 模板 -->\n\n## 语气\n直接、克制，不用感叹句。")
+    guide = load_style_guide()
+    assert "直接、克制" in guide and "模板" not in guide
+
+
+def test_style_guide_and_notes_both_land_in_the_prompt_block(tmp_path, monkeypatch) -> None:
+    from app.services.publication_preferences import preference_rules_block, save_style_guide
+
+    monkeypatch.setenv("NEWS_AGENT_PREFERENCES_DIR", str(tmp_path))
+    repository = _Repository()
+    assert preference_rules_block(repository) == ""
+
+    save_style_guide("## 不要出现\n不要用问句开头。")
+    add_style_note(repository, "语气克制")
+    block = preference_rules_block(repository)
+
+    assert "不要用问句开头。" in block      # 仓库文件（长文）
+    assert "- 语气克制" in block            # 数据库短条目
+    assert block.index("不要用问句开头。") < block.index("- 语气克制")  # 文件优先
+
+
+def test_style_guide_tools_read_and_write_the_repo_file(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NEWS_AGENT_PREFERENCES_DIR", str(tmp_path))
+    tools = {tool.name: tool for tool in tools_module.build_publication_preference_tools("session-1")}
+
+    assert {"show_style_guide", "update_style_guide"} <= set(tools)
+    assert tools["update_style_guide"].invoke({"markdown": ""}).get("status") == "rejected"
+
+    result = tools["update_style_guide"].invoke({"markdown": "## 结构\n开头先交代主体。"})
+    assert result["status"] == "done"
+    assert (tmp_path / "style.md").read_text(encoding="utf-8").strip().endswith("开头先交代主体。")
+    assert "开头先交代主体。" in tools["show_style_guide"].invoke({})["style_guide"]
+
+
 def test_generic_preference_tools_exist_with_sync_entrypoints() -> None:
     tools = {tool.name: tool for tool in tools_module.build_publication_preference_tools("session-1")}
 

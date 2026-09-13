@@ -21,10 +21,13 @@ from app.services.attachments import AttachmentError, PrivateAttachmentStore
 from app.services.source_media import SourceImageError
 from app.services.publication_preferences import (
     add_style_note,
+    load_style_guide,
     load_publication_preferences,
     load_style_notes,
     remove_style_note,
     save_publication_preferences,
+    save_style_guide,
+    style_guide_path,
 )
 from app.services.wechat_official import WechatOfficialAccountError
 from app.storage.database import SessionLocal
@@ -191,8 +194,52 @@ def _impl_remove_style_preference(text: str) -> dict[str, Any]:
     return {"status": "done", "style_notes": list(notes), "message": "已移除该条长期偏好。"}
 
 
+def _impl_show_style_guide() -> dict[str, Any]:
+    guide = load_style_guide()
+    return {
+        "status": "done",
+        "path": str(style_guide_path()),
+        "characters": len(guide),
+        "style_guide": guide or "（当前为空或只有模板注释，未生效）",
+        "message": (
+            f"长期写作偏好文件：{style_guide_path()}；当前 {len(guide)} 个字符；"
+            "会被注入生成、改稿、审核三处提示词，空文件不生效。"
+        ),
+    }
+
+
+def _impl_update_style_guide(markdown: str) -> dict[str, Any]:
+    text = str(markdown or "")
+    if not text.strip():
+        return {"status": "rejected", "reason": "请给出要写入的风格说明内容"}
+    try:
+        size = save_style_guide(text)
+    except OSError as exc:
+        return {"status": "failed", "reason": f"写入偏好文件失败：{exc}"}
+    return {
+        "status": "done",
+        "path": str(style_guide_path()),
+        "bytes": size,
+        "characters": len(load_style_guide()),
+        "message": (
+            "已写入长期写作偏好文件（仓库 preferences/style.md，宿主机可见 diff）。"
+            "此后每次生成、改稿、审核都会带上；已有草稿需重新生成或重写才会应用。"
+        ),
+    }
+
+
 def build_publication_preference_tools(session_id: str):  # noqa: ARG001 - 与其它工具构造器一致
     from app.services.async_bridge import run_coroutine_sync  # noqa: F401 - 保持与其它工具一致的同步约定
+
+    @tool("show_style_guide")
+    def show_style_guide() -> dict[str, Any]:
+        """查看长期写作偏好文件（preferences/style.md）的内容。"""
+        return _impl_show_style_guide()
+
+    @tool("update_style_guide")
+    def update_style_guide(markdown: str) -> dict[str, Any]:
+        """覆盖写入长期写作偏好文件（markdown）；会注入生成/改稿/审核，且可在 Git 里评审。"""
+        return _impl_update_style_guide(markdown)
 
     @tool("show_publication_preferences")
     def show_publication_preferences() -> dict[str, Any]:
@@ -230,6 +277,8 @@ def build_publication_preference_tools(session_id: str):  # noqa: ARG001 - 与�
 
     return [
         show_publication_preferences,
+        show_style_guide,
+        update_style_guide,
         add_style_preference,
         remove_style_preference,
         set_publication_preferences,
