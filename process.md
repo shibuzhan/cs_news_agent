@@ -3465,4 +3465,16 @@
 - 未提交 git：`77010ec` 已提交（7 文件，+338/−17）。
 - 授权状态：已确认并完成
 
+### 2026-09-14｜变更 329
+
+- 用户指令：“先帮我把之前插入的那条长期偏好从数据库里删除”→ 已删除；随后截图提问：“目前 agent 是不是缺少 todolist 能力？收到什么消息就立刻去执行”，方案获选：A（投递作为审核的通过后动作）+ D+B（预检查状态 + 修卡片不闭合）；C（真正的 todo 清单）留待单独一轮。
+- 删除操作：`publication.style_notes` 由 `["正文目标字数上限为 2800 字，超出时需精简压缩到上限以内。"]` 改为 `[]`（updated_by=agent）；复查 `load_style_notes()` 返回 0 条、全库 `%2800%` 0 行、`preferences/style.md` 无相关改动、`runtime.draft_body_*_chars` 仍为默认 1600–2200。
+- 影响范围：`app/services/chat_dispatch.py`（多步计划的条件投递、`_step_deliver(after_review=)`、`_step_outcome` 接受 `already_running`/`queued_after_*`）、`app/services/pending_reviews.py`（新增 `merge_pending_review`）、`app/agent_tools/draft_actions.py`（审核在跑时合并诉求、新增 `_not_ready_for_delivery`）；新增 `tests/test_review_then_delivery.py`。
+- 结论（截图复盘，三条叠加原因）：①`_step_outcome` 把 `already_running` 当失败 → 多步计划第 1 步撞上正在跑的审核就整条中断，第 2 步的投递要求被丢弃（那次审核是 `deliver=False`，通过后也不会投递）；②投递单独执行时只回“当前状态不支持这个操作”，看不出“因为审核没过”；③运行没人收尾，卡片停在“处理中”。
+- 处理结论：投递改成审核的**通过后动作**（计划里同时有审核与投递时，第一步就带 `deliver=True`，第二步只看结论：通过则投递、未通过则明确说“未投递 + 为什么”）；已有审核在跑时用 `merge_pending_review()` 把 deliver/revise 并进那次审核的待办标记；新增 `_not_ready_for_delivery()` 按“审核在跑/重写在跑/需要先审核”给出可执行的下一步（对话派发与 Agent 工具共用）；`already_running`/`queued_after_*` 一律视为“有人接管”，运行保持处理中由接管者汇报。
+- 关于 todolist 能力的结论：**确实没有**。现有的只有 `plan_chat_message`（关键词扫出多步，只用作**回执文案**，不落库、无状态、无依赖）与 DeepAgent 的单条 intent 解析（每条消息一个意图，不先看状态、不排队等条件）。因此“收到消息就立刻执行”“两条并列任务前一条失败就整条断”都是必然结果。方案 C（`add_task`/`list_tasks`/`update_task` + 会话级任务表 + 前端渲染）已出方案，用户本轮未选。
+- 验证（单测 + 只读实测）：后端 **461 项通过、0 失败**（新增 6 项）；app/worker 已重建（重建前在跑任务 0）。容器内复刻截图场景（临时会话，入队函数打桩不真跑审核/投递）：第二幕“审核如果通过就投递草稿箱”→ 运行保持 `running`、`keep_running=True`、第 1 步 `already_running` 且消息说明“投递已记下，通过后自动投递”、待办标记写入 `deliver=True`、**新入队任务 0 个**；第三幕直接要求投递 → 明确回答“审核还在处理中；审核通过后才能投递…要不要我在这次审核通过后自动投递？”，不再出现“当前状态（x）不支持”。实测后已删除临时会话/临时审核并清空标记，草稿仍为 `pending_review`。
+- 未提交 git：`99f8ffa` 已提交（4 文件，+366/−14）。
+- 授权状态：已确认并完成
+
 -->
