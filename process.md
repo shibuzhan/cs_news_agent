@@ -2292,6 +2292,31 @@
 - 验证：模式解析断言（回退、按任务覆盖、大小写归一、非法值报错）通过；新增文案/审核 JSON 模式用例确认未传 `response_format`、系统提示互斥、非 JSON 与 Schema 不符均报错；新增会话 JSON 模式用例确认省略结构化工具并解析最终 JSON。完整后端套件 121 项通过、0 失败。未调用真实模型或外部服务。
 - 授权状态：已确认并完成
 
+### 2026-09-14｜变更 324
+
+- 用户指令：使用 `frontend-design` 优化前端页面；先确认“编辑台”方案后实施。
+- 影响范围：`frontend/src/App.tsx`（将公众号草稿准备入口由生成记录迁移至发布情况）、`frontend/src/styles.css`（统一视觉令牌、对话/生成/发布/设置页面布局与响应式规则）、`task_plan.md`、`findings.md`、`progress.md`。
+- 处理结论：保留自动审核、自动审核通过后投递公众号草稿箱、原有接口和所有既有确认弹窗；生成记录不再提供重复的草稿箱操作入口，发布情况成为唯一的投递工作台。对话、生成记录、发布情况和设置页统一为队列/编辑纸面/状态轨迹的视觉结构；API Key 继续固定掩码并与操作列稳定对齐。
+- 验证：`npm --prefix frontend run build` 通过（TypeScript 与 Vite 均成功）；待执行差异检查。
+- 安全边界：未改动后端、数据库、密钥、审核规则或真实公众号发布；未执行容器重建、公众号上传或发表；不处理工作区其他未提交改动。
+- 授权状态：已确认并完成
+
+### 2026-09-14｜变更 325
+
+- 用户指令：验证已确认的编辑台式前端重构。
+- 影响范围：无新增业务代码；验证 `frontend/src/App.tsx`、`frontend/src/styles.css` 及本次记录文件。
+- 处理结论：`git diff --check` 通过；静态复核确认 `WechatDraftPreparation` 在生成记录中已移除，只在发布情况渲染一次。保留 Vite 构建产物以供现有开发流程使用，未重建容器。
+- 授权状态：已确认并完成
+
+### 2026-09-14｜变更 326
+
+- 用户指令：在当前没有运行任务的前提下重建容器，以查看前端优化效果。
+- 影响范围：仅 Docker Compose 服务 `frontend`；不重启 `app`、`worker`、数据库、Redis 或 MinIO。
+- 处理结论：只读检查确认运行中的生成任务、自动审核和投递任务均为 0；随后构建前端镜像并以 `--no-deps` 替换 `frontend` 容器。
+- 验证：前端容器运行，端口为 `127.0.0.1:5173`；页面入口返回 HTTP 200。
+- 安全边界：未执行公众号上传或发表，未修改后端、数据库或用户配置，未处理工作区其他未提交改动。
+- 授权状态：已确认并完成
+
 -->
 
 <!--
@@ -3385,5 +3410,15 @@
 - 验证：后端 **377 项通过、0 失败**；前端 `tsc` 0 错误；app/worker/frontend 已重建。端到端探针（不调用模型）：容器内按真实发布路径推增量，宿主侧读到 `open → delta(kind=draft, 逐条累计) → RESET(清空) → delta → done(status=completed)`，确认分片、换篇清空与收尾都正常。
 - 未提交 git：等待用户指令。
 - 授权状态：已确认并完成
+
+### 2026-09-14｜变更 324
+
+- 用户指令：“继续上轮任务”——把上轮只出了方案的 ②`rewrite_draft` 拆分落地（①`run_auto_review` 只审不改、③`reselect` 只重选不投递已在变更 323 前的提交 `c311162` 完成）。
+- 影响范围：`app/agent_tools/draft_actions.py`（新增 `refresh_draft_source`、`regenerate_draft_body`，`_start_rewrite` 增加 `source_mode`）、`app/services/source_refresh.py`（新增：联网重抓正文的共用实现）、`app/services/source_snapshots.py`（`replace_github_readme`）、`app/storage/repositories.py`（`delete_draft_source_snapshot`、`record_source_refresh`、`_apply_source_update` 保留 `content_origin`）、`app/worker.py`（`process_draft_regeneration_job(source_mode=...)` + `_source_from_snapshot` 抽成函数）、`app/jobs.py`（`enqueue_draft_regeneration_job(source_mode=...)`）、`app/services/agent_commands.py`（新增两条确定性命令，且前缀表优先于配图启发式）；新增 `tests/test_draft_rewrite_split.py`、`tests/test_source_refresh_storage.py`。
+- 结论①（拆分口径）：`refresh_draft_source` 只重新抓来源正文→写回来源记录 + 替换私有快照，**不改正文、不调内容模型**（秒级返回，抓不到就保留旧证据）；`regenerate_draft_body` 走 `source_mode='snapshot'`，**只**用已保存证据重写，worker 不联网重抓；`rewrite_draft` 保留为合并入口（`source_mode='auto'`，缺快照时允许重抓）。三者关系：先刷证据、再决定要不要重写，避免“刷新完又被抓成另一份 README”。
+- 结论②（三处会假装成功的坑）：①`save_draft_source_snapshot` 见到同草稿已有行会直接返回旧行 → 刷新后新快照根本存不上、重写仍读旧 README；改为先 `delete_draft_source_snapshot` 硬删行再存，删对象失败则停手（保留旧证据）。②刷新来源不涨版本 → 运营看到的版本号与“当时用的是哪份来源”对不上；`record_source_refresh` 登记一版正文不变的版本（正文原样入快照，可回退），并把旧投递标记为过期。③`parse_agent_command` 的配图启发式先跑，“重新生成正文”被判成“生成正文插图”（正文重写变成配图任务）；改为前缀表优先。
+- 验证（按用户尺度：单测 + 只读实测，**未跑生成/审核/投递等慢流程**）：后端 **417 项通过、0 失败**（本轮新增 18 项：`test_draft_rewrite_split.py` 9、`test_source_refresh_storage.py` 5、`test_source_snapshots.py` +2、`test_agent_commands.py` +1 并扩展工具清单断言）；前端 `tsc` 0 错误；app/worker 已重建（重建前 `chat_agent_runs/auto_review_runs/image_generation_jobs` 在跑任务数为 0/0/0）；容器内实测工具数 15、`refresh_draft_source`/`regenerate_draft_body` 均已挂载，命令解析 `刷新来源→refresh_draft_source`、`重新生成正文→regenerate_draft_body`、`生成正文第 3 段插图→generate_draft_illustration`、`重写文案→rewrite_draft`；对不存在的草稿调用两个新工具返回 `rejected: 找不到这篇草稿`，随后复查样本草稿 `b3857275` 的 `(版本, 状态, 正文字数, 来源字数)` 前后一致，确认拒绝路径不改数据。
+- 未提交 git：`c908a45` 已提交（12 文件，+734/−42）；前端 `App.tsx`/`api.ts`/`styles.css` 的既有未提交改动属于另一并行会话，本轮未纳入。
+- 授权状态：已确认并完成（用户要求“继续上轮任务”，方案已在上轮给出）
 
 -->
