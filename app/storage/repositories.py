@@ -881,6 +881,9 @@ class ContentRepository:
         row.tool_results_json = tool_results or []
         row.error_message = error_message
         row.finished_at = utcnow()
+        # 运行结束就放开草稿登记：否则“这篇正在被重写”的去重判断会挡住之后所有重写。
+        row.target_draft_id = None
+        row.rewrite_job_id = None
         self.session.flush()
         return row
 
@@ -889,6 +892,62 @@ class ContentRepository:
         if row is None:
             raise RepositoryError(f"对话 Agent 运行记录不存在：{run_id}")
         return row
+
+    def claim_run_target_draft(self, run_id: str, draft_id: str) -> bool:
+        """把“本次长任务正在写这篇草稿”登记到运行上；该运行已指向别的草稿时返回 False。
+
+        一条运行只服务一篇草稿：模型在同一条消息里既调工具又触发兜底时，两次都会走到这里，
+        第二次必须看到第一次的登记（而不是覆盖它），去重判断才成立。
+        """
+        row = self.get_chat_agent_run(run_id)
+        if row.target_draft_id and row.target_draft_id != draft_id:
+            return False
+        row.target_draft_id = draft_id
+        self.session.flush()
+        return True
+
+    def release_run_target_draft(self, run_id: str) -> None:
+        """运行结束就释放登记，否则同一篇草稿之后再也发不起新的重写。"""
+        row = self.session.get(ChatAgentRunRow, run_id)
+        if row is not None and row.target_draft_id:
+            row.target_draft_id = None
+            self.session.flush()
+
+    def find_active_regeneration_run(
+        self, draft_id: str, *, within_seconds: int, exclude_run_id: str = "",
+    ) -> ChatAgentRunRow | None:
+        """正在改写这篇草稿的**其它**运行（用于入队前去重与任务串行化）。
+
+        按草稿判断、**不按会话过滤**：同一篇草稿可能被不同会话（甚至不同入口）触发改写，
+        而版本号是草稿级的共享资源——漏判一次就是两个写者抢同一个版本号
+        （实测：worker 侧按会话过滤时，跨会话的第二个任务照跑）。
+
+        运行在 `attempt_started_at` 早于后台任务时限时视为孤儿（服务重启会留下永远 running
+        的记录），否则这篇草稿会被彻底锁死。
+        """
+        now = utcnow()
+        for row in self.session.scalars(
+            select(ChatAgentRunRow).where(ChatAgentRunRow.target_draft_id == draft_id)
+        ):
+            if exclude_run_id and row.id == exclude_run_id:
+                continue
+            if row.status != ConversationRunStatus.RUNNING.value:
+                continue
+            started_at = row.attempt_started_at or row.created_at
+            if started_at is not None and (now - started_at).total_seconds() > max(within_seconds, 60):
+                logger.warning(
+                    "regeneration_run_expired run_id=%s draft_id=%s", row.id, draft_id,
+                )
+                continue
+            return row
+        return None
+
+    def mark_rewrite_job_enqueued(self, run_id: str, draft_id: str, job_id: str) -> None:
+        """记下“本次运行已经为这篇草稿入队过重写任务”，同一条消息的第二次请求据此去重。"""
+        row = self.get_chat_agent_run(run_id)
+        row.target_draft_id = draft_id
+        row.rewrite_job_id = job_id
+        self.session.flush()
 
     def list_chat_agent_runs(self, session_id: str) -> list[ChatAgentRunRow]:
         self.get_chat_session(session_id)
@@ -1894,6 +1953,23 @@ class ContentRepository:
         self.session.flush()
         return row
 
+    def _merge_regenerated_evidence(self, previous: list | None, evidence: list[dict] | None) -> list:
+        """重写时用新证据包替换来源条目，但**保留**联网补充等附加证据。
+
+        真实问题：改稿会 `append_draft_evidence(origin="revision_search")` 往草稿里追加联网资料，
+        而重写原本整体替换 `evidence_json` → 用户花了外部检索拿到的说明在重写后凭空消失
+        （实测：草稿 evidence_count=1、search_entries=0）。这里保留所有 `*search` 来源的条目。
+        """
+        new_entries = list(evidence or [])
+        known = {str(item.get("id")) for item in new_entries if isinstance(item, dict)}
+        kept = [
+            item for item in (previous or [])
+            if isinstance(item, dict)
+            and str(item.get("origin") or "").endswith("search")
+            and str(item.get("id")) not in known
+        ]
+        return [*new_entries, *kept] if new_entries else (kept or list(previous or []))
+
     def regenerate_draft(
         self, draft_id: str, content: DraftContent, evidence: list[dict] | None = None,
     ) -> DraftRow:
@@ -1912,7 +1988,7 @@ class ContentRepository:
         row.body = format_source_body(content.body, row.source_item.title, row.source_item.source_kind)
         row.tags_json = [str(tag).strip("# ") for tag in content.tags if str(tag).strip("# ")][:10]
         row.card_script_json = content.card_script
-        row.evidence_json = evidence or row.evidence_json
+        row.evidence_json = self._merge_regenerated_evidence(row.evidence_json, evidence)
         row.content_plan_json = content.content_plan
         row.quality_report_json = content.quality_report
         row.claim_citations_json = content.claim_citations
@@ -2005,18 +2081,23 @@ class ContentRepository:
             raise DraftNotFound(f"草稿不存在：{draft_id}")
         return row
 
-    def append_draft_evidence(self, draft_id: str, entries: list[dict]) -> int:
+    def append_draft_evidence(
+        self, draft_id: str, entries: list[dict], *, origin: str = "revision_search",
+        prefix: str = "search",
+    ) -> int:
         """把补充资料（例如改稿时的联网检索结果）并入草稿证据。
 
         审核与改稿都从 `evidence_json` 取证据：只写进改稿提示词而不落库，
         审核模型就看不到这些事实，只能把它们判成“来源证据中未出现”。
+
+        `origin` 标记这批证据从哪来（改稿时联网 / 会话里主动联网），前端据此把它们
+        渲染成“联网补充”；id 前缀按来源区分，避免两批联网证据互相占号。
         """
         if not entries:
             return 0
         row = self.get_draft(draft_id)
         existing = list(row.evidence_json or [])
         known = {str(item.get("id")) for item in existing if isinstance(item, dict)}
-        prefix = "search"
         appended = 0
         for entry in entries:
             if not isinstance(entry, dict) or not str(entry.get("content") or "").strip():
@@ -2027,7 +2108,7 @@ class ContentRepository:
                 index += 1
                 candidate = f"{prefix}-{index}"
             known.add(candidate)
-            existing.append({**entry, "id": candidate, "origin": "revision_search"})
+            existing.append({**entry, "id": candidate, "origin": origin})
             appended += 1
         if appended:
             row.evidence_json = existing

@@ -168,6 +168,9 @@ async def test_auto_review_rewrites_once_then_keeps_failed_final_result(monkeypa
         def finish_auto_review_run(self, *_args, **_kwargs) -> None:
             return None
 
+        def find_active_regeneration_run(self, _draft_id, **_kwargs):
+            return None  # 没有并发重写：本用例要验证“审核后改稿一轮”的正常路径
+
         def add_chat_agent_event(self, _run_id, title, *_args, **_kwargs) -> None:
             self.events.append(title)
 

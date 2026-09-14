@@ -130,7 +130,16 @@ export type Draft = {
   card_script: string[];
   source_name: string;
   source_url: string;
-  evidence: Array<{ title: string; url: string; summary: string }>;
+  evidence: Array<{
+    id?: string;
+    title: string;
+    url: string;
+    summary: string;
+    // 联网补充的证据带 origin（agent_search / revision_search）与检索词，界面上要单独标出来。
+    origin?: string;
+    search_query?: string;
+    retrieved_at?: string;
+  }>;
   content_plan: { audience?: string; angle?: string; outline?: string[]; risks?: string[] };
   quality_report: { status?: string; score?: number; risks?: string[]; suggestions?: string[] };
   claim_citations: Array<{ claim: string; evidence_ids: string[] }>;

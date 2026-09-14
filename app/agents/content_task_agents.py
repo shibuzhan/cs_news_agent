@@ -250,7 +250,19 @@ def _chunk_content(message: Any) -> str:
 
 
 class RestrictedContentTaskAgent:
-    """每次调用临时创建一个任务子 Agent，不共享会话 checkpoint 或记忆。"""
+    """内容侧的**受限执行器**：一次调用临时建一个任务 Agent，不共享会话 checkpoint 或记忆。
+
+    它不是“会自己安排事情”的 Agent，而是被工作流派发的两个**角色**（同一个执行器 + 两套
+    系统提示词/模型）：
+
+    | 角色 | task | 模型档 | 输入 → 输出 | 明确不能做 |
+    |---|---|---|---|---|
+    | `DraftWriterRole`（日志里叫 news_draft_writer） | `content` | DB 里的 content 档 | 已整理的证据/大纲 → `DraftWritingResponse` | 不查库、不联网、不落库 |
+    | `DraftReviewerRole`（日志里叫 news_draft_reviewer） | `review` | DB 里的 review 档 | 草稿快照 + 证据 → `ReviewResponse`（分数/意见/检索词） | 不改正文、不投递 |
+
+    决策与编排在**会话 Agent**（`ContentDeepAgent`）和确定性工作流手里；这里只做
+    “无副作用 + 结构化输出 + 模型分离”这一件事。界面与汇报按 `role_label` 称呼它们。
+    """
 
     def __init__(
         self,
@@ -264,6 +276,11 @@ class RestrictedContentTaskAgent:
         self.selected_api_key = api_key_for(settings, task)
         if not (settings.llm_enabled and self.selected_api_key and self.selected_model):
             raise ContentTaskAgentError(f"{task} 子 Agent 的模型未启用或配置不完整")
+
+    @property
+    def role_label(self) -> str:
+        """给界面/汇报用的角色名：一眼看出这一步是“写”还是“审”。"""
+        return "正文写作" if self.task == "content" else "审核"
 
     def write(self, prompt: str) -> DraftWritingResponse:
         if self.task != "content":
@@ -376,3 +393,20 @@ class RestrictedContentTaskAgent:
             mode,
         )
         return validated
+
+
+# 角色别名：产品语义上的“两个子 Agent”是这两个角色（同一个受限执行器 + 两套提示词/模型）。
+# 实现名保留 `RestrictedContentTaskAgent`；调用方按角色读代码更容易看懂“这一步是谁在做”。
+DraftWriterRole = RestrictedContentTaskAgent
+DraftReviewerRole = RestrictedContentTaskAgent
+
+__all__ = [
+    "ContentTaskAgentError",
+    "DraftWritingResponse",
+    "ReviewIssue",
+    "ReviewResponse",
+    "RestrictedContentTaskAgent",
+    "DraftWriterRole",
+    "DraftReviewerRole",
+]
+

@@ -51,6 +51,11 @@ _PREFIXES: tuple[tuple[str, str, str], ...] = (
     # 只用已存证据重写：不联网重抓，避免换出一份不同的正文。
     ("重新生成正文", "regenerate_draft_body", "重新生成正文"),
     ("按已保存证据重写", "regenerate_draft_body", "重新生成正文"),
+    # 只读：先看队列再决定要不要新建任务（长任务期间最容易做错的就是“又起一个”）。
+    ("查任务队列", "list_active_tasks", "查看在跑的任务"),
+    ("任务队列", "list_active_tasks", "查看在跑的任务"),
+    ("队列状态", "list_active_tasks", "查看在跑的任务"),
+    ("现在在跑什么", "list_active_tasks", "查看在跑的任务"),
     ("排版偏好", "show_publication_preferences", "查看长期排版偏好"),
     ("清理素材库", "list_wechat_materials", "盘点素材库可清理项"),
     ("素材库盘点", "list_wechat_materials", "盘点素材库可清理项"),

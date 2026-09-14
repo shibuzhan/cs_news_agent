@@ -92,6 +92,10 @@ def test_action_tools_are_registered_for_the_session() -> None:
         # 拆分出的两半：只刷新来源（不动正文）／只用已存证据重写正文。
         "refresh_draft_source",
         "regenerate_draft_body",
+        # 长任务串行化要用的只读零件：先看队列，再决定要不要新建任务。
+        "list_active_tasks",
+        # 联网补充证据（真调外部检索服务）。
+        "search_web_evidence",
         # 只读零件：让 Agent 自己先看现状与历史意见，再决定动作。
         "read_current_draft",
         "read_latest_review",

@@ -319,6 +319,9 @@ class _FlowRepository:
     def get_active_draft_source_snapshot(self, _draft_id):
         return None
 
+    def find_active_regeneration_run(self, _draft_id, **_kwargs):
+        return None  # 没有并发的重写：本用例走“审核→改稿”的正常路径
+
 
 class _FakeSnapshotStore:
     def __init__(self, *_args, **_kwargs) -> None:

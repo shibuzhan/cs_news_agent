@@ -49,7 +49,7 @@ def test_pending_review_round_trip() -> None:
     assert pending_review_drafts(repository, ["draft-1", "draft-2"]) == ["draft-1"]
 
     popped = pop_pending_review(repository, "draft-1")
-    assert popped == {"deliver": True, "chat_run_id": "run-1"}
+    assert popped == {"deliver": True, "chat_run_id": "run-1", "revise": True}
     assert pop_pending_review(repository, "draft-1") is None       # 只取一次
     assert pending_review_drafts(repository, ["draft-1"]) == []
 
@@ -105,4 +105,14 @@ def test_pending_review_helper_is_json_serialisable() -> None:
     assert json.loads(repository.values[pending_reviews.pending_key("d")]) == {
         "deliver": False,
         "chat_run_id": "",
+        "revise": True,
     }
+
+
+def test_review_queues_behind_a_running_rewrite_too() -> None:
+    """重写在跑时也必须排队：否则审核的是马上要被替换掉的旧版本，还会与重写抢版本号。"""
+    source = inspect.getsource(__import__("app.agent_tools.draft_actions", fromlist=["x"]))
+
+    assert "find_active_regeneration_run" in source
+    assert "queued_after_rewrite" in source
+    assert "正在重写正文" in source

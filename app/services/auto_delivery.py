@@ -33,23 +33,27 @@ async def _revision_search_evidence(
     draft_id: str,
     chat_agent_run_id: str | None,
     model_report: dict,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """为这次改稿取一次联网补充资料；任何失败都只记日志，不阻断改稿。
 
     检索词优先用审核模型给出的 `search_queries`；没有时用正文里的外部名称做确定性兜底。
+    返回（证据条目, 本次检索事实）：事实要一路带到**汇报文案**里，否则用户看不到
+    “到底搜没搜、搜了什么”（真实反馈：感觉搜索没被使用）。
     """
+    facts: dict = {"searched": False, "queries": [], "entries": 0}
     if not (settings.revision_search_enabled and settings.exa_mcp_enabled):
-        return []
+        return [], facts
     queries = [str(item) for item in (model_report.get("search_queries") or []) if str(item).strip()][:2]
     if not queries:
         queries = extract_name_queries(repository.get_draft(draft_id).body, limit=2)
     if not queries:
-        return []
+        return [], facts
     try:
         evidence = await ExaMcpSearchTool(settings).search(queries)
     except ExaMcpSearchError as exc:
         logger.warning("revision_search_failed draft_id=%s error_type=%s", draft_id, type(exc).__name__)
-        return []
+        return [], {**facts, "queries": queries, "failed": True}
+    facts = {"searched": True, "queries": queries, "entries": len(evidence)}
     if evidence:
         # 让审核也看得到这次补充：否则联网写入的事实会被判成“来源证据中未出现”。
         try:
@@ -66,12 +70,14 @@ async def _revision_search_evidence(
             repository,
             chat_agent_run_id,
             "改稿前已联网补充",
-            f"已按审核意见为 {len(evidence)} 个外部名称取回补充资料，将在改稿时并入正文。",
+            "联网检索「" + "、".join(queries) + f"」带回 {len(evidence)} 条资料，将在改稿时并入正文，"
+            "并作为联网证据留在本文证据里。",
             "revising",
             draft_id=draft_id,
-            search_query_count=len(queries),
+            search_queries=queries,
+            search_entry_count=len(evidence),
         )
-    return evidence
+    return evidence, facts
 
 
 def _model_draft_snapshot(repository: ContentRepository, draft_id: str) -> SimpleNamespace:
@@ -381,7 +387,7 @@ async def apply_revision_from_review(
     if not model_report and not rule_report:
         raise ValueError("没有可用的审核意见")
     issues = revision_issues(rule_report, model_report)
-    search_evidence = await _revision_search_evidence(
+    search_evidence, search_facts = await _revision_search_evidence(
         settings, repository, draft_id, chat_agent_run_id, model_report
     )
     revised = await run_in_threadpool(
@@ -402,8 +408,8 @@ async def apply_revision_from_review(
         revised.article_shape,
     )
     logger.info(
-        "revision_from_review_applied draft_id=%s review_id=%s version=%s issues=%s extra=%s",
-        draft_id, applied_review_id or "-", draft.version, len(issues), len(extra),
+        "revision_from_review_applied draft_id=%s review_id=%s version=%s issues=%s extra=%s searches=%s",
+        draft_id, applied_review_id or "-", draft.version, len(issues), len(extra), search_facts.get("queries"),
     )
     return {
         "draft_id": draft.id,
@@ -412,6 +418,7 @@ async def apply_revision_from_review(
         "issue_count": len(issues),
         "issues": issues,
         "article_shape": revised.article_shape,
+        "searches": [search_facts] if search_facts.get("searched") else [],
     }
 
 
@@ -432,6 +439,8 @@ async def auto_review_and_create_wechat_draft(
     """
     settings = load_runtime_settings(settings)
     revision_count = 0
+    # 联网补充的检索事实要一路带到汇报里：否则“搜索到底有没有被调用”在界面上无从判断。
+    searches: list[dict] = []
     if review_run_id:
         selection_run = repository.mark_auto_review_run_running(review_run_id)
     else:
@@ -446,7 +455,7 @@ async def auto_review_and_create_wechat_draft(
                 repository, chat_agent_run_id, "投递配图未确定", str(exc), "rejected",
                 review_id=selection_run.id,
             )
-            return {"review_id": selection_run.id, "status": "failed", "error": str(exc), "issues": []}
+            return {"review_id": selection_run.id, "status": "failed", "error": str(exc), "issues": [], "searches": []}
         _record_review_event(
             repository,
             chat_agent_run_id,
@@ -493,6 +502,35 @@ async def auto_review_and_create_wechat_draft(
             and review.error_message is None
             and revision_count < MAX_AUTO_REVIEW_REVISIONS
         )
+        # 正文正在被重写（9–12 分钟）：本轮审核意见照常给出，但**不**并发改稿，
+        # 否则两个写者抢同一个草稿版本号，后完成的那次会以唯一约束冲突失败。
+        if can_revise:
+            active_rewrite = repository.find_active_regeneration_run(
+                draft_id,
+                within_seconds=getattr(settings, "collection_job_timeout_seconds", 900),
+                exclude_run_id=chat_agent_run_id or "",
+            )
+            if active_rewrite is not None:
+                repository.finish_auto_review_run(
+                    run.id, "revision_deferred", review.rule_report, review.model_report,
+                    "正文正在重写，本轮不再并发改稿",
+                )
+                _record_review_event(
+                    repository, chat_agent_run_id, "审核完成（改稿已让位给正在进行的重写）",
+                    f"正文正在重写中，本轮只出意见（{len(issues)} 条）；重写完成后可再按这些意见改稿。",
+                    "rejected",
+                    review_id=run.id, revision_count=revision_count, issues=issues,
+                )
+                return {
+                    "review_id": run.id,
+                    "status": "reviewed_while_rewriting",
+                    "passed": review.passed,
+                    "revise_disabled": False,
+                    "error": None,
+                    "issues": issues,
+                    "revision_count": revision_count,
+                    "searches": searches,
+                }
         if review.passed and not can_revise:
             _record_review_event(
                 repository, chat_agent_run_id, "自动审核通过",
@@ -526,6 +564,7 @@ async def auto_review_and_create_wechat_draft(
                 "error": None if not revise else (review.error_message or "自动审核未通过"),
                 "issues": issues,
                 "revision_count": revision_count,
+                "searches": searches,
             }
 
         revision_count += 1
@@ -539,9 +578,11 @@ async def auto_review_and_create_wechat_draft(
         try:
             # 联网补充搭在“本来就会发生”的这次改稿上：审核模型给出待说明的外部名称，
             # 这里只做检索（非模型调用），改稿时顺带把说明补进正文。
-            search_evidence = await _revision_search_evidence(
+            search_evidence, search_facts = await _revision_search_evidence(
                 settings, repository, draft_id, chat_agent_run_id, review.model_report
             )
+            if search_facts.get("searched"):
+                searches.append(search_facts)
             revised = await run_in_threadpool(
                 AutoRevisionTool(settings, repository).invoke,
                 draft_id,
@@ -567,7 +608,7 @@ async def auto_review_and_create_wechat_draft(
                 repository, chat_agent_run_id, "自动改稿失败", str(exc), "rejected",
                 review_id=run.id, revision_count=revision_count,
             )
-            return {"review_id": run.id, "status": "revision_failed", "error": str(exc), "issues": issues, "revision_count": revision_count}
+            return {"review_id": run.id, "status": "revision_failed", "error": str(exc), "issues": issues, "revision_count": revision_count, "searches": searches}
         _record_review_event(
             repository, chat_agent_run_id, f"自动改稿完成（{revision_count}/{MAX_AUTO_REVIEW_REVISIONS}）",
             f"已生成文案版本 {draft.version}，正在重新审核。", "running",
@@ -592,6 +633,7 @@ async def auto_review_and_create_wechat_draft(
             "draft_id": draft.id,
             "revision_count": revision_count,
             "delivered": False,
+            "searches": searches,
         }
     if not settings.auto_wechat_draft_enabled:
         repository.finish_auto_review_run(run.id, "approved_no_delivery", review.rule_report, review.model_report, "自动创建公众号草稿开关未启用")
@@ -601,6 +643,7 @@ async def auto_review_and_create_wechat_draft(
             "draft_id": draft.id,
             "revision_count": revision_count,
             "delivered": False,
+            "searches": searches,
         }
     try:
         job = await retry_agent_selected_wechat_draft(settings, repository, draft_id)
@@ -613,8 +656,9 @@ async def auto_review_and_create_wechat_draft(
             "wechat_job_id": job.id,
             "revision_count": revision_count,
             "delivered": True,
+            "searches": searches,
         }
     except (WechatOfficialAccountError, PublicationAssetSelectionError, RuntimeError) as exc:
         repository.finish_auto_review_run(run.id, "delivery_failed", review.rule_report, review.model_report, str(exc))
         logger.warning("auto_wechat_draft_failed draft_id=%s error_type=%s", draft_id, type(exc).__name__)
-        return {"review_id": run.id, "status": "delivery_failed", "error": str(exc), "revision_count": revision_count}
+        return {"review_id": run.id, "status": "delivery_failed", "error": str(exc), "revision_count": revision_count, "searches": searches}

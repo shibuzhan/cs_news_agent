@@ -397,6 +397,36 @@ async def process_draft_regeneration_job(
     """
     mode = source_mode if source_mode in {"auto", "snapshot"} else "auto"
     logger.info("draft_regeneration_started run_id=%s draft_id=%s source_mode=%s", chat_run_id, draft_id, mode)
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        # 同一篇草稿同时只跑一个重写任务：入队即去重之外，这里再挡一次，
+        # 否则两个任务会并发写同一草稿并撞上草稿版本唯一约束。
+        other = repository.find_active_regeneration_run(
+            draft_id,
+            within_seconds=settings.collection_job_timeout_seconds,
+            exclude_run_id=chat_run_id,
+        )
+        if other is not None:
+            logger.warning(
+                "draft_regeneration_superseded run_id=%s draft_id=%s active_run_id=%s",
+                chat_run_id, draft_id, other.id,
+            )
+            repository.add_chat_agent_event(
+                chat_run_id, "重写任务已合并",
+                "这篇草稿已经有一个重写任务在跑，本次不再重复启动（同一次请求只会跑一个任务）。",
+                metadata={"phase": "text", "state": "superseded", "draft_ids": [draft_id]},
+            )
+            if response_message_id:
+                repository.update_chat_message(
+                    response_message_id,
+                    "这篇草稿已经在重写中；完成后我会在同一张卡片上汇报，不会重复改写。",
+                )
+            repository.finish_chat_agent_run(
+                chat_run_id, response_message_id, ConversationRunStatus.COMPLETED,
+                "已有重写任务在跑，本次未重复执行", [], None,
+            )
+            session.commit()
+            return
     try:
         with SessionLocal() as session:
             repository = ContentRepository(session)
@@ -427,6 +457,7 @@ async def process_draft_regeneration_job(
                 session_id, active_draft_id=draft_id,
                 summary="本会话当前草稿已在原生成记录内重新生成。",
             )
+            repository.release_run_target_draft(chat_run_id)
             source_note = (
                 "只使用已保存的来源正文（未联网重抓）" if mode == "snapshot" else "已按已保存或重新获取的来源正文"
             )
@@ -508,6 +539,22 @@ async def process_draft_regeneration_job(
                     metadata={"phase": "image", "state": "pending" if existing else "reported", "draft_ids": [draft_id], "regeneration": True},
                 )
             session.commit()
+        if not image_task_ids:
+            # 重写完成即触发此前因“正文正在重写”而排队的审核：审的必须是刚写好的这一版，
+            # 而不是重写开始前那一版（真实故障：审核旧版本 + 两个写者抢版本号）。
+            with SessionLocal() as session:
+                repository = ContentRepository(session)
+                from app.services.pending_reviews import launch_pending_reviews
+
+                launched = await launch_pending_reviews(settings, repository, [draft_id])
+                session.commit()
+            if launched:
+                logger.info("regeneration_launched_pending_review draft_id=%s", draft_id)
+        else:
+            logger.info(
+                "regeneration_defers_pending_review draft_id=%s image_tasks=%s",
+                draft_id, len(image_task_ids),
+            )
         for image_task_id in image_task_ids:
             arq_job_id = await enqueue_image_generation_job(settings, image_task_id)
             with SessionLocal() as session:
@@ -670,6 +717,9 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
         if passed is None:
             passed = status.startswith("approved") or status in {"delivered", "draft_created", "wechat_draft_created"}
         revise_disabled = bool(result.get("revise_disabled"))
+        searches = [item for item in (result.get("searches") or []) if isinstance(item, dict)]
+        searched_queries = [query for item in searches for query in (item.get("queries") or [])]
+        search_entries = sum(int(item.get("entries") or 0) for item in searches)
         summary = (
             f"自动审核{'通过' if passed else '未通过'}：版本 {draft.version}；"
             f"共 {len(issues)} 条意见。"
@@ -688,6 +738,16 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
                 "delivery": "已按要求投递" if result.get("delivery") else "未投递",
                 # 只审不改时必须说清“没有改稿”，否则用户会以为文章已经被改过。
                 "revised": not revise_disabled,
+                # 联网检索的事实：用户要能判断搜索到底有没有被调用（真实反馈：感觉搜索没使用）。
+                "web_search": (
+                    {
+                        "queries": searched_queries[:4],
+                        "entries": search_entries,
+                        "note": "改稿前用这些检索词联网补充过资料，并已作为联网证据并入本文证据。",
+                    }
+                    if searched_queries
+                    else "本轮没有联网检索：审核模型没有给出需要解释的外部名称。"
+                ),
                 "next_step": "需要的话我可以按这些意见改稿（apply_revision_issues）或重新审核。"
                 if revise_disabled
                 else None,

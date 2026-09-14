@@ -454,6 +454,10 @@ class ChatAgentRunRow(Base):
     auto_illustration_requested: Mapped[bool] = mapped_column(default=False)
     status: Mapped[str] = mapped_column(String(40), index=True)
     summary: Mapped[str] = mapped_column(Text, default="")
+    # 本次长任务正在写的草稿与已经入队的任务号：入队前用它判断“这篇是不是已经有一个在跑的重写”，
+    # 避免同一条用户消息被模型工具与意图兜底各入队一次、两个任务并发写同一草稿。
+    target_draft_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    rewrite_job_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
     tool_results_json: Mapped[list] = mapped_column(JSONB, default=list)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

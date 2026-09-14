@@ -65,6 +65,15 @@ class FakeRepository:
     def find_generation_run_for_draft(self, _draft_id: str):
         return None  # 老草稿：没有原生成记录
 
+    def claim_run_target_draft(self, _run_id: str, _draft_id: str) -> bool:
+        return True
+
+    def mark_rewrite_job_enqueued(self, _run_id: str, _draft_id: str, _job_id: str) -> None:
+        return None
+
+    def find_active_regeneration_run(self, _draft_id: str, **_kwargs):
+        return None  # 没有并发重写：本轮应当真的入队
+
     def reopen_generation_run(self, *_args, **_kwargs) -> None:
         raise AssertionError("没有原生成记录时不应尝试重开它")
 

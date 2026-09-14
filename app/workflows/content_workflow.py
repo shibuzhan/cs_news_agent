@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -21,6 +23,8 @@ from app.services.source_snapshots import DraftSourceSnapshotStore
 
 # 与 GitHub 采集器保持一致的最小 README 长度。
 MIN_README_CHARS = 200
+
+logger = logging.getLogger("news_agent.content_workflow")
 
 
 def _github_content_ready(raw: RawSourceItem) -> bool:
@@ -146,19 +150,39 @@ class ContentPipeline:
         normalized = NormalizedItem.model_validate(state["normalized_item"])
         saved = self.repository.save_source(normalized)
         generated = DraftContent.model_validate(state["draft"])
-        draft = self.repository.regenerate_draft(
-            draft_id,
-            generated,
-            generated.evidence_pack or [{
-                "id": "source-1",
-                "title": normalized.title,
-                "url": str(normalized.url),
-                "summary": normalized.summary[:1000],
-                "content_origin": normalized.metadata.get("content_origin"),
-            }],
-        )
+        evidence = generated.evidence_pack or [{
+            "id": "source-1",
+            "title": normalized.title,
+            "url": str(normalized.url),
+            "summary": normalized.summary[:1000],
+            "content_origin": normalized.metadata.get("content_origin"),
+        }]
+        draft = self._write_regenerated_draft(draft_id, generated, evidence)
         self._capture_source_snapshot(draft.id, normalized)
         return {"draft_id": draft.id, "version": draft.version, "source_item_id": saved.row.id}
+
+    def _write_regenerated_draft(
+        self, draft_id: str, generated: DraftContent, evidence: list[dict], attempts: int = 2,
+    ) -> Any:
+        """落库重生成正文；版本被并发写入抢先时用下一个版本号再写一次。
+
+        模型调用已经花掉 9–12 分钟，绝不能让一次版本号冲突把结果丢掉：`draft_revisions`
+        有 (draft_id, version) 唯一约束，另一个写者（例如并发的按意见改稿）先提交后，
+        这里必须换号重写，而不是抛 IntegrityError 让整个任务失败。
+        真实故障：用户看到“生成失败”，但草稿其实已经涨过版本，报告与内容对不上。
+        """
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with self.session.begin_nested():
+                    return self.repository.regenerate_draft(draft_id, generated, evidence)
+            except IntegrityError as exc:
+                last_error = exc
+                logger.warning(
+                    "draft_regeneration_version_conflict draft_id=%s attempt=%s",
+                    draft_id, attempt,
+                )
+        raise last_error if last_error is not None else RuntimeError("重生成草稿写入失败")
 
     def save_github_candidates(self, raw_items: list[RawSourceItem]) -> None:
         """保存 Trending 候选和趋势快照所需字段，但不为它们批量生成草稿。"""

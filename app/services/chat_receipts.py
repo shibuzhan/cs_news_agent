@@ -54,6 +54,7 @@ _COMMAND_STEPS: dict[str, tuple[str, ...]] = {
     # 只审不改（review_draft）与“重新选择配图”是界面按钮命令：不在这里登记，
     # 回执就会退化到关键词扫描，措辞与卡片标题都可能对不上点下去的动作。
     "review_draft": (STEP_REVIEW,),
+    "list_active_tasks": (STEP_CHAT,),
     "generate_draft_illustration": (STEP_IMAGE,),
     "publish_to_wechat_draft": (STEP_DELIVER,),
     "reselect_publication_assets": (STEP_DELIVER,),

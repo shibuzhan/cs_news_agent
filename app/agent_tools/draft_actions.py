@@ -149,12 +149,45 @@ async def _start_review(
     existing = repository.find_active_auto_review_run(draft.id)
     if existing is not None:
         return {"status": "already_running", "message": "这篇的自动审核已经在处理中。", "draft_id": draft.id}
-    # 配图还在生成时不立刻审核：否则审核会看到“还没有正文插图”的草稿，
-    # 汇报也会与实际时序矛盾（真实反馈：“感觉这样不是很合理”）。
-    active_images = repository.count_active_image_jobs(draft.id, ACTIVE_IMAGE_STATUSES)
+    # 正文正在被重写时也不立刻审核：否则审核的是**马上要被替换掉的那一版**，
+    # 真实后果（2026-09-14 09:53）：审核 v1 → 改稿写 v2 → 重写写 v3 → 两个写者抢版本号，
+    # 最后一条以唯一冲突失败，用户看到“生成失败”而正文其实已经改了。
+    active_rewrite = repository.find_active_regeneration_run(
+        draft.id,
+        within_seconds=getattr(settings, "collection_job_timeout_seconds", 900),
+        exclude_run_id=chat_run_id or "",
+    )
     chat_run = _task_run(repository, session_id, chat_run_id, ConversationIntent.RUN_AUTO_REVIEW)
+    if active_rewrite is not None:
+        mark_pending_review(repository, draft.id, deliver=deliver, chat_run_id=chat_run.id, revise=revise)
+        _announce(
+            repository, session_id, chat_run,
+            f"《{_draft_label(draft)}》正在重写正文，我等新版本生成后自动开始审核，不用再提醒我。",
+        )
+        repository.add_chat_agent_event(
+            chat_run.id, "审核已排队（等待重写）",
+            "当前正文正在被重写；重写完成后自动按**新版本**开始审核，避免审到即将被替换的旧版本。",
+            "running",
+            metadata={
+                "phase": "review", "state": "queued", "draft_ids": [draft.id],
+                "pending_rewrite_run_id": active_rewrite.id, "revise": revise,
+            },
+        )
+        return {
+            "status": "queued_after_rewrite",
+            "status_text": "审核已排队（等待重写）",
+            "draft_id": draft.id,
+            "draft_title": _draft_label(draft),
+            "pending_rewrite_run_id": active_rewrite.id,
+            "chat_run_id": chat_run.id,
+            "message": (
+                f"正文正在重写；新版本生成后会自动审核《{_draft_label(draft)}》，"
+                "这样审的就是新版本而不是即将被替换的旧版本。"
+            ),
+        }
+    active_images = repository.count_active_image_jobs(draft.id, ACTIVE_IMAGE_STATUSES)
     if active_images:
-        mark_pending_review(repository, draft.id, deliver=deliver, chat_run_id=chat_run.id)
+        mark_pending_review(repository, draft.id, deliver=deliver, chat_run_id=chat_run.id, revise=revise)
         _announce(
             repository, session_id, chat_run,
             f"《{_draft_label(draft)}》还有 {active_images} 个配图任务在生成，配图完成后我会自动开始审核。",
@@ -214,6 +247,24 @@ async def _start_review(
     }
 
 
+def _already_rewriting(
+    draft: Any, label: str, run_id: str, *, requested_by_another: bool,
+) -> dict[str, Any]:
+    """去重命中时的统一返回：不再入队、不再记事件，让用户看到一句准确的状态。"""
+    reason = "另一个请求" if requested_by_another else "同一条请求的另一条执行路径"
+    return {
+        "status": "already_running",
+        "status_text": "重写已在进行中",
+        "draft_id": draft.id,
+        "draft_title": label,
+        "run_id": run_id,
+        "message": (
+            f"《{label}》已经在重写中（{reason}已经启动过这个任务，同一次改写只跑一个任务），"
+            "完成后我会在同一张卡片上汇报。"
+        ),
+    }
+
+
 async def _start_rewrite(
     settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
     origin_run: Any | None = None, chat_run_id: str | None = None, source_mode: str = "auto",
@@ -226,6 +277,12 @@ async def _start_rewrite(
 
     `source_mode` 透传给后台任务：`snapshot` 只用已保存证据（用户先刷新过来源时用，避免重写时
     又抓到不同版本的 README），`auto` 才在缺快照时联网重抓。
+
+    **同一篇草稿同时只允许一个重写任务**：同一条用户消息可能两条路径各入队一次（模型直接调
+    `rewrite_draft` 工具 + 意图兜底再入队），两个任务并发写同一草稿会撞上草稿版本唯一约束，
+    后完成的那次以 IntegrityError 失败——内容已经写进去了，用户却收到“生成失败”
+    （真实故障：用户报“聊天框异常”，日志里 `uq_draft_revision_version` 冲突）。
+    已在跑时复用同一个任务，不重复入队、不重复记事件。
     """
     mode = source_mode if source_mode in {"auto", "snapshot"} else "auto"
     source_note = "已保存的来源正文" if mode == "snapshot" else "已保存的 README 与证据包"
@@ -237,6 +294,28 @@ async def _start_rewrite(
         if chat_run_id
         else None
     )
+    if mode != "snapshot":
+        planned_job_id = ""
+        if chat_run is not None:
+            # 同一条用户消息会两条路径各调一次（模型工具 + 意图兜底）：第一次已经入队过，
+            # 第二次必须直接复用，否则两个任务并发写同一草稿（真实故障：聊天框里
+            # 两个“正在处理中”，后完成的任务以草稿版本唯一冲突失败）。
+            if getattr(chat_run, "rewrite_job_id", None):
+                return _already_rewriting(draft, label, chat_run.id, requested_by_another=False)
+            repository.claim_run_target_draft(chat_run.id, draft.id)
+            planned_job_id = chat_run.id
+        # 其它运行正在写同一篇：同一次点击只应该有一个任务（按草稿判断，不按会话）。
+        active = repository.find_active_regeneration_run(
+            draft.id,
+            within_seconds=getattr(settings, "collection_job_timeout_seconds", 900),
+            exclude_run_id=planned_job_id,
+        )
+        if active is not None:
+            logger.info(
+                "rewrite_dedup_skipped session_id=%s draft_id=%s active_run_id=%s",
+                session_id, draft.id, active.id,
+            )
+            return _already_rewriting(draft, label, active.id, requested_by_another=True)
     if chat_run is not None:
         anchor_message_id = _announce(
             repository, session_id, chat_run, f"正在用{source_note}重写《{label}》…"
@@ -286,6 +365,9 @@ async def _start_rewrite(
         settings, job_run_id, session_id, anchor_message_id, draft.id,
         auto_review_requested, auto_illustration_requested, mode,
     )
+    # 入队成功立刻登记（调用方随后会 commit）：同一条消息的第二次请求据此判断“已经入队过”。
+    if chat_run is not None:
+        repository.mark_rewrite_job_enqueued(chat_run.id, draft.id, job_id)
     repository.add_chat_agent_event(
         job_run_id, "正在重写文案", f"任务编号：{job_id}；完成后会覆盖为新的草稿版本。",
         metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [draft.id], "rewrite": True},
@@ -585,6 +667,104 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
             ),
         }
 
+    async def _impl_list_active_tasks(draft_id: str = "") -> dict[str, Any]:
+        """只读：这篇草稿现在有哪些任务在跑、哪些在排队。
+
+        为什么需要它：重写要跑 9–12 分钟，用户在这期间说“再跑一轮审核”，
+        若不先看队列就会**另起一个任务**去审即将被替换的旧版本（真实故障）。
+        Agent 应当能先查这里，再决定是排队等待还是直接执行。
+        """
+        from app.services.pending_reviews import ACTIVE_IMAGE_STATUSES, read_pending_review
+
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            now = datetime.now(UTC)
+            rewrite = repository.find_active_regeneration_run(
+                draft.id,
+                within_seconds=getattr(get_settings(), "collection_job_timeout_seconds", 900),
+                exclude_run_id="",
+            )
+            review = repository.find_active_auto_review_run(draft.id)
+            images = repository.count_active_image_jobs(draft.id, ACTIVE_IMAGE_STATUSES)
+            pending = read_pending_review(repository, draft.id)
+            label = _draft_label(draft)
+            version = draft.version
+
+        def minutes(run: Any) -> int:
+            started = getattr(run, "attempt_started_at", None) or getattr(run, "created_at", None)
+            if started is None:
+                return 0
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
+            return max(0, int((now - started).total_seconds() // 60))
+
+        active: list[dict] = []
+        if rewrite is not None:
+            active.append({"task": "重写正文", "started_minutes_ago": minutes(rewrite)})
+        if review is not None:
+            active.append({"task": "自动审核", "state": review.status})
+        if images:
+            active.append({"task": "生成配图", "count": images})
+        summary = "；".join(
+            f"{item['task']}（已进行 {item['started_minutes_ago']} 分钟）" if "started_minutes_ago" in item
+            else f"{item['task']}（{item.get('count') or item.get('state')}）"
+            for item in active
+        ) or "没有在跑的任务"
+        return {
+            "status": "ok",
+            "draft_id": draft.id,
+            "draft_title": label,
+            "draft_version": version,
+            "active_tasks": active,
+            "queued_review": pending,
+            "busy": bool(active),
+            "message": (
+                f"《{label}》（版本 {version}）当前：{summary}。"
+                + (
+                    "审核已排队，会在前面的任务结束后自动开始，不需要再发起一次。"
+                    if pending
+                    else ""
+                )
+            ),
+        }
+
+    async def _impl_search_web_evidence(
+        draft_id: str = "", queries: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """联网检索并把结果存成这篇草稿的**联网证据**（真的调用外部检索服务）。
+
+        什么时候用：正文里有不解释就读不懂的外部名称、或用户明确要求“查一下再改”。
+        结果会落进草稿证据（带联网标记），审核与改稿都能看到，因此不会把新事实判成“来源未出现”。
+        """
+        from app.services.evidence_search import search_and_store_evidence
+
+        settings = get_settings()
+        cleaned = [" ".join(str(item).split())[:300] for item in (queries or []) if str(item).strip()]
+        if not cleaned:
+            return {"status": "rejected", "message": "请给出要检索的关键词（最多 2 个）。"}
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=REVIEWABLE_STATUSES)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            result = await search_and_store_evidence(settings, repository, draft, cleaned)
+            session.commit()
+            label = _draft_label(draft)
+        return {
+            **result,
+            "draft_id": draft.id,
+            "draft_title": label,
+            "message": (
+                f"已为《{label}》联网检索「{'、'.join(cleaned)}」，带回 {result.get('entries', 0)} 条补充资料，"
+                "已存成这篇的联网证据；审核与改稿都会看到。"
+                if result.get("entries")
+                else f"《{label}》这次联网检索没有取回可用资料。"
+            ),
+        }
+
     def _review_decision(draft_id: str, action: str, note: str, allowed: set[str]) -> dict[str, Any]:
         with SessionLocal() as session:
             repository = ContentRepository(session)
@@ -742,6 +922,26 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
             "message": f"已开始重新选择《{_draft_label(draft)}》的投递配图，完成后我会汇报。",
         }
 
+    @tool("list_active_tasks")
+    def list_active_tasks(draft_id: str = "") -> dict[str, Any]:
+        """只读：查看当前文章**现在有哪些任务在跑、哪些在排队**。
+
+        长任务（重写正文 9–12 分钟、自动审核几分钟、配图）期间要先查这里，再决定是
+        排队等待还是直接执行——不看队列就会另起一个任务，去审即将被替换掉的旧版本。
+        """
+        return run_coroutine_sync(_impl_list_active_tasks(draft_id=draft_id))
+
+    @tool("search_web_evidence")
+    def search_web_evidence(draft_id: str = "", queries: list[str] | None = None) -> dict[str, Any]:
+        """联网检索最多 2 个关键词，并把结果存成当前文章的**联网证据**（真调用外部检索服务）。
+
+        用于正文里“不解释就读不懂”的外部名称，或用户明确说“先查一下再改”。
+        结果会带联网标记落库，审核与改稿都能看到；只补证据，不改正文、不投递。
+        """
+        return run_coroutine_sync(
+            _impl_search_web_evidence(draft_id=draft_id, queries=queries)
+        )
+
     # 会话 Agent 以同步方式执行工具：异步实现必须配同步外壳，否则 LangChain 抛
     # NotImplementedError（真实故障：对话模型报“暂时不可用”，failure_stage=agent_invoke）。
     @tool("run_auto_review")
@@ -878,6 +1078,24 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
             draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=EDITABLE_STATUSES)
             if draft is None:
                 return {"status": "rejected", "message": reason}
+            # 正文正在被重写时不再并发改稿：两个写者会抢同一个草稿版本号，
+            # 后完成的那次以唯一约束冲突失败（真实故障：用户看到“生成失败”而正文已改）。
+            # 这个判断放在最前面：先于“有没有审核记录”，否则用户会拿到误导性的拒绝理由。
+            active_rewrite = repository.find_active_regeneration_run(
+                draft.id,
+                within_seconds=getattr(settings, "collection_job_timeout_seconds", 900),
+                exclude_run_id=chat_run_id or "",
+            )
+            if active_rewrite is not None:
+                return {
+                    "status": "rejected",
+                    "draft_id": draft.id,
+                    "draft_title": _draft_label(draft),
+                    "message": (
+                        f"《{_draft_label(draft)}》正在重写正文，现在改稿会和它抢同一个版本号。"
+                        "等重写完成后我再按这些意见改；那时也可以直接说“按审核意见改”。"
+                    ),
+                }
             run = None
             if review_id:
                 try:
@@ -982,6 +1200,8 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
         regenerate_draft_body,
         read_current_draft,
         read_latest_review,
+        list_active_tasks,
+        search_web_evidence,
         apply_revision_issues,
         plan_publication_assets,
         approve_draft,
