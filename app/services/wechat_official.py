@@ -29,6 +29,20 @@ class WechatRemoteDraft:
     updated_at: str
 
 
+# 正文段落的内联样式（用户反馈：“你写的时候保留的空行，上传到微信草稿箱后没有空行了”）。
+#
+# 原因：我们此前只发 `<p>正文</p>`，段间距完全交给微信编辑器默认值 —— 在草稿编辑器里
+# 相邻段落会贴在一起，看起来就像空行被吃了；行高也只有 1.0，中文长文很难读。
+# 内联样式写进 content 字段后，编辑器与发表后的正文都会照它渲染，两端观感一致。
+PARAGRAPH_MARGIN_PX = 22
+PARAGRAPH_STYLE = f"margin:0 0 {PARAGRAPH_MARGIN_PX}px;line-height:1.75;"
+IMAGE_PARAGRAPH_STYLE = "margin:0 0 12px;line-height:0;"
+
+
+def _paragraph(inner_html: str, style: str = PARAGRAPH_STYLE) -> str:
+    return f'<p style="{style}">{inner_html}</p>'
+
+
 def render_wechat_html(
     body: str,
     inline_image_urls: list[str | dict[str, Any]],
@@ -43,6 +57,9 @@ def render_wechat_html(
 
     `footer_image_url` 给定时：文末追加该图，并按 `include_text_footer` 决定是否保留
     “原文标题／原文链接”这类文字尾注（用户要求“以固定结尾图取代原来的文字”）。
+
+    每个段落都带内联样式（见 `PARAGRAPH_STYLE`）：不加样式时微信草稿编辑器会把相邻段落
+    贴在一起，用户看到的“空行消失”就是这么来的。
     """
     lines = [line.strip() for line in normalize_plain_text(body).splitlines() if line.strip()]
     if footer_image_url and not include_text_footer:
@@ -65,21 +82,24 @@ def render_wechat_html(
             position = 0
         positioned.setdefault(min(position, max_position), []).append(normalized_url)
 
-    blocks: list[str] = [f'<p><img src="{html.escape(url, quote=True)}" /></p>' for url in positioned.get(0, [])]
+    def image_block(url: str) -> str:
+        return _paragraph(f'<img src="{html.escape(url, quote=True)}" />', IMAGE_PARAGRAPH_STYLE)
+
+    blocks: list[str] = [image_block(url) for url in positioned.get(0, [])]
     paragraph_index = 0
     for line in lines:
         is_footer = is_source_footer_line(line)
         # 纯文本规范化会移除段首空白；微信正文逐段恢复两个全角空格缩进，来源行不缩进。
         prefix = "" if is_footer else "　　"
-        blocks.append(f"<p>{prefix}{html.escape(line)}</p>")
+        blocks.append(_paragraph(f"{prefix}{html.escape(line)}"))
         if is_footer:
             continue
         paragraph_index += 1
         for url in positioned.get(paragraph_index, []):
-            blocks.append(f'<p><img src="{html.escape(url, quote=True)}" /></p>')
+            blocks.append(image_block(url))
     footer_url = _wechat_inline_image_url(footer_image_url)
     if footer_url:
-        blocks.append(f'<p><img src="{html.escape(footer_url, quote=True)}" /></p>')
+        blocks.append(image_block(footer_url))
     return "".join(blocks)
 
 

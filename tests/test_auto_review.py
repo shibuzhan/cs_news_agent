@@ -62,8 +62,9 @@ def test_wechat_html_inserts_positioned_image_after_requested_paragraph() -> Non
         "第一段\n\n第二段",
         [{"url": "https://images.example.com/chart.png", "after_paragraph": 1}],
     )
-    assert "<p>　　第一段</p>" in rendered
-    assert "<p>　　第二段</p>" in rendered
+    # 段落带内联段间距样式（微信编辑器默认会贴在一起），断言只针对文本与顺序。
+    assert "　　第一段</p>" in rendered
+    assert "　　第二段</p>" in rendered
     assert rendered.index("第一段") < rendered.index("chart.png") < rendered.index("第二段")
 
 

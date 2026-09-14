@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import Settings
-from app.services.wechat_official import WechatOfficialAccountError, remote_drafts_from_payload, render_wechat_html
+from app.services.wechat_official import (
+    IMAGE_PARAGRAPH_STYLE,
+    PARAGRAPH_STYLE,
+    WechatOfficialAccountError,
+    remote_drafts_from_payload,
+    render_wechat_html,
+)
 from app.tools import wechat_official_account
 from app.tools.wechat_official_account import WechatOfficialAccountTool
 
@@ -20,13 +26,25 @@ def test_render_wechat_html_escapes_draft_text_and_normalizes_wechat_inline_imag
         ],
     )
 
-    assert "<p>　　标题</p>" in rendered
+    assert "<p>　　标题</p>" not in rendered
+    assert "　　标题</p>" in rendered
     assert "<h1>" not in rendered
     assert "<script>" not in rendered
     assert "alert(1)" in rendered
     assert 'src="https://mmbiz.qpic.cn/inline.png"' in rendered
     assert 'src="https://mmbiz.qpic.cn/returned-by-wechat.png?from=appmsg"' in rendered
     assert "not-inserted.example" not in rendered
+
+
+def test_render_wechat_html_keeps_paragraph_spacing_inline() -> None:
+    """段间距必须写成内联样式：微信草稿编辑器默认把相邻段落贴在一起（用户反馈“空行没了”）。"""
+    rendered = render_wechat_html("第一段\n\n第二段\n\n点击查看原文跳转项目地址", [])
+
+    assert rendered.count(f'<p style="{PARAGRAPH_STYLE}">') == 3
+    assert "margin:0 0 22px" in rendered and "line-height:1.75" in rendered
+    # 图片段落用更小的下间距，且不让 img 带上行高留白。
+    with_image = render_wechat_html("第一段", ["https://mmbiz.qpic.cn/a.png"])
+    assert f'<p style="{IMAGE_PARAGRAPH_STYLE}">' in with_image
 
 
 def test_remote_draft_payload_is_reduced_to_safe_display_fields() -> None:
