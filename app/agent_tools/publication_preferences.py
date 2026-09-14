@@ -37,6 +37,84 @@ from app.tools.wechat_official_account import WechatOfficialAccountTool
 logger = logging.getLogger(__name__)
 
 
+def _impl_show_generation_settings() -> dict[str, Any]:
+    """只读：当前生效的正文目标字数（配置页那一对数字）与推导出的硬区间。"""
+    from app.services.plain_text import article_length_band
+    from app.services.runtime_settings import load_runtime_settings
+
+    settings = load_runtime_settings(get_settings())
+    low, high, hard_low, hard_high = article_length_band(
+        settings.draft_body_min_chars, settings.draft_body_max_chars
+    )
+    return {
+        "status": "done",
+        "target_min_chars": low,
+        "target_max_chars": high,
+        "hard_min_chars": hard_low,
+        "hard_max_chars": hard_high,
+        "metric": "去掉空白与来源尾注后的全部字符（汉字、英文字母、数字、标点各算一个）",
+        "message": (
+            f"当前正文目标字数是 {low} 到 {high} 字（同一口径），"
+            f"规则审核按硬区间 {hard_low} 到 {hard_high} 字判定；"
+            "这就是“系统设置 → 写作、审核与自动化”里的那两个数字。"
+        ),
+    }
+
+
+def _impl_set_generation_settings(
+    target_min_chars: int | None = None, target_max_chars: int | None = None,
+) -> dict[str, Any]:
+    """修改正文目标字数（写进配置页那两个数字），而不是记成写作偏好。
+
+    真实困惑（2026-09-14）：“我让 agent 改字数上限，但是配置页并没有改”——因为当时
+    只有“长期写作偏好”这一条路，Agent 只能把“上限 2800”记成一句偏好，配置页当然不动。
+    """
+    from app.services.plain_text import article_length_band
+    from app.services.runtime_settings import (
+        RuntimeSettingsError,
+        load_runtime_settings,
+        validate_runtime_options,
+    )
+
+    if target_min_chars is None and target_max_chars is None:
+        return {"status": "rejected", "reason": "请给出要修改的目标字数（target_min_chars / target_max_chars）"}
+    settings = load_runtime_settings(get_settings())
+    payload: dict[str, object] = {}
+    if target_min_chars is not None:
+        payload["draft_body_min_chars"] = int(target_min_chars)
+    if target_max_chars is not None:
+        payload["draft_body_max_chars"] = int(target_max_chars)
+    # 与配置页共用同一套校验：非法值（例如上限超过 6000 或下限大于上限）在这里就被拒绝。
+    try:
+        accepted = validate_runtime_options(payload)
+    except RuntimeSettingsError as exc:
+        return {"status": "rejected", "reason": str(exc)}
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        for field, value in accepted.items():
+            repository.set_app_setting(f"runtime.{field}", value, updated_by="agent")
+        session.commit()
+        effective = load_runtime_settings(get_settings())
+    low, high, hard_low, hard_high = article_length_band(
+        effective.draft_body_min_chars, effective.draft_body_max_chars
+    )
+    logger.info(
+        "generation_settings_updated min=%s max=%s", effective.draft_body_min_chars, effective.draft_body_max_chars
+    )
+    return {
+        "status": "done",
+        "target_min_chars": low,
+        "target_max_chars": high,
+        "hard_min_chars": hard_low,
+        "hard_max_chars": hard_high,
+        "message": (
+            f"已把正文目标字数改为 {low} 到 {high} 字（配置页同一处数字，刷新即可看到）；"
+            f"规则审核按硬区间 {hard_low} 到 {hard_high} 字判定。"
+            "**已经写好的旧稿不会自动跟着变**：需要重新生成或重写才会按新区间写。"
+        ),
+    }
+
+
 def _describe(preferences, repository) -> dict[str, Any]:
     return {
         "cover_in_body": preferences.cover_in_body,
@@ -241,6 +319,24 @@ def build_publication_preference_tools(session_id: str):  # noqa: ARG001 - 与�
         """覆盖写入长期写作偏好文件（markdown）；会注入生成/改稿/审核，且可在 Git 里评审。"""
         return _impl_update_style_guide(markdown)
 
+    @tool("show_generation_settings")
+    def show_generation_settings() -> dict[str, Any]:
+        """查看当前**生效的正文目标字数**（配置页“写作、审核与自动化”里的那两个数字）与硬区间。"""
+        return _impl_show_generation_settings()
+
+    @tool("set_generation_settings")
+    def set_generation_settings(
+        target_min_chars: int | None = None, target_max_chars: int | None = None
+    ) -> dict[str, Any]:
+        """修改正文目标字数（写进配置页，立即对之后的生成/重写生效）。
+
+        用户说“把字数上限改成 2800”“目标字数改成 1500–2600”时用这个——**不要**把它记成
+        写作偏好：偏好只是提示词里的一句话，配置页的数字不会变（真实困惑）。
+        """
+        return _impl_set_generation_settings(
+            target_min_chars=target_min_chars, target_max_chars=target_max_chars
+        )
+
     @tool("show_publication_preferences")
     def show_publication_preferences() -> dict[str, Any]:
         """查看长期排版偏好（封面是否作为正文首图、固定结尾图、是否保留文字尾注）。"""
@@ -277,6 +373,8 @@ def build_publication_preference_tools(session_id: str):  # noqa: ARG001 - 与�
 
     return [
         show_publication_preferences,
+        show_generation_settings,
+        set_generation_settings,
         show_style_guide,
         update_style_guide,
         add_style_preference,

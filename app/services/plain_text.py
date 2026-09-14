@@ -55,12 +55,42 @@ _NAME_STOPWORDS = frozenset(
 )
 
 
+def body_source_lines_removed(body: str) -> str:
+    """去掉来源尾注行（“点击查看原文…”这类），其余原样保留。"""
+    text = (body or "").replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [item for item in text.split("\n\n") if item.strip()]
+    return "\n\n".join(
+        item for item in paragraphs if not is_source_footer_line(item.lstrip("　 "))
+    )
+
+
+def body_char_count(body: str) -> int:
+    """**正文长度的唯一口径**（目标字数、成形校验、规则审核、改稿、汇报共用这一个函数）。
+
+    数什么：去掉来源尾注行之后，**去掉所有空白字符**（含段首全角缩进与换行）的剩余字符数。
+    也就是汉字、英文字母、数字、标点各算一个。
+
+    为什么必须唯一：2026-09-14 实测同一篇 v4 草稿在不同代码路径下被数成四个数——
+    `len(body)` 2628、规则审核 2614（含缩进）、成形校验 2483（去空白）、
+    改稿提示词说的“中文字符”1657，而公众号编辑器显示 1957。于是同一篇稿子
+    「一个说太短、一个说太长」，规则审核还据不同的数给出相反结论。
+
+    与编辑器口径的关系：编辑器按「汉字数 + 英文单词数」计（实测 1957 对 1776，
+    我们数 2483，多半是因为 `Codex / SKILL.md` 这类英文每个字母都算了一个字符）。
+    要把配置页的数字调到与编辑器一致，用 `python .planning/calibrate_length_metric.py`
+    对比同一条草稿的两种数字后，按比例调整配置值即可。
+    """
+    return len(re.sub(r"\s+", "", body_source_lines_removed(body)))
+
+
 def article_length_band(target_low: int, target_high: int) -> tuple[int, int, int, int]:
     """返回正文写作的字数区间：目标下限、目标上限、硬下限、硬上限。
 
     配置页填的是**目标值**：硬区间 = 目标上下限各放宽 `HARD_BAND_MARGIN` 字，
     只有超出硬区间才会被规则审核拦下，目标带只是写作建议（历史实现把配置当成硬区间，
     于是“目标”永远无法表达，只能靠下限反推）。
+
+    这里的“字”一律指 `body_char_count()` 的口径；调用方不得再自己数。
     """
     low = max(int(target_low), NATURAL_ARTICLE_MIN_CHARS)
     high = min(max(int(target_high), low), MAX_TARGET_CHARS)
@@ -274,9 +304,9 @@ def compose_natural_article(
             f"正文应为 {NATURAL_ARTICLE_MIN_PARAGRAPHS} 到 {NATURAL_ARTICLE_MAX_PARAGRAPHS} 个自然段"
         )
     body = "\n\n".join(paragraphs)
-    body_chars = len(re.sub(r"\s+", "", body))
+    body_chars = body_char_count(body)
     if body_chars < min_chars:
-        raise NaturalArticleError(f"正文至少需要 {min_chars} 个字符")
+        raise NaturalArticleError(f"正文至少需要 {min_chars} 个字符（当前 {body_chars}）")
     return body, {
         "paragraph_count": len(paragraphs),
         "body_chars": body_chars,

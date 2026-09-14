@@ -176,7 +176,9 @@ def test_revision_prompt_states_length_floor_and_forbids_translationese(monkeypa
     # 目标 1600–2200，硬区间 1400–2400（目标上下各放宽 200 字）。
     assert "1400" in prompt and "2400" in prompt
     assert "不得低于下限" in prompt
-    assert "1600 到 2200 个中文字符" in prompt
+    # 口径统一后提示词不再说“中文字符”，而是说明数的是去空白后的全部字符。
+    assert "1600 到 2200 个字" in prompt
+    assert "去掉空白与来源尾注后的全部字符" in prompt
     assert "4 到 8 个自然段" in prompt
     # 明确禁止翻译腔，避免为了保守而写出生硬句子。
     assert "语境里看" in prompt and "不要用含糊措辞掩盖" in prompt
@@ -405,7 +407,8 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "4 到 8 个自然段" in instruction
     assert "语境里看" in instruction
     assert "不要用含糊措辞掩盖" in instruction
-    assert "不得少于 1400 个中文字符" in instruction
+    assert "不得少于 1400 个字" in instruction
+    assert "去掉空白与来源尾注后的全部字符" in instruction
     # 正向语感锚点：自然开头、允许短段、数字的中文可读写法；不鼓励谈论来源自身的缺失。
     assert "万能开头" in instruction
     assert "短段" in instruction
@@ -423,8 +426,8 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "每个句子都要有明确主语" in instruction
     assert "本地运行后，浏览器中会显示" in instruction
     # 长度给目标带而不是只给上下限，避免贴着下限写。
-    assert "1600 到 2200 个中文字符" in instruction
-    assert "不得超过 2400 个中文字符" in instruction
+    assert "1600 到 2200 个字" in instruction
+    assert "不得超过 2400 个字" in instruction
     assert "不要贴着下限写" in instruction
     # 禁止每篇同一结构。
     assert "不要每篇都套同一个顺序" in instruction

@@ -13,6 +13,8 @@ from app.services.model_errors import model_failure_message
 from app.services.plain_text import (
     MIN_HARD_BODY_CHARS,
     article_length_band,
+    body_char_count,
+    body_source_lines_removed,
     is_source_footer_line,
     normalize_plain_text,
 )
@@ -68,23 +70,23 @@ def _blocking_issue_count(values: object) -> int:
 def rule_review(draft, min_body_chars: int = MIN_HARD_BODY_CHARS, max_body_chars: int = 2400) -> dict:
     # 这里不能先调用 normalize_plain_text：它会按设计去除段首空白，
     # 而段首两个全角空格正是本项目需要核验的格式规则。
+    # 长度一律用 body_char_count()（去尾注 + 去空白），与提示词、成形校验、改稿、汇报同一口径。
     # 传入的应当是**硬区间**（目标带上下各放宽 HARD_BAND_MARGIN 字）；这里只兜一个绝对底线。
     min_body_chars = max(min_body_chars, MIN_HARD_BODY_CHARS)
     body = draft.body.replace("\r\n", "\n").replace("\r", "\n")
     paragraphs = [item for item in body.split("\n\n") if item.strip()]
     failures: list[str] = []
-    body_without_footer = "\n\n".join(
-        item for item in paragraphs if not is_source_footer_line(item.lstrip("　 "))
-    )
+    body_without_footer = body_source_lines_removed(body)
     if not draft.source_url.startswith(("https://", "http://")):
         failures.append("缺少可追溯原文链接")
     if not draft.source_name or not (draft.title_options_json or []):
         failures.append("缺少来源或标题")
     if not draft.tags_json:
         failures.append("缺少内容标签")
-    if body_without_footer and not (min_body_chars <= len(body_without_footer) <= max_body_chars):
+    body_chars = body_char_count(body)
+    if body_without_footer and not (min_body_chars <= body_chars <= max_body_chars):
         failures.append(
-            f"正文长度 {len(body_without_footer)} 不在 {min_body_chars} 到 {max_body_chars} 字符范围内"
+            f"正文长度 {body_chars} 不在 {min_body_chars} 到 {max_body_chars} 字范围内"
         )
     source_kind = str(getattr(getattr(draft, "source_item", None), "source_kind", "")).casefold()
     if source_kind != "github" and body.count("原文标题：") != 1:
@@ -105,7 +107,7 @@ def rule_review(draft, min_body_chars: int = MIN_HARD_BODY_CHARS, max_body_chars
     return {
         "passed": not failures,
         "failures": failures,
-        "body_chars": len(body_without_footer),
+        "body_chars": body_chars,
         "paragraph_count": len(content_paragraphs),
         "logical_sections": logical_sections,
         "article_shape": article_shape,
