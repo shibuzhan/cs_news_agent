@@ -3421,4 +3421,14 @@
 - 未提交 git：`c908a45` 已提交（12 文件，+734/−42）；前端 `App.tsx`/`api.ts`/`styles.css` 的既有未提交改动属于另一并行会话，本轮未纳入。
 - 授权状态：已确认并完成（用户要求“继续上轮任务”，方案已在上轮给出）
 
+### 2026-09-14｜变更 325
+
+- 用户指令：“把‘仅审核’改指到 review_draft”。
+- 影响范围：`app/services/agent_commands.py`（前缀表）、`app/services/chat_receipts.py`（`_single_step_receipt(revise=)` + `_READ_ONLY_COMMANDS` + `_COMMAND_STEPS` 补两条按钮命令）、`frontend/src/App.tsx`（按钮文案与说明）；`tests/test_agent_commands.py`、`tests/test_chat_receipt_on_enqueue.py` 各新增用例。
+- 结论（为什么必须改）：命令解析把“仅审核”映射到 `run_auto_review`，而它**会在有可执行意见时改稿一轮**——按钮写着“仅运行审核（改稿不投递）”，点下去正文却被动了，措辞与行为不符。现在“仅审核/仅运行审核”落在上一轮新增的 `review_draft`（`revise=false`，文字模型只出意见、正文一个字不动）；会改稿的入口（自动审核/运行自动审核/重新审核）保持 `run_auto_review` 不变。
+- 连带两处：①回执区分“只审不改”——`_single_step_receipt(revise=False)` 写明“不改稿”，卡片状态为“正在审核（不改稿）”，否则用户以为正文已按意见改过；②`review_draft` 与 `reselect_publication_assets` 登记进 `_COMMAND_STEPS`，这两个界面按钮命令此前会退化到关键词扫描（措辞与卡片标题可能对不上点下去的动作）。
+- 验证（单测 + 只读实测）：后端 **420 项通过、0 失败**（较变更 324 新增 3 项）；前端 `tsc` 0 错误；app/worker/frontend 已重建（重建前在跑任务 0/0/0）。容器内实测命令解析与回执：`仅运行审核/仅审核 → review_draft`（回执“收到：只审核当前文章，不改稿…”，工具可执行=True）、`自动审核/运行自动审核/重新审核 → run_auto_review`（回执仍为“自动审核当前文章”）、`重新选择配图 → reselect_publication_assets`。前端 dev 服务器已提供新文案（`http://127.0.0.1:5173/src/App.tsx` 含“仅运行审核（只出意见，不改稿）”，刷新页面即生效）。
+- 未提交 git：`ae0af87` 已提交（5 文件，+53/−5，App.tsx 只暂存本轮 2 个 hunk，另一并行会话的改动未纳入）。
+- 授权状态：已确认并完成
+
 -->
