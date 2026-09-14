@@ -3488,4 +3488,15 @@
 - 未提交 git：`6e998e8`（14 文件，+1019/−3）、`4b78cbf`（前端 2 文件，+52/−2；App.tsx 只暂存本轮 3 个 hunk，并行会话改动未纳入）。
 - 授权状态：已确认并完成
 
+### 2026-09-14｜变更 331
+
+- 用户指令：“核实一下：app/skills/ 下 6 个 SKILL.md…既没被 Dockerfile COPY，也没有任何 Python 代码引用（app/paths.py 只认 agent_skills/）。它们是提示词的孤儿副本…这本身就是‘提示词真源不唯一’的隐患”。核实后用户选择：**删除整个 app/skills/**（未选“迁移 agnes 参考文件”与“加防回退测试”）。
+- 核实结论（逐条）：①文件数 ✅ 6 个 SKILL.md（另有 1 个 `image-generation/references/agnes-image-2.5-flash.md`，合计 7 个被跟踪文件）；②“没被 Dockerfile COPY” ⚠️ **不准确**——`COPY app ./app` 让它们确实进了镜像（`docker exec … ls /app/app/skills` 可见），只是没人读；③“没有任何 Python 引用” ✅ `git grep "app/skills\|app\.skills"` 在全部代码/配置里 0 命中；④“paths.py 只认 agent_skills/” ✅ `ASSET_DIR_NAME = "agent_skills"` 写死，skill 加载只有 `content_deep_agent`（glob `*/SKILL.md` → `/skills/<name>/`）与 `generator`（按来源取 `<source>-content-writing`）两条路径；⑤“auto-review 的能力其实在 app/tools/auto_review.py” ✅，孤儿副本与运行时零耦合。
+- 关键危险点（内容已过期）：副本 `content-writing` 写“正文至少 **1200** 字符”“文末保留一次原文标题：”，而现行是硬下限 **1400**、GitHub 已改为“点击查看原文跳转项目地址”；副本 `image-generation` 让模型读 `references/agnes-image-2.5-flash.md`，而运行期读的是 `agent_skills/*-content-writing/references/image-brief.md`（`app/services/image_brief.py` 经 `resolve_asset` 只认 `agent_skills/`），且 `agent_skills/` 下并无 image-generation 目录——指引指向不存在的位置。
+- 处理：`git rm -r app/skills`（6 个 SKILL.md + agnes 参考文件，共 −101 行）。Agnes 的模型契约本就在 `app/config.py` 与 `app/tools/image_generation.py` 中实现，无独有信息。历史 `process.md`/`findings.md`/`progress.md` 里提到该目录的旧记录保留（它们是日志，不是引用）。
+- 附带发现（本轮未处理，用户未选）：`agent_skills/source-media/SKILL.md` 声称校验支持 **webp**，而 `app/services/attachments.py` 的 `ALLOWED_IMAGE_EXTENSIONS` 只有 `.jpg/.jpeg/.png`、`chat_dispatch` 与 `image_generation` 也只接受 `image/jpeg|image/png`（`app/services/source_media.py` 里另有 webp 映射，需确认其落库路径是否绕过该校验）。另：用户未选“加防回退测试”（断言 app/skills 不存在、DeepAgent 读到的 SKILL.md 全部来自 agent_skills/）。
+- 验证：后端 **471 项通过、0 失败**；app/worker 已重建；容器内确认 `/app/app/skills` 不存在，DeepAgent 仍从 `agent_skills/` 读到 **11 个** skill；顺带清理了任务清单实测（变更 330）留下的一条占位审核记录（`queued` 但任务从未入队，会挡住新审核）。
+- 未提交 git：`6cd0270` 已提交（7 文件删除，−101 行）。
+- 授权状态：已确认并完成
+
 -->
