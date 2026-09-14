@@ -132,7 +132,7 @@ async def start_draft_rewrite(
 
 async def _start_review(
     settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
-    deliver: bool, chat_run_id: str | None = None,
+    deliver: bool, chat_run_id: str | None = None, revise: bool = True,
 ) -> dict[str, Any]:
     from app.services.pending_reviews import ACTIVE_IMAGE_STATUSES, mark_pending_review
 
@@ -165,29 +165,43 @@ async def _start_review(
             "chat_run_id": chat_run.id,
             "message": f"配图完成后会自动审核《{_draft_label(draft)}》（当前还有 {active_images} 个配图任务）。",
         }
-    _announce(repository, session_id, chat_run, f"好，正在审核《{_draft_label(draft)}》；通过后不会自动发表。")
+    _announce(
+        repository, session_id, chat_run,
+        f"好，正在审核《{_draft_label(draft)}》；通过后不会自动发表。"
+        if revise
+        else f"好，正在审核《{_draft_label(draft)}》，只出意见、不改稿。",
+    )
     review_run = repository.create_auto_review_run(draft.id, None, status="queued")
     repository.add_chat_agent_event(
         chat_run.id, "自动审核中",
-        "正在按规则与模型审核当前文案与配图，并按意见改稿一轮。",
+        "正在按规则与模型审核当前文案与配图，并按意见改稿一轮。"
+        if revise
+        else "正在按规则与模型审核当前文案与配图；只出意见，不改稿。",
         "running",
-        metadata={"phase": "review", "state": "running", "draft_ids": [draft.id], "review_id": review_run.id},
+        metadata={"phase": "review", "state": "running", "draft_ids": [draft.id], "review_id": review_run.id, "revise": revise},
     )
-    job_id = await enqueue_auto_review_job(settings, draft.id, review_run.id, deliver, chat_run.id)
+    job_id = await enqueue_auto_review_job(
+        settings, draft.id, review_run.id, deliver, chat_run.id, revise
+    )
     repository.add_chat_agent_event(
         chat_run.id, "审核任务已创建", f"任务编号：{job_id}",
         metadata={"phase": "review", "state": "running", "job_id": job_id, "draft_ids": [draft.id]},
     )
     return {
         "status": "started",
-        "status_text": "审核中",
+        "status_text": "审核中（不改稿）" if not revise else "审核中",
         "draft_id": draft.id,
         "draft_title": _draft_label(draft),
         "deliver": deliver,
+        "revise": revise,
         "review_id": review_run.id,
         "chat_run_id": chat_run.id,
         "message": f"已开始审核《{_draft_label(draft)}》"
-        + ("（通过后会创建公众号草稿，不会发表）" if deliver else "（仅审核，不投递）"),
+        + (
+            "（只出意见、不改稿）"
+            if not revise
+            else "（通过后会创建公众号草稿，不会发表）" if deliver else "（仅审核，不投递）"
+        ),
     }
 
 
@@ -397,9 +411,13 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
     `chat_run_id` 传入用户消息的受理运行时，工具不再各自新建运行与重复气泡。
     """
 
-    async def _impl_run_auto_review(draft_id: str = "", deliver: bool = False) -> dict[str, Any]:
-        """对当前文章发起自动审核（规则 + 模型审核，并按意见改稿一轮）。
+    async def _impl_run_auto_review(
+        draft_id: str = "", deliver: bool = False, revise: bool = True,
+    ) -> dict[str, Any]:
+        """对当前文章发起自动审核（规则 + 模型审核）。
 
+        `revise=false` 表示**只出意见、不改稿**（用户要“先看审核怎么说”时用这个）；
+        默认 true 会在有可执行意见时按意见改稿一轮再复审。
         deliver=true 表示审核通过后创建公众号草稿箱记录（不会发表）；默认 false 仅审核。
         """
         settings = get_settings()
@@ -409,10 +427,14 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
             if draft is None:
                 return {"status": "rejected", "message": reason}
             result = await _start_review(
-                settings, repository, session_id, draft, deliver=deliver, chat_run_id=chat_run_id
+                settings, repository, session_id, draft, deliver=deliver,
+                chat_run_id=chat_run_id, revise=revise,
             )
             session.commit()
-        logger.info("agent_tool_run_auto_review session_id=%s draft_id=%s status=%s", session_id, draft_id or "-", result.get("status"))
+        logger.info(
+            "agent_tool_run_auto_review session_id=%s draft_id=%s deliver=%s revise=%s status=%s",
+            session_id, draft_id or "-", deliver, revise, result.get("status"),
+        )
         return result
 
     async def _impl_rewrite_draft(draft_id: str = "") -> dict[str, Any]:
@@ -511,10 +533,13 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
                 session_id=session_id, draft=draft, chat_run_id=chat_run_id, updating=updating,
             )
 
-    async def _impl_reselect_publication_assets(draft_id: str = "") -> dict[str, Any]:
+    async def _impl_reselect_publication_assets(
+        draft_id: str = "", deliver: bool = True,
+    ) -> dict[str, Any]:
         """作废当前投递素材选择并按最新口径重新选择（真实截图优先、AI 配图补足）。
 
-        已投递的草稿会在重选后**原地覆盖**远端公众号草稿；未投递时只固化新的选择。
+        `deliver=False` 只重新选择并落库，**不创建或覆盖远端草稿**（用户想先看看选了哪几张）；
+        默认 deliver=True：已投递的草稿会在重选后原地覆盖远端公众号草稿。
         """
         settings = get_settings()
         with SessionLocal() as session:
@@ -534,22 +559,31 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
             chat_run = _task_run(
                 repository, session_id, chat_run_id, ConversationIntent.RESELECT_PUBLICATION_ASSETS
             )
-            _announce(
-                repository, session_id, chat_run,
-                f"好，正在重新为《{_draft_label(draft)}》选择投递配图（真实截图优先，AI 配图补足）"
-                + ("，完成后会覆盖公众号草稿内容。" if updating else "。"),
-            )
+            if deliver:
+                pending = (
+                    f"好，正在重新为《{_draft_label(draft)}》选择投递配图（真实截图优先，AI 配图补足）"
+                    + ("，完成后会覆盖公众号草稿内容。" if updating else "。")
+                )
+            else:
+                pending = (
+                    f"好，正在重新为《{_draft_label(draft)}》选择投递配图；"
+                    "只更新选择，不会创建或覆盖远端草稿。"
+                )
+            _announce(repository, session_id, chat_run, pending)
             repository.add_chat_agent_event(
                 chat_run.id, "重新选择配图已入队",
                 "已作废旧的投递素材选择，将按当前草稿里的全部图片重新选择。",
                 "running",
-                metadata={"phase": "image", "state": "queued", "draft_ids": [draft.id], "reselection": True},
+                metadata={
+                    "phase": "image", "state": "queued", "draft_ids": [draft.id],
+                    "reselection": True, "delivery": deliver,
+                },
             )
             session.commit()
         try:
             from app.jobs import enqueue_wechat_delivery_job
 
-            job_id = await enqueue_wechat_delivery_job(settings, draft.id, chat_run.id)
+            job_id = await enqueue_wechat_delivery_job(settings, draft.id, chat_run.id, deliver)
         except Exception as exc:
             logger.warning("agent_tool_reselect_enqueue_failed draft_id=%s error_type=%s", draft.id, type(exc).__name__)
             return {"status": "failed", "draft_id": draft.id, "message": f"重新选择配图任务未能入队：{exc}"}
@@ -579,11 +613,22 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
     # NotImplementedError（真实故障：对话模型报“暂时不可用”，failure_stage=agent_invoke）。
     @tool("run_auto_review")
     def run_auto_review(draft_id: str = "", deliver: bool = False) -> dict[str, Any]:
-        """对当前文章发起自动审核（规则 + 模型审核，并按意见改稿一轮）。
+        """对当前文章发起自动审核，并按审核意见改稿一轮（需要“只看意见”用 review_draft）。
 
         deliver=true 表示审核通过后创建公众号草稿箱记录（不会发表）；默认 false 仅审核。
         """
         return run_coroutine_sync(_impl_run_auto_review(draft_id=draft_id, deliver=deliver))
+
+    @tool("review_draft")
+    def review_draft(draft_id: str = "") -> dict[str, Any]:
+        """只审核当前文章、**不改稿**：返回评分与意见，正文保持原样。
+
+        用户说“先看看审核怎么说”“只审不改”“别动文章”时用这个；审核意见可以用
+        read_latest_review 读回来，需要改稿再用 apply_revision_issues。
+        """
+        return run_coroutine_sync(
+            _impl_run_auto_review(draft_id=draft_id, deliver=False, revise=False)
+        )
 
     @tool("rewrite_draft")
     def rewrite_draft(draft_id: str = "") -> dict[str, Any]:
@@ -764,12 +809,24 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
         """重新选择投递配图：作废旧选择并按“真实截图优先、AI 配图补足”重选，必要时覆盖远端草稿。"""
         return run_coroutine_sync(_impl_reselect_publication_assets(draft_id=draft_id))
 
+    @tool("plan_publication_assets")
+    def plan_publication_assets(draft_id: str = "") -> dict[str, Any]:
+        """只重新选择投递配图、**不投递**：把新的封面与正文插图选择落库，远端草稿保持不动。
+
+        用户想先看看“会选哪几张”“换一套图再投”时用这个；确认后投递用 publish_to_wechat_draft。
+        """
+        return run_coroutine_sync(
+            _impl_reselect_publication_assets(draft_id=draft_id, deliver=False)
+        )
+
     return [
         run_auto_review,
+        review_draft,
         rewrite_draft,
         read_current_draft,
         read_latest_review,
         apply_revision_issues,
+        plan_publication_assets,
         approve_draft,
         discard_draft,
         revoke_approval,

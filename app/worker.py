@@ -565,12 +565,20 @@ async def process_general_chat_job(
 
 
 async def process_auto_review_job(
-    _ctx: dict, draft_id: str, review_id: str, deliver: bool = True, chat_run_id: str | None = None,
+    _ctx: dict,
+    draft_id: str,
+    review_id: str,
+    deliver: bool = True,
+    chat_run_id: str | None = None,
+    revise: bool = True,
 ) -> None:
-    """在 Worker 中完成耗时审核、一轮自动改稿，并按需受控投递草稿箱。"""
+    """在 Worker 中完成耗时审核、（可选）一轮自动改稿，并按需受控投递草稿箱。
+
+    `revise=False` 时只出审核意见、不改稿——用户要“先看看审核怎么说”时走这条。
+    """
     logger.info(
-        "auto_review_job_started draft_id=%s review_id=%s deliver=%s chat_run_id=%s",
-        draft_id, review_id, deliver, chat_run_id or "-",
+        "auto_review_job_started draft_id=%s review_id=%s deliver=%s revise=%s chat_run_id=%s",
+        draft_id, review_id, deliver, revise, chat_run_id or "-",
     )
     with SessionLocal() as session:
         repository = ContentRepository(session)
@@ -583,7 +591,9 @@ async def process_auto_review_job(
             # 让这次审核在“生成记录”里有可见的运行条目与阶段状态。
             repository.add_chat_agent_event(
                 chat_run_id, "自动审核中",
-                "正在按规则与模型审核当前文案与配图，并按意见改稿一轮。",
+                "正在按规则与模型审核当前文案与配图，并按意见改稿一轮。"
+                if revise
+                else "正在按规则与模型审核当前文案与配图；按你的要求只出意见，不改稿。",
                 "running",
                 metadata={"phase": "review", "state": "running", "draft_ids": [draft_id], "review_id": review_id},
             )
@@ -593,7 +603,7 @@ async def process_auto_review_job(
             repository = ContentRepository(session)
             result = await auto_review_and_create_wechat_draft(
                 settings, repository, draft_id, chat_agent_run_id=chat_run_id,
-                review_run_id=review_id, deliver=deliver,
+                review_run_id=review_id, deliver=deliver, revise=revise,
             )
             session.commit()
         logger.info("auto_review_job_finished draft_id=%s review_id=%s status=%s", draft_id, review_id, result.get("status"))
@@ -628,7 +638,10 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
         status = str(result.get("status") or "")
         issues = result.get("issues") or []
         # 审核结果的状态值有多个：仅审核通过与已投递都算通过，别把 approved_no_delivery 误报成未通过。
-        passed = status.startswith("approved") or status in {"delivered", "draft_created", "wechat_draft_created"}
+        passed = result.get("passed")
+        if passed is None:
+            passed = status.startswith("approved") or status in {"delivered", "draft_created", "wechat_draft_created"}
+        revise_disabled = bool(result.get("revise_disabled"))
         summary = (
             f"自动审核{'通过' if passed else '未通过'}：版本 {draft.version}；"
             f"共 {len(issues)} 条意见。"
@@ -636,7 +649,7 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
         fallback = f"自动审核{'通过' if passed else '未通过'}：当前文案版本 {draft.version}，共 {len(issues)} 条意见。"
         reply = await _compose_report(
             chat_run_id,
-            task="自动审核（含一轮按意见改稿）",
+            task="自动审核（仅出意见，未改稿）" if revise_disabled else "自动审核（含一轮按意见改稿）",
             facts={
                 "draft_title": (draft.title_options_json or ["当前文案"])[0],
                 "draft_version": draft.version,
@@ -645,6 +658,11 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
                 "issue_count": len(issues),
                 "issues": [str(item)[:120] for item in issues[:5]],
                 "delivery": "已按要求投递" if result.get("delivery") else "未投递",
+                # 只审不改时必须说清“没有改稿”，否则用户会以为文章已经被改过。
+                "revised": not revise_disabled,
+                "next_step": "需要的话我可以按这些意见改稿（apply_revision_issues）或重新审核。"
+                if revise_disabled
+                else None,
             },
             fallback=fallback,
         )
@@ -656,12 +674,18 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
         session.commit()
 
 
-async def process_wechat_delivery_job(_ctx: dict, draft_id: str, chat_run_id: str | None = None) -> None:
+async def process_wechat_delivery_job(
+    _ctx: dict, draft_id: str, chat_run_id: str | None = None, deliver: bool = True,
+) -> None:
     """后台完成公众号草稿的创建或原地覆盖，并在对话里汇报结果。
 
     投递要上传封面与正文图片、再调用微信写接口，耗时远超对话请求时限，因此独立成后台任务。
+    `deliver=False` 表示**只重新选择投递配图、不碰远端草稿**（用户想先看看选了哪几张时用）。
     """
-    logger.info("wechat_delivery_job_started draft_id=%s chat_run_id=%s", draft_id, chat_run_id or "-")
+    logger.info(
+        "wechat_delivery_job_started draft_id=%s chat_run_id=%s deliver=%s",
+        draft_id, chat_run_id or "-", deliver,
+    )
     with SessionLocal() as session:
         repository = ContentRepository(session)
         draft = repository.get_draft(draft_id)
@@ -669,23 +693,36 @@ async def process_wechat_delivery_job(_ctx: dict, draft_id: str, chat_run_id: st
         updating = bool(existing is not None and existing.wechat_draft_media_id)
         if chat_run_id:
             repository.add_chat_agent_event(
-                chat_run_id, "正在投递公众号草稿",
-                "正在上传封面与正文图片并写入公众号草稿箱；已存在远端草稿时会原地覆盖。",
+                chat_run_id,
+                "正在重新选择投递配图" if not deliver else "正在投递公众号草稿",
+                "只重新选择封面与正文插图并落库，不会创建或覆盖远端草稿。"
+                if not deliver
+                else "正在上传封面与正文图片并写入公众号草稿箱；已存在远端草稿时会原地覆盖。",
                 "running",
-                metadata={"phase": "text", "state": "running", "draft_ids": [draft_id], "delivery": True},
+                metadata={"phase": "text", "state": "running", "draft_ids": [draft_id], "delivery": deliver},
             )
         session.commit()
     try:
         with SessionLocal() as session:
             repository = ContentRepository(session)
             draft = repository.get_draft(draft_id)
-            from app.services.auto_delivery import retry_agent_selected_wechat_draft
+            from app.services.auto_delivery import (
+                prepare_agent_selected_wechat_assets,
+                retry_agent_selected_wechat_draft,
+            )
 
-            job = await retry_agent_selected_wechat_draft(settings, repository, draft_id)
+            if deliver:
+                job = await retry_agent_selected_wechat_draft(settings, repository, draft_id)
+            else:
+                # 只重选：走与投递同一条素材选择实现，但不创建/覆盖远端草稿。
+                job = await prepare_agent_selected_wechat_assets(settings, repository, draft_id)
             session.commit()
-        logger.info("wechat_delivery_job_finished draft_id=%s state=%s", draft_id, job.state)
+        logger.info("wechat_delivery_job_finished draft_id=%s state=%s deliver=%s", draft_id, job.state, deliver)
         if chat_run_id:
-            await _report_wechat_delivery_result(chat_run_id, draft_id, updating=updating, error="")
+            if deliver:
+                await _report_wechat_delivery_result(chat_run_id, draft_id, updating=updating, error="")
+            else:
+                await _report_publication_selection_result(chat_run_id, draft_id, job)
     except asyncio.CancelledError:
         if chat_run_id:
             await _report_wechat_delivery_result(chat_run_id, draft_id, updating=updating, error="投递任务超时，已停止。")
@@ -695,6 +732,35 @@ async def process_wechat_delivery_job(_ctx: dict, draft_id: str, chat_run_id: st
         if chat_run_id:
             await _report_wechat_delivery_result(chat_run_id, draft_id, updating=updating, error=str(exc)[:200])
         raise
+
+
+async def _report_publication_selection_result(chat_run_id: str, draft_id: str, job) -> None:
+    """只重选配图时的汇报：说清选了哪几张、没有投递。"""
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        chat_run = repository.get_chat_agent_run(chat_run_id)
+        draft = repository.get_draft(draft_id)
+        title = (draft.title_options_json or ["当前草稿"])[0]
+        inline_count = len(job.inline_asset_ids_json or [])
+        reply = await _compose_report(
+            chat_run_id,
+            task="重新选择投递配图（未投递）",
+            facts={
+                "draft_title": title,
+                "cover_asset_id": job.cover_asset_id,
+                "inline_count": inline_count,
+                "delivered": False,
+                "note": "只重新选择并保存了投递配图，没有创建或覆盖公众号草稿",
+            },
+            fallback=f"已为《{title}》重新选择投递配图：封面 1 张、正文插图 {inline_count} 张；未投递。",
+        )
+        if chat_run.response_message_id:
+            repository.append_run_reply(chat_run_id, reply)
+        repository.finish_chat_agent_run(
+            chat_run_id, chat_run.response_message_id, ConversationRunStatus.COMPLETED,
+            f"已重新选择配图（未投递）：封面 1 张、正文 {inline_count} 张", [{"draft_id": draft_id}],
+        )
+        session.commit()
 
 
 async def _report_wechat_delivery_result(chat_run_id: str, draft_id: str, *, updating: bool, error: str) -> None:

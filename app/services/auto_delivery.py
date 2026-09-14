@@ -422,11 +422,13 @@ async def auto_review_and_create_wechat_draft(
     chat_agent_run_id: str | None = None,
     review_run_id: str | None = None,
     deliver: bool = True,
+    revise: bool = True,
 ) -> dict:
     """审核通过后可创建远端草稿；不调用 submit_draft，因此绝不发表。
 
-    `deliver=False` 表示“仅审核”：不选投递素材、不创建公众号草稿，只给出审核意见与
-    按意见进行的一轮改稿。只要审核给出可执行意见，**通过与否都会先改稿一轮再复审**。
+    `deliver=False` 表示“仅审核”：不选投递素材、不创建公众号草稿。
+    `revise=False` 表示**只出意见、不改稿**（用户要“先看审核意见再说”时用这个）；
+    默认 `revise=True`：只要审核给出可执行意见，通过与否都会先改稿一轮再复审。
     """
     settings = load_runtime_settings(settings)
     revision_count = 0
@@ -485,7 +487,12 @@ async def auto_review_and_create_wechat_draft(
             review_id=run.id, revision_count=revision_count,
         )
         issues = revision_issues(review.rule_report, review.model_report)
-        can_revise = bool(issues) and review.error_message is None and revision_count < MAX_AUTO_REVIEW_REVISIONS
+        can_revise = (
+            revise
+            and bool(issues)
+            and review.error_message is None
+            and revision_count < MAX_AUTO_REVIEW_REVISIONS
+        )
         if review.passed and not can_revise:
             _record_review_event(
                 repository, chat_agent_run_id, "自动审核通过",
@@ -505,13 +512,18 @@ async def auto_review_and_create_wechat_draft(
         if not can_revise:
             detail = review.error_message or "；".join(issues) or "自动审核未通过"
             _record_review_event(
-                repository, chat_agent_run_id, "自动审核未通过", detail, "rejected",
+                repository, chat_agent_run_id,
+                "审核完成（按你的要求未改稿）" if not revise else "自动审核未通过",
+                detail, "rejected",
                 review_id=run.id, revision_count=revision_count, issues=issues,
             )
             return {
                 "review_id": run.id,
-                "status": "failed",
-                "error": review.error_message or "自动审核未通过",
+                # revise=False 时这是“只出意见”的结果：审核本身跑完了，只是没通过 / 没改稿。
+                "status": "reviewed" if not revise else "failed",
+                "passed": review.passed,
+                "revise_disabled": not revise,
+                "error": None if not revise else (review.error_message or "自动审核未通过"),
                 "issues": issues,
                 "revision_count": revision_count,
             }

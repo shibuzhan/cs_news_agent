@@ -59,12 +59,16 @@ def test_action_tools_are_registered_for_the_session() -> None:
 
     assert names == {
         "run_auto_review",
+        # 只审不改：用户要“先看看审核怎么说”时用这个。
+        "review_draft",
         "rewrite_draft",
         # 只读零件：让 Agent 自己先看现状与历史意见，再决定动作。
         "read_current_draft",
         "read_latest_review",
         # 动作零件：只负责“按这些意见改这一稿”，不替 Agent 决定流程。
         "apply_revision_issues",
+        # 只重选配图、不投递。
+        "plan_publication_assets",
         "approve_draft",
         "discard_draft",
         "revoke_approval",

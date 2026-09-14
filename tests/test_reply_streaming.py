@@ -214,5 +214,5 @@ def test_worker_reports_through_the_streaming_helper() -> None:
     source = inspect.getsource(worker)
 
     assert "compose_task_reply_streaming" in inspect.getsource(worker._compose_report)
-    # 所有汇报路径都必须走统一入口（新增按审核意见改稿后是 5 条），避免又出现“某条路径不会流式”的漏网。
-    assert source.count("await _compose_report(") == 5
+    # 所有汇报路径都必须走统一入口（新增改稿与配图选择汇报后是 6 条），避免漏网。
+    assert source.count("await _compose_report(") == 6
