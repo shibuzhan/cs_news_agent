@@ -32,7 +32,10 @@ def test_delivery_job_reports_through_the_model() -> None:
 
     assert "retry_agent_selected_wechat_draft" in source
     assert "_report_wechat_delivery_result" in source
-    assert "compose_task_reply" in inspect.getsource(worker._report_wechat_delivery_result)
+    # 汇报统一走 _compose_report：它内部会用流式版本（失败自动回退非流式）。
+    report_source = inspect.getsource(worker._report_wechat_delivery_result)
+    assert "_compose_report" in report_source
+    assert "compose_task_reply_streaming" in inspect.getsource(worker._compose_report)
 
 
 def test_source_image_download_budget_is_short() -> None:

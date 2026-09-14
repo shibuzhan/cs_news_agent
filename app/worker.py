@@ -15,6 +15,8 @@ from app.domain.models import AgentCollectCommand, ConversationRunStatus, RawSou
 from app.jobs import enqueue_collection_finalizer, enqueue_image_generation_job
 from app.observability import configure_observability
 from app.services.auto_delivery import auto_review_and_create_wechat_draft
+from app.services.chat_dispatch import ChatDispatchContext, dispatch_chat_message
+from app.services.reply_stream import streaming_run
 from app.services.generator import GenerationError, build_generator
 from app.services.model_errors import sanitize_failure_text
 from app.services.source_snapshots import DraftSourceSnapshotStore
@@ -146,6 +148,34 @@ def _finish_failed_run(chat_run_id: str, response_message_id: str, detail: str, 
             )
 
 
+async def _compose_report(
+    run_id: str | None, *, task: str, facts: dict, fallback: str
+) -> str:
+    """任务汇报：开启流式时边生成边推送（SSE），失败自动回退非流式。
+
+    结构化路径（生成/审核/改稿）不受影响：它们要求完整 JSON，无法边生成边用。
+    """
+    from app.services.reply_stream import StreamPublisher, stream_enabled
+    from app.services.task_narration import compose_task_reply_streaming
+
+    if not run_id or not stream_enabled():
+        return await asyncio.to_thread(
+            compose_task_reply, settings, task=task, facts=facts, fallback=fallback, run_id=run_id or ""
+        )
+    publisher = StreamPublisher(run_id, "report")
+    reply = await asyncio.to_thread(
+        compose_task_reply_streaming,
+        settings,
+        task=task,
+        facts=facts,
+        fallback=fallback,
+        run_id=run_id,
+        on_delta=publisher.delta,
+    )
+    publisher.done(reply, status="completed")
+    return reply
+
+
 def _generation_failure_detail(exc: Exception, *, preserved_draft: bool = False) -> str:
     """面向运营人员显示安全失败原因，不泄露供应商响应或密钥。"""
     if isinstance(exc, GenerationError):
@@ -190,13 +220,16 @@ async def process_collection_job(
             agent = ContentMainAgent(
                 build_source_tools(client, job_settings), build_generator(job_settings), settings=job_settings
             )
-            result = await agent.run(
-                AgentCollectCommand(
-                    sources=[SourceKind(name) for name in source_names],
-                    limit=limit,
-                    target=target,
+            # 正文生成是全程最慢的一步（一次调用 9–12 分钟）：把 body 边写边推给对话页，
+            # 用户能看到“正在写正文”，而不是长时间黑箱等待。流式失败只影响可见性，不影响生成。
+            with streaming_run(chat_run_id, "draft"):
+                result = await agent.run(
+                    AgentCollectCommand(
+                        sources=[SourceKind(name) for name in source_names],
+                        limit=limit,
+                        target=target,
+                    )
                 )
-            )
         conversation_status, summary, event_status = collection_completion(result)
         draft_ids = [draft_id for source_run in getattr(result, "runs", []) for draft_id in source_run.get("created_draft_ids", [])]
         image_task_ids: list[str] = []
@@ -351,9 +384,10 @@ async def process_draft_regeneration_job(
             repository = ContentRepository(session)
             # 与采集任务保持一致：同步生成放到线程里执行，避免阻塞事件循环（否则生成期间的
             # 健康检查、图片任务与 ARQ 超时都会被卡住），并让内部检索在独立线程的循环里运行。
-            regenerated = await asyncio.to_thread(
-                _regenerate_draft_in_thread, settings, draft_id, raw
-            )
+            with streaming_run(chat_run_id, "draft"):
+                regenerated = await asyncio.to_thread(
+                    _regenerate_draft_in_thread, settings, draft_id, raw
+                )
             repository.update_chat_session_memory(
                 session_id, active_draft_id=draft_id,
                 summary="本会话当前草稿已在原生成记录内重新生成。",
@@ -450,70 +484,71 @@ async def process_draft_regeneration_job(
 
 
 async def process_general_chat_job(
-    _ctx: dict, chat_run_id: str, session_id: str, content: str,
+    _ctx: dict,
+    chat_run_id: str,
+    session_id: str,
+    content: str,
+    attachment_id: str | None = None,
+    auto_review: bool = False,
+    auto_illustration: bool = False,
 ) -> None:
-    """在后台完成带记忆的普通会话，HTTP 请求只负责保存用户消息。"""
+    """对话派发：HTTP 只保存用户消息并写回执，这里才做意图识别与工具执行。
+
+    运行在受理时已经建好（含一条确定性回执消息）：这里只负责推进它，
+    结束时把最终回复**追加**为新消息，运行卡片随之显示完成状态。
+    """
     logger.info(
         "general_chat_job_started run_id=%s session_id=%s content_length=%s",
         chat_run_id, session_id, len(content),
     )
-    with SessionLocal() as session:
-        repository = ContentRepository(session)
-        run = repository.get_chat_agent_run(chat_run_id)
-        if run.status != ConversationRunStatus.RUNNING.value:
-            logger.info("general_chat_job_skipped run_id=%s status=%s", chat_run_id, run.status)
-            return
-        repository.add_chat_agent_event(
-            chat_run_id,
-            "会话回复生成中",
-            "正在读取当前会话上下文并生成回复。",
-            "running",
-            metadata={"phase": "chat", "state": "running"},
-        )
-        session.commit()
+    outcome = None
     try:
-        resolution = await ContentDeepAgent(settings).resolve(session_id, content, False)
-    except Exception as exc:  # resolve 本身会安全分类；此处仅保护历史 Worker 任务。
-        logger.exception("general_chat_response_failed run_id=%s error_type=%s", chat_run_id, type(exc).__name__)
-        resolution = None
-    with SessionLocal() as session:
-        repository = ContentRepository(session)
-        run = repository.get_chat_agent_run(chat_run_id)
-        if run.status != ConversationRunStatus.RUNNING.value:
-            logger.info("general_chat_result_ignored run_id=%s status=%s", chat_run_id, run.status)
-            return
-        if resolution and resolution.success:
-            reply = resolution.decision.reply
-            status = ConversationRunStatus.COMPLETED
-            summary = "已完成会话回复"
-            error_message = None
-            title = "会话回复已生成"
-            detail = "已基于当前会话的受控上下文生成回复。"
-            event_status = "completed"
-        else:
-            status = ConversationRunStatus.FAILED
-            summary = (
-                resolution.decision.reply if resolution else "对话模型暂时不可用，未执行任何业务操作。请稍后重试。"
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            run = repository.get_chat_agent_run(chat_run_id)
+            if run.status != ConversationRunStatus.RUNNING.value:
+                logger.info("general_chat_job_skipped run_id=%s status=%s", chat_run_id, run.status)
+                return
+            ctx = ChatDispatchContext(
+                settings=settings,
+                repository=repository,
+                session=session,
+                session_id=session_id,
+                run_id=chat_run_id,
+                content=content,
+                attachment_id=attachment_id,
+                auto_review=auto_review,
+                auto_illustration=auto_illustration,
             )
-            error_message = summary
-            reply = summary
-            title = "会话回复未完成"
-            detail = "未执行采集、配图、改稿或发布操作；用户消息和会话上下文均已保留。"
-            event_status = "failed"
-        assistant_message = repository.create_chat_message(session_id, "assistant", reply)
-        repository.add_chat_agent_event(
-            chat_run_id, title, detail, event_status,
-            metadata={
-                "phase": "chat",
-                "state": "completed" if status == ConversationRunStatus.COMPLETED else "failed",
-                "failure_kind": None if not resolution else resolution.failure_kind,
-            },
-        )
-        repository.finish_chat_agent_run(
-            chat_run_id, assistant_message.id, status, summary, [], error_message,
-        )
-        session.commit()
-    logger.info("general_chat_job_finished run_id=%s status=%s", chat_run_id, status.value)
+            outcome = await dispatch_chat_message(ctx)
+            if outcome.keep_running:
+                if outcome.summary:
+                    run.summary = outcome.summary
+                session.commit()
+                logger.info("general_chat_job_handed_off run_id=%s summary=%s", chat_run_id, outcome.summary)
+                return
+            message_id = run.response_message_id
+            if outcome.reply:
+                message_id = repository.append_run_reply(chat_run_id, outcome.reply)
+            repository.finish_chat_agent_run(
+                chat_run_id, message_id, outcome.status, outcome.summary,
+                outcome.results, outcome.error,
+            )
+            session.commit()
+    except Exception as exc:
+        logger.exception("general_chat_job_failed run_id=%s error_type=%s", chat_run_id, type(exc).__name__)
+        anchor = None
+        try:
+            with SessionLocal() as session:
+                anchor = ContentRepository(session).get_chat_agent_run(chat_run_id).response_message_id
+        except RepositoryError:
+            logger.warning("general_chat_failed_run_missing run_id=%s", chat_run_id)
+        _finish_failed_run(chat_run_id, anchor, str(exc), "对话派发失败")
+        return
+    logger.info(
+        "general_chat_job_finished run_id=%s status=%s",
+        chat_run_id, outcome.status.value if outcome else "unknown",
+    )
 
 
 async def process_auto_review_job(
@@ -586,9 +621,8 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
             f"共 {len(issues)} 条意见。"
         )
         fallback = f"自动审核{'通过' if passed else '未通过'}：当前文案版本 {draft.version}，共 {len(issues)} 条意见。"
-        reply = await asyncio.to_thread(
-            compose_task_reply,
-            settings,
+        reply = await _compose_report(
+            chat_run_id,
             task="自动审核（含一轮按意见改稿）",
             facts={
                 "draft_title": (draft.title_options_json or ["当前文案"])[0],
@@ -600,7 +634,6 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
                 "delivery": "已按要求投递" if result.get("delivery") else "未投递",
             },
             fallback=fallback,
-            run_id=chat_run_id,
         )
         if chat_run.response_message_id:
             repository.append_run_reply(chat_run_id, reply)
@@ -664,9 +697,8 @@ async def _report_wechat_delivery_result(chat_run_id: str, draft_id: str, *, upd
             f"投递失败：{error}" if error
             else f"{'已更新' if updating else '已创建'}公众号草稿（{title}），未提交发表。"
         )
-        reply = await asyncio.to_thread(
-            compose_task_reply,
-            settings,
+        reply = await _compose_report(
+            chat_run_id,
             task="投递到微信公众号草稿箱",
             facts={
                 "draft_title": title,
@@ -676,7 +708,6 @@ async def _report_wechat_delivery_result(chat_run_id: str, draft_id: str, *, upd
                 "note": "只创建或更新草稿箱内容，绝不发表",
             },
             fallback=fallback,
-            run_id=chat_run_id,
         )
         if chat_run.response_message_id:
             repository.append_run_reply(chat_run_id, reply)
@@ -871,9 +902,8 @@ async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_me
         )
         if message_id:
             # 全流程结束：把配图与审核的真实结果交给模型写最终汇报（是否追问由模型按结果决定）。
-            reply = await asyncio.to_thread(
-                compose_task_reply,
-                settings,
+            reply = await _compose_report(
+                chat_run_id,
                 task="生成配图" if run_intent == ConversationIntent.GENERATE_DRAFT_IMAGE.value else "采集→配图→自动审核全流程结束",
                 facts={
                     "task_intent": run_intent,
@@ -895,7 +925,6 @@ async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_me
                     "summary": summary,
                 },
                 fallback=summary,
-                run_id=chat_run_id,
             )
             # 完成后**新消息回复**：占位消息保留，结果作为新消息追加并前移运行指针。
             reply_message_id = repository.append_run_reply(chat_run_id, reply)

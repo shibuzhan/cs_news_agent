@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -10,7 +12,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -45,7 +47,7 @@ from app.services.attachments import (
     PrivateAttachmentStore,
     validate_image_attachment,
 )
-from app.services.agent_commands import parse_agent_command
+from app.services.chat_receipts import plan_chat_message
 from app.services.plain_text import SOURCE_FOOTER_PREFIXES, normalize_wechat_description
 from app.services.task_narration import compose_task_reply
 from app.services.review_feedback import normalized_review_report
@@ -62,7 +64,12 @@ from app.tools.auto_review import AutoReviewTool
 from app.tools.image_generation import ImageGenerationError, ImageGenerationTool
 from app.tools.illustration_planner import PublicationAssetSelectionError
 from app.tools.wechat_official_account import WechatOfficialAccountTool
-from app.jobs import enqueue_auto_review_job, enqueue_collection_job, enqueue_draft_regeneration_job
+from app.jobs import (
+    enqueue_auto_review_job,
+    enqueue_collection_job,
+    enqueue_draft_regeneration_job,
+    enqueue_general_chat_job,
+)
 from app.storage.repositories import (
     AttachmentNotFound,
     ContentRepository,
@@ -71,7 +78,7 @@ from app.storage.repositories import (
     RepositoryError,
     WechatPublicationNotFound,
 )
-from app.storage.database import get_session
+from app.storage.database import SessionLocal, get_session
 from app.storage.tables import (
     AgentRunRow,
     AttachmentRow,
@@ -111,6 +118,9 @@ from app.services.runtime_settings import (
 router = APIRouter()
 SessionDependency = Annotated[Session, Depends(get_session)]
 logger = logging.getLogger("news_agent.chat")
+
+# 单条运行的事件流最长存活时间：超时后客户端会重新连接（浏览器 EventSource 自动重连）。
+CHAT_STREAM_MAX_SECONDS = 900
 
 
 class ModelProfileInput(BaseModel):
@@ -478,67 +488,6 @@ def attachment_to_dict(row: AttachmentRow, settings: Settings) -> dict[str, Any]
             f"{settings.app_base_url}/api/attachments/{row.id}/download?token={token}"
         ),
     }
-
-
-async def _bind_explicit_image_attachment(
-    settings: Settings,
-    repository: ContentRepository,
-    session_id: str,
-    attachment: AttachmentRow,
-    draft_id: str,
-    purpose: str,
-    placement_after_paragraph: int,
-) -> tuple[str, str]:
-    """将明确引用的聊天图片复制为草稿独立素材，避免与聊天附件共享删除生命周期。"""
-    if attachment.content_type not in {"image/jpeg", "image/png"}:
-        raise HTTPException(status_code=400, detail="当前附件不是可用图片，请选择 JPG、JPEG 或 PNG 图片")
-    store = PrivateAttachmentStore(settings)
-    workspace = AgentWorkspaceStore(settings)
-    try:
-        try:
-            content = workspace.read(session_id, attachment.id, attachment.original_name)
-        except AttachmentAccessError:
-            # 仅用户已明确要求将本图片用于草稿时，才允许为历史附件补建工作区副本。
-            content = await run_in_threadpool(store.read, attachment.object_key)
-            await run_in_threadpool(workspace.write, session_id, attachment.id, attachment.original_name, content)
-        validate_image_attachment(attachment.original_name, content, attachment.content_type, settings)
-        object_key, content_hash = await run_in_threadpool(
-            store.upload, attachment.original_name, content, attachment.content_type
-        )
-    except AttachmentError as exc:
-        raise HTTPException(status_code=503, detail="图片附件暂时不可读取或保存") from exc
-    asset = repository.create_publication_asset(
-        attachment.original_name,
-        attachment.content_type,
-        object_key,
-        len(content),
-        content_hash,
-    )
-    illustration = repository.create_draft_illustration(
-        draft_id,
-        asset.id,
-        purpose,
-        placement_after_paragraph,
-        prompt="用户明确引用聊天附件作为草稿图片",
-        provider="user_upload",
-        model=None,
-    )
-    return illustration.id, asset.id
-
-
-def _current_editable_draft(repository: ContentRepository, session_id: str) -> DraftRow | None:
-    """仅使用当前会话明确记忆的草稿，禁止把全局最新草稿误当成用户目标。"""
-    memory = repository.get_chat_session_memory(session_id)
-    if not memory.active_draft_id:
-        return None
-    try:
-        draft = repository.get_draft(memory.active_draft_id)
-    except DraftNotFound:
-        repository.update_chat_session_memory(session_id, clear_draft=True)
-        return None
-    if draft.status not in {"pending_review", "needs_revision", "ready_to_publish"}:
-        return None
-    return draft
 
 
 def publication_asset_to_dict(row: PublicationAssetRow, settings: Settings) -> dict[str, Any]:
@@ -967,6 +916,10 @@ def get_chat_session(
     session: SessionDependency,
 ) -> dict[str, Any]:
     repository = ContentRepository(session)
+    # 对话页每 2 秒轮询这个接口：顺带收束失联任务，否则一条僵死运行会让页面永远显示“正在处理中”，
+    # 也会让前端一直轮询下去（真实反馈：已完成的任务下方状态没有更新）。
+    if reconcile_stale_generation_runs(settings, repository):
+        session.commit()
     chat_session = repository.get_chat_session(session_id)
     return {
         "session": chat_session_to_dict(chat_session),
@@ -993,6 +946,121 @@ def reconcile_stale_generation_runs(
     if rows:
         logger.warning("stale_generation_runs_reconciled count=%s", len(rows))
     return len(rows)
+
+
+@router.get("/chat/agent-runs/{run_id}/stream")
+async def stream_chat_agent_run(
+    run_id: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    session: SessionDependency,
+) -> StreamingResponse:
+    """SSE：把这条运行的回复增量、里程碑与结束状态推给前端。
+
+    没有增量（模型不支持 stream、Redis 不可用、或断开）时会自动退化成按数据库轮询：
+    连接期间始终以数据库为**事实来源**，最终一定下发完整文本与 done。
+    """
+    ContentRepository(session).get_chat_agent_run(run_id)
+    return StreamingResponse(
+        _chat_run_event_stream(run_id, settings),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # 反向代理不得缓冲，否则增量会被攒到最后一起发（curl -N 看不到分片）。
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse_frame(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _chat_run_event_stream(run_id: str, settings: Settings):
+    """增量优先、数据库兜底的运行事件流。"""
+    import redis.asyncio as aioredis
+
+    from app.services.reply_stream import channel_for, read_buffer
+
+    yield _sse_frame("open", {"run_id": run_id})
+    emitted_text = ""
+    buffered = await run_in_threadpool(read_buffer, run_id)
+    if buffered:
+        emitted_text = buffered
+        yield _sse_frame("delta", {"kind": "buffer", "text": buffered})
+
+    client = aioredis.from_url(settings.redis_url, socket_timeout=5, socket_connect_timeout=2)
+    pubsub = client.pubsub()
+    last_event_count = 0
+    deadline = datetime.now(UTC) + timedelta(seconds=CHAT_STREAM_MAX_SECONDS)
+    try:
+        try:
+            await pubsub.subscribe(channel_for(run_id))
+        except Exception as exc:  # noqa: BLE001 - Redis 不可用时退化为轮询
+            logger.warning("chat_stream_subscribe_failed run_id=%s error_type=%s", run_id, type(exc).__name__)
+        while datetime.now(UTC) < deadline:
+            message = None
+            try:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=2.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("chat_stream_poll_failed run_id=%s error_type=%s", run_id, type(exc).__name__)
+                await asyncio.sleep(1.0)
+            if message and message.get("data"):
+                try:
+                    payload = json.loads(message["data"])
+                except (TypeError, ValueError):
+                    payload = None
+                if payload:
+                    if payload.get("text"):
+                        emitted_text = payload["text"] if payload.get("type") == "done" else emitted_text + payload["text"]
+                        yield _sse_frame("delta", payload)
+                    elif payload.get("reset"):
+                        # 换一篇正文：告诉前端清空这一类别的临时文本。
+                        yield _sse_frame("delta", payload)
+                    if payload.get("type") == "done":
+                        # 不在这里结束：这个 done 可能只是“对话回复结束”，运行还在继续
+                        # （例如正文仍在写）。是否结束由下面按数据库里的运行状态决定。
+                        yield _sse_frame("done", payload)
+            with SessionLocal() as poll_session:
+                repository = ContentRepository(poll_session)
+                try:
+                    run = repository.get_chat_agent_run(run_id)
+                except RepositoryError:
+                    yield _sse_frame("done", {"status": "deleted", "text": emitted_text})
+                    return
+                events = repository.list_chat_agent_events(run_id)
+                if len(events) > last_event_count:
+                    for event in events[last_event_count:]:
+                        yield _sse_frame(
+                            "milestone",
+                            {
+                                "title": event.title,
+                                "detail": event.detail,
+                                "status": event.status,
+                                "created_at": event.created_at.isoformat() if event.created_at else None,
+                            },
+                        )
+                    last_event_count = len(events)
+                if run.status != ConversationRunStatus.RUNNING.value:
+                    final_text = emitted_text
+                    if run.response_message_id:
+                        final_message = poll_session.get(ChatMessageRow, run.response_message_id)
+                        if final_message is not None:
+                            final_text = final_message.content
+                    yield _sse_frame(
+                        "done",
+                        {"status": run.status, "text": final_text, "summary": run.summary or ""},
+                    )
+                    return
+            yield ": keep-alive\n\n"
+    finally:
+        try:
+            await pubsub.unsubscribe(channel_for(run_id))
+            await pubsub.aclose()
+            await client.aclose()
+        except Exception:  # noqa: BLE001 - 关闭失败不影响已经发出的帧
+            logger.debug("chat_stream_close_failed run_id=%s", run_id)
+    yield _sse_frame("done", {"status": "timeout", "text": emitted_text})
 
 
 @router.get("/chat/agent-runs/active")
@@ -1258,6 +1326,12 @@ async def send_chat_message(
     settings: Annotated[Settings, Depends(get_settings)],
     session: SessionDependency,
 ) -> dict[str, Any]:
+    """写入用户消息 + 确定性回执后**立即返回**；意图识别与执行都在 Worker 里完成。
+
+    真实反馈：“为什么直到任务结束才响应聊天”。此前这个接口同步跑模型意图识别，甚至
+    同步等一张图片生成完，整个过程里对话没有任何回应。现在这里不调用任何模型，
+    响应时间只取决于本地数据库写入与一次入队。
+    """
     repository = ContentRepository(session)
     user_message = repository.create_chat_message(session_id, "user", command.content)
     repository.set_first_instruction_title(session_id, command.content)
@@ -1292,434 +1366,57 @@ async def send_chat_message(
             assistant_message = repository.create_chat_message(session_id, "assistant", f"脚本未执行：{exc}")
         session.commit()
         return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
-    agent = ChatAgent()
-    attachment_extraction_requested = agent.requests_attachment_extraction(command.content, command.attachment_id)
-    decision = None
-    resolution = None
-    if not attachment_extraction_requested:
-        # 界面按钮发来的明确命令：先确定性解析并交给 Agent 工具执行，不消耗模型意图识别。
-        command_response = await _run_agent_command(
-            settings, repository, session, session_id, user_message, command
-        )
-        if command_response is not None:
-            return command_response
-        # 先提交用户消息，前端可立即显示；后续由同一 session_id 的 DeepAgent 恢复 checkpoint 决策。
-        session.commit()
-        resolution = await ContentDeepAgent(settings).resolve(
-            session_id, command.content, command.attachment_id is not None,
-        )
-        decision = resolution.decision
-        logger.info(
-            "chat_deep_agent_resolved session_id=%s intent=%s attachment=%s success=%s failure_kind=%s",
-            session_id, decision.intent.value, command.attachment_id is not None,
-            resolution.success, resolution.failure_kind,
-        )
-    if command.attachment_id and decision and decision.intent == ConversationIntent.GENERATE_DRAFT_IMAGE:
-        attachment = repository.get_attachment(command.attachment_id)
-        if attachment.session_id != session_id:
-            raise HTTPException(status_code=400, detail="附件不属于当前对话")
-        purpose, placement_after_paragraph = decision.image_purpose, decision.placement_after_paragraph
-        run = repository.create_chat_agent_run(
-            session_id, user_message.id, ConversationIntent.GENERATE_DRAFT_IMAGE,
+    plan = plan_chat_message(command.content, has_attachment=command.attachment_id is not None)
+    run = repository.create_chat_agent_run(
+        session_id, user_message.id, plan.intent, command.auto_review, command.auto_illustration,
+    )
+    receipt = repository.create_chat_message(session_id, "assistant", plan.text)
+    run.response_message_id = receipt.id
+    run.summary = plan.status
+    repository.add_chat_agent_event(
+        run.id,
+        "已收到指令",
+        plan.event_detail(),
+        "running",
+        metadata={
+            "phase": "intake",
+            "state": "running",
+            "steps": list(plan.steps),
+            "auto_review": command.auto_review,
+            "auto_illustration": command.auto_illustration,
+        },
+    )
+    # 先提交这条确定性回执：前端下一次轮询（2 秒）就能看到，且耗时与模型、图片生成完全无关。
+    session.commit()
+    try:
+        job_id = await enqueue_general_chat_job(
+            settings, run.id, session_id, command.content, command.attachment_id,
             command.auto_review, command.auto_illustration,
         )
-        repository.add_chat_agent_event(
-            run.id,
-            "识别附件图片用途",
-            f"用户明确要求将当前图片用作{'封面' if purpose == 'cover' else f'正文第 {placement_after_paragraph} 段后插图'}。",
-            metadata={"phase": "image", "state": "binding", "purpose": purpose},
-        )
-        target = _current_editable_draft(repository, session_id)
-        if target is None:
-            reply = "当前会话还没有已选择的可编辑草稿。请先生成草稿，或明确告诉我需要处理哪篇文章。"
-            status = ConversationRunStatus.FAILED
-            results: list[dict[str, Any]] = []
-            repository.add_chat_agent_event(run.id, "图片绑定未执行", reply, "failed", metadata={"phase": "image", "state": "failed"})
-        else:
-            try:
-                repository.add_chat_agent_event(
-                    run.id,
-                    "读取受控工作区图片",
-                    "已按明确指令读取当前会话图片；未发送给无关服务。",
-                    "running",
-                    metadata={"phase": "image", "state": "reading"},
-                )
-                illustration_id, asset_id = await _bind_explicit_image_attachment(
-                    settings, repository, session_id, attachment, target.id, purpose, placement_after_paragraph
-                )
-                reply = f"已将“{attachment.original_name}”设为“{(target.title_options_json or ['草稿'])[0]}”的{'封面' if purpose == 'cover' else f'第 {placement_after_paragraph} 段后插图'}，可在生成记录中调整或移除。"
-                status = ConversationRunStatus.COMPLETED
-                results = [{"tool": "bind_uploaded_image", "draft_id": target.id, "illustration_id": illustration_id, "asset_id": asset_id, "purpose": purpose, "placement_after_paragraph": placement_after_paragraph}]
-                repository.add_chat_agent_event(
-                    run.id,
-                    "图片已绑定到草稿",
-                    "图片已复制为草稿私有素材，未上传公众号。",
-                    metadata={"phase": "image", "state": "completed", **results[0]},
-                )
-            except HTTPException as exc:
-                reply = str(exc.detail)
-                status = ConversationRunStatus.FAILED
-                results = []
-                repository.add_chat_agent_event(run.id, "图片绑定失败", reply, "failed", metadata={"phase": "image", "state": "failed"})
-        assistant_message = repository.create_chat_message(session_id, "assistant", reply)
+    except Exception as exc:
+        logger.exception("chat_dispatch_enqueue_failed run_id=%s error_type=%s", run.id, type(exc).__name__)
+        failure = repository.create_chat_message(session_id, "assistant", "后台队列不可用，请稍后重试。")
         repository.finish_chat_agent_run(
-            run.id, assistant_message.id, status, reply, results,
-            reply if status == ConversationRunStatus.FAILED else None,
+            run.id, failure.id, ConversationRunStatus.FAILED, "后台队列不可用", [], str(exc)
         )
         session.commit()
-        return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": chat_agent_run_to_dict(run, repository)}
-
-    target_draft = _current_editable_draft(repository, session_id)
-    if decision and decision.intent == ConversationIntent.REGENERATE_DRAFT and target_draft is not None:
-        origin_run = repository.find_generation_run_for_draft(target_draft.id)
-        if origin_run is None:
-            reply = "当前草稿缺少可回溯的原生成记录，未创建新任务；请先在生成记录中选择原文案后重试。"
-            assistant_message = repository.create_chat_message(session_id, "assistant", reply)
-            session.commit()
-            return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
-        assistant_message = repository.create_chat_message(
-            session_id, "assistant", "已在原生成记录内发起重新获取，将更新原草稿版本，不会新建文章或生成记录。"
-        )
-        repository.reopen_generation_run(
-            origin_run, assistant_message.id, command.auto_review,
-            command.auto_illustration or decision.auto_illustration,
-        )
-        repository.add_chat_agent_event(
-            origin_run.id,
-            "重新获取项目内容",
-            f"将更新原草稿版本 {target_draft.version}，保留原来源、图片和审核记录。",
-            "running",
-            metadata={"phase": "text", "state": "running", "draft_ids": [target_draft.id], "regeneration": True},
-        )
-        session.commit()
-        try:
-            job_id = await enqueue_draft_regeneration_job(
-                settings, origin_run.id, session_id, assistant_message.id, target_draft.id,
-                origin_run.auto_review_requested, origin_run.auto_illustration_requested,
-            )
-            repository.add_chat_agent_event(
-                origin_run.id, "正在重新生成文案", f"任务编号：{job_id}；将用来源快照重建正文并覆盖为新版本。",
-                metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [target_draft.id], "regeneration": True},
-            )
-            session.commit()
-        except Exception as exc:
-            logger.exception("draft_regeneration_enqueue_failed run_id=%s error_type=%s", origin_run.id, type(exc).__name__)
-            repository.update_chat_message(assistant_message.id, "原记录重生成任务未能入队，请稍后重试。")
-            repository.finish_chat_agent_run(origin_run.id, assistant_message.id, ConversationRunStatus.FAILED, "原记录重生成入队失败", [], str(exc))
-            session.commit()
-        return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": chat_agent_run_to_dict(origin_run, repository)}
-
-    target_draft = _current_editable_draft(repository, session_id)
-    if decision and decision.intent == ConversationIntent.RUN_AUTO_REVIEW and target_draft is not None:
-        # 先清理超时/被重启打断的僵死审核记录，否则它会一直挡住新的审核。
-        repository.expire_stale_auto_review_run(target_draft.id, settings.collection_job_timeout_seconds)
-        session.commit()
-        existing_review = repository.find_active_auto_review_run(target_draft.id)
-        if existing_review is not None:
-            assistant_message = repository.create_chat_message(
-                session_id, "assistant", "这篇的自动审核已经在处理中，完成后我会汇报结果。"
-            )
-            session.commit()
-            return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
-        review_run = repository.create_auto_review_run(target_draft.id, None, status="queued")
-        # 审核也要有一条可见的运行记录，否则用户在“生成记录”里看不到任何正在跑的任务。
-        chat_run = repository.create_chat_agent_run(
-            session_id, user_message.id, ConversationIntent.RUN_AUTO_REVIEW, False, False
-        )
-        repository.add_chat_agent_event(
-            chat_run.id, "识别对话意图", "已识别为：立即审核当前文案（仅审核，不投递）",
-            metadata={"intent": ConversationIntent.RUN_AUTO_REVIEW.value, "draft_ids": [target_draft.id]},
-        )
-        repository.add_chat_agent_event(
-            chat_run.id, "自动审核已入队",
-            f"正在审核《{(target_draft.title_options_json or ['当前草稿'])[0]}》并按其意见改稿一轮；通过后不会自动发表。",
-            "running",
-            metadata={"phase": "review", "state": "running", "draft_ids": [target_draft.id], "review_id": review_run.id},
-        )
-        assistant_message = repository.create_chat_message(
-            session_id,
-            "assistant",
-            f"好，正在对《{(target_draft.title_options_json or ['当前草稿'])[0]}》运行自动审核；通过后不会自动发表。",
-        )
-        chat_run.response_message_id = assistant_message.id
-        chat_run.summary = "自动审核中"
-        chat_run.status = ConversationRunStatus.RUNNING.value
-        session.commit()
-        try:
-            job_id = await enqueue_auto_review_job(
-                settings, target_draft.id, review_run.id, False, chat_run.id
-            )
-        except Exception as exc:
-            repository.finish_auto_review_run(review_run.id, "failed", {}, {}, "自动审核任务入队失败，请稍后重试")
-            repository.update_chat_message(assistant_message.id, "自动审核任务未能入队，请稍后重试。")
-            repository.finish_chat_agent_run(
-                chat_run.id, assistant_message.id, ConversationRunStatus.FAILED, "自动审核入队失败", [], str(exc)
-            )
-            session.commit()
-            logger.exception("chat_auto_review_enqueue_failed draft_id=%s error_type=%s", target_draft.id, type(exc).__name__)
-            raise HTTPException(status_code=503, detail="自动审核任务未能入队，请稍后重试") from exc
-        repository.add_chat_agent_event(
-            chat_run.id, "审核任务已创建", f"任务编号：{job_id}",
-            metadata={"phase": "review", "state": "running", "job_id": job_id, "draft_ids": [target_draft.id]},
-        )
-        logger.info("chat_auto_review_enqueued draft_id=%s review_id=%s job_id=%s", target_draft.id, review_run.id, job_id)
-        session.commit()
-        return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": chat_agent_run_to_dict(chat_run, repository)}
-
-    if decision and decision.intent == ConversationIntent.REUSE_DRAFT_ASSETS and target_draft is not None:
-        illustrations = repository.list_draft_illustrations(target_draft.id)
-        if not illustrations:
-            assistant_message = repository.create_chat_message(
-                session_id, "assistant", "这篇目前没有可复用的配图；需要的话我可以按当前正文重新生成配图。"
-            )
-            session.commit()
-            return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
-        # 复用＝用当前草稿已有的插图固化一次投递选择：封面取现有封面（没有就用第一张），正文取其余全部。
-        cover = next((item for item in illustrations if item.purpose == "cover"), illustrations[0])
-        inline = [item for item in illustrations if item.id != cover.id]
-        repository.save_wechat_asset_selection(target_draft.id, cover.asset_id, [item.asset_id for item in inline])
-        assistant_message = repository.create_chat_message(
-            session_id,
-            "assistant",
-            f"已复用当前草稿的配图：封面 1 张、正文插图 {len(inline)} 张；正文与图片都不变，可直接进入发布流程。",
-        )
-        session.commit()
-        logger.info("chat_reuse_draft_assets draft_id=%s inline=%s", target_draft.id, len(inline))
-        return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
-
-    if not attachment_extraction_requested:
-        assert decision is not None
-        if decision.intent == ConversationIntent.COLLECT_NEWS:
-            target = normalize_github_target(decision.target)
-            source_names = [source.value for source in decision.sources]
-            if target and SourceKind.GITHUB.value not in source_names:
-                # 点名了项目就必须包含 GitHub 来源，避免模型漏给 sources 时又去跑别的榜单。
-                source_names.insert(0, SourceKind.GITHUB.value)
-            auto_illustration_requested = command.auto_illustration or decision.auto_illustration
-            run = repository.create_chat_agent_run(
-                session_id, user_message.id, decision.intent,
-                command.auto_review, auto_illustration_requested,
-            )
-            repository.add_chat_agent_event(
-                run.id, "识别对话意图",
-                f"已识别为：按指定项目生成（{target}）" if target else "已识别为：采集资讯",
-                metadata={"intent": decision.intent.value, "target": target},
-            )
-            repository.add_chat_agent_event(
-                run.id, "加入后台采集队列",
-                f"任务已入队；将只抓取指定项目 {target} 并生成待审核草稿，不读取榜单。"
-                if target
-                else "任务已入队；将按已登记来源规则生成待审核草稿。",
-                metadata={
-                    "sources": source_names,
-                    "limit": decision.limit,
-                    "auto_illustration": auto_illustration_requested,
-                    "target": target,
-                },
-            )
-            repository.add_chat_agent_event(
-                run.id,
-                "文字生成中",
-                f"正在获取 {target} 的仓库信息与 README，并生成待审核文案。"
-                if target
-                else "正在采集来源、提取证据并生成待审核文案。",
-                "running",
-                metadata={"phase": "text", "state": "running", "target": target},
-            )
-            assistant_message = repository.create_chat_message(
-                session_id,
-                "assistant",
-                f"已加入后台队列，正在按指定项目 {target} 获取资料并生成待审核草稿。"
-                if target
-                else "已加入后台队列，正在采集并生成待审核草稿。",
-            )
-            run.response_message_id = assistant_message.id
-            run.summary = "后台任务已排队"
-            run.status = ConversationRunStatus.RUNNING.value
-            session.commit()
-            try:
-                job_id = await enqueue_collection_job(
-                    settings, run.id, session_id, assistant_message.id, source_names, decision.limit,
-                    command.auto_review, auto_illustration_requested, target,
-                )
-                repository.add_chat_agent_event(
-                    run.id, "后台任务已创建", f"任务编号：{job_id}", metadata={"job_id": job_id}
-                )
-                session.commit()
-                logger.info(
-                    "chat_collection_enqueued run_id=%s sources=%s limit=%s job_id=%s",
-                    run.id,
-                    source_names,
-                    decision.limit,
-                    job_id,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "chat_collection_enqueue_failed run_id=%s error_type=%s",
-                    run.id,
-                    type(exc).__name__,
-                )
-                repository.update_chat_message(assistant_message.id, "后台队列不可用，请稍后重试。")
-                repository.finish_chat_agent_run(
-                    run.id, assistant_message.id, ConversationRunStatus.FAILED,
-                    "后台任务创建失败", [], str(exc),
-                )
-                session.commit()
-            return {
-                "message": chat_message_to_dict(assistant_message),
-                "processing": None,
-                "execution": chat_agent_run_to_dict(run, repository),
-            }
-
-        if decision.intent == ConversationIntent.GENERATE_DRAFT_IMAGE:
-            run = repository.create_chat_agent_run(
-                session_id, user_message.id, decision.intent,
-                command.auto_review, command.auto_illustration,
-            )
-            repository.add_chat_agent_event(run.id, "识别对话意图", "已识别为：生成草稿插图")
-            target = _current_editable_draft(repository, session_id)
-            if target is None:
-                reply = "当前会话还没有已选择的可编辑草稿。请先生成草稿，或明确指定需要配图的文章。"
-                status = ConversationRunStatus.FAILED
-                results: list[dict[str, Any]] = []
-            else:
-                purpose = decision.image_purpose
-                try:
-                    result = await ImageGenerationTool(
-                        settings, repository
-                    ).invoke(target.id, purpose, decision.placement_after_paragraph)
-                    reply = f"已为“{(target.title_options_json or ['草稿'])[0]}”生成私有{('封面' if purpose == 'cover' else '插图')}，可在生成记录中调整位置或移除。"
-                    status = ConversationRunStatus.COMPLETED
-                    results = [{"tool": "generate_draft_image", "draft_id": target.id, "illustration_id": result.illustration_id, "asset_id": result.asset_id, "purpose": purpose}]
-                    repository.add_chat_agent_event(run.id, "生成草稿插图 Tool", "图片已私有保存，未上传公众号。", metadata=results[0])
-                except ImageGenerationError as exc:
-                    reply = f"图片未生成：{exc}"
-                    status = ConversationRunStatus.FAILED
-                    results = []
-                    repository.add_chat_agent_event(run.id, "图片生成未执行", str(exc), "failed")
-            assistant_message = repository.create_chat_message(session_id, "assistant", reply)
-            repository.finish_chat_agent_run(run.id, assistant_message.id, status, reply, results, reply if status == ConversationRunStatus.FAILED else None)
-            session.commit()
-            return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": chat_agent_run_to_dict(run, repository)}
-
-        run = repository.create_chat_agent_run(
-            session_id, user_message.id, ConversationIntent.GENERAL_CHAT,
-            command.auto_review, command.auto_illustration,
-        )
-        assert resolution is not None
-        if resolution.success:
-            summary = "已完成会话回复"
-            repository.add_chat_agent_event(
-                run.id,
-                "DeepAgent 会话决策已生成",
-                "已基于同一会话的持久记忆和受控上下文生成回复。",
-                metadata={"phase": "chat", "state": "completed", "intent": decision.intent.value},
-            )
-            status = ConversationRunStatus.COMPLETED
-            error_message = None
-        else:
-            summary = decision.reply
-            repository.add_chat_agent_event(
-                run.id,
-                "DeepAgent 会话决策未完成",
-                "未执行采集、配图、改稿或发布操作；失败类别已安全记录。",
-                "failed",
-                metadata={"phase": "chat", "state": "failed", "failure_kind": resolution.failure_kind},
-            )
-            status = ConversationRunStatus.FAILED
-            error_message = summary
-        assistant_message = repository.create_chat_message(session_id, "assistant", decision.reply)
-        repository.finish_chat_agent_run(
-            run.id, assistant_message.id, status, summary, [], error_message,
-        )
-        session.commit()
-        logger.info(
-            "chat_deep_agent_reply_finished run_id=%s session_id=%s status=%s",
-            run.id, session_id, status.value,
-        )
         return {
-            # 前端以该消息替换本地乐观用户消息；随后 reload 会同时带回助手回复。
             "message": chat_message_to_dict(user_message),
+            "receipt": chat_message_to_dict(failure),
             "processing": None,
             "execution": chat_agent_run_to_dict(run, repository),
         }
-
-    attachment = repository.get_attachment(command.attachment_id or "")
-    if attachment.session_id != session_id:
-        raise HTTPException(status_code=400, detail="附件不属于当前对话")
-    if not settings.llm_enabled:
-        assistant_message = repository.create_chat_message(
-            session_id,
-            "assistant",
-            "已识别明确提取指令，但 LLM_ENABLED=false，附件没有被读取或处理。",
-        )
-        session.commit()
-        return {
-            "message": chat_message_to_dict(assistant_message),
-            "processing": None,
-            "execution": None,
-        }
-
-    processing = repository.create_attachment_processing(attachment.id, user_message.id)
-    session.commit()
-    try:
-        content = SessionWorkspaceTool(
-            PrivateAttachmentStore(settings), AgentWorkspaceStore(settings)
-        ).read_text(session_id, attachment).content[:30000]
-        download_url = attachment_to_dict(attachment, settings)["download_url"]
-        raw_item = RawSourceItem(
-            source_kind=SourceKind.ATTACHMENT,
-            external_id=attachment.id,
-            title=attachment.original_name,
-            url=download_url,
-            summary=content[:5000],
-            content=content,
-            source_name=f"对话附件：{attachment.original_name}",
-            metadata={"attachment_id": attachment.id},
-        )
-        result = ContentPipeline(session, build_generator(settings), settings).process([raw_item])
-        source = repository.get_source_by_external_id(
-            SourceKind.ATTACHMENT.value, attachment.id
-        )
-        draft = repository.get_draft_for_source(source.id) if source else None
-        if result["errors"] or draft is None:
-            error_message = "; ".join(
-                error["error"] for error in result["errors"]
-            ) or "未生成待审核草稿"
-            repository.finish_attachment_processing(
-                processing.id, AttachmentStatus.FAILED, error_message=error_message
-            )
-            assistant_content = f"附件提取失败：{error_message}"
-            draft_id = None
-        else:
-            repository.finish_attachment_processing(
-                processing.id, AttachmentStatus.PROCESSED, draft_id=draft.id
-            )
-            assistant_content = f"已生成待审核草稿：{draft.id}"
-            draft_id = draft.id
-        assistant_message = repository.create_chat_message(
-            session_id, "assistant", assistant_content
-        )
-        session.commit()
-        return {
-            "message": chat_message_to_dict(assistant_message),
-            "processing": {"id": processing.id, "draft_id": draft_id},
-            "execution": None,
-        }
-    except Exception as exc:
-        session.rollback()
-        repository.finish_attachment_processing(
-            processing.id, AttachmentStatus.FAILED, error_message=str(exc)
-        )
-        assistant_message = repository.create_chat_message(
-            session_id, "assistant", f"附件提取失败：{exc}"
-        )
-        session.commit()
-        return {
-            "message": chat_message_to_dict(assistant_message),
-            "processing": {"id": processing.id, "draft_id": None},
-            "execution": None,
-        }
+    logger.info(
+        "chat_message_dispatched session_id=%s run_id=%s job_id=%s steps=%s",
+        session_id, run.id, job_id, plan.steps,
+    )
+    return {
+        # 前端用 message 替换本地乐观用户消息；回执与运行卡片由随后的 reload 一起带回。
+        "message": chat_message_to_dict(user_message),
+        "receipt": chat_message_to_dict(receipt),
+        "processing": None,
+        "execution": chat_agent_run_to_dict(run, repository),
+    }
 
 
 @router.post("/schedule-plans/{plan_id}/confirm")
@@ -1887,101 +1584,6 @@ def review_draft(
         DraftSourceSnapshotStore(settings, repository).delete_after_approval(draft_id)
     session.commit()
     return draft_to_dict(row, settings)
-
-
-async def _run_agent_command(
-    settings: Settings,
-    repository: ContentRepository,
-    session,
-    session_id: str,
-    user_message,
-    command,
-) -> dict[str, Any] | None:
-    """把界面命令交给 Agent 工具执行；不是命令时返回 None，交给模型意图识别。
-
-    长任务（审核/重写/配图）由工具自己创建可见运行并入队；即时动作（审核决定、复用配图）
-    在这里建一条运行并当场结束，两种情况的回复都由模型按真实结果生成。
-    """
-    parsed = parse_agent_command(command.content)
-    if parsed is None:
-        return None
-    tools = {item.name: item for item in build_draft_action_tools(session_id)}
-    facts: dict[str, Any]
-    run = None
-    if parsed.name in tools:
-        arguments: dict[str, Any] = {}
-        if parsed.draft_id:
-            arguments["draft_id"] = parsed.draft_id
-        if parsed.name == "run_auto_review":
-            arguments["deliver"] = parsed.deliver
-        if parsed.name == "generate_draft_illustration":
-            arguments.update(purpose=parsed.purpose, placement_after_paragraph=parsed.placement)
-        if parsed.name in {"approve_draft", "discard_draft", "revoke_approval"}:
-            # 即时动作：先建运行，执行后立即结束，保证对话与生成记录里都看得到。
-            run = repository.create_chat_agent_run(
-                session_id, user_message.id, parsed.name, command.auto_review, command.auto_illustration
-            )
-            repository.add_chat_agent_event(
-                run.id, "识别对话命令", f"已按命令执行：{parsed.label}",
-                metadata={"phase": "text", "state": "running", "command": parsed.name, "draft_ids": [parsed.draft_id] if parsed.draft_id else []},
-            )
-            session.commit()
-        result = await tools[parsed.name].ainvoke(arguments)
-        facts = {"command": parsed.name, "label": parsed.label, **(result or {})}
-        if run is not None:
-            result_run = result.get("chat_run_id") if isinstance(result, dict) else None
-            execution_run = repository.get_chat_agent_run(result_run) if result_run else run
-        else:
-            execution_run = repository.get_chat_agent_run(result["chat_run_id"]) if result.get("chat_run_id") else None
-    elif parsed.name == "reuse_draft_assets":
-        draft = _current_editable_draft(repository, session_id) if not parsed.draft_id else repository.get_draft(parsed.draft_id)
-        if draft is None:
-            result = {"status": "rejected", "message": "没有找到要复用配图的草稿。"}
-        else:
-            illustrations = repository.list_draft_illustrations(draft.id)
-            if not illustrations:
-                result = {"status": "rejected", "message": "这篇目前没有可复用的配图；需要的话我可以按当前正文重新生成配图。"}
-            else:
-                cover = next((item for item in illustrations if item.purpose == "cover"), illustrations[0])
-                inline = [item for item in illustrations if item.id != cover.id]
-                repository.save_wechat_asset_selection(draft.id, cover.asset_id, [item.asset_id for item in inline])
-                result = {
-                    "status": "done",
-                    "draft_id": draft.id,
-                    "draft_title": (draft.title_options_json or ["当前草稿"])[0],
-                    "inline_count": len(inline),
-                    "message": f"已复用当前草稿的配图：封面 1 张、正文插图 {len(inline)} 张。",
-                }
-        facts = {"command": parsed.name, "label": parsed.label, **result}
-        execution_run = None
-    else:  # pragma: no cover - 解析器不会产生未知命令
-        return None
-    reply = await run_in_threadpool(
-        compose_task_reply,
-        settings,
-        task=f"执行界面命令：{parsed.label}",
-        facts=facts,
-        fallback=str(facts.get("message") or "命令已执行。"),
-        run_id=session_id,
-    )
-    assistant_message = repository.create_chat_message(session_id, "assistant", reply)
-    if execution_run is not None:
-        repository.add_chat_agent_event(
-            execution_run.id, "已汇报执行结果", reply[:500],
-            metadata={"phase": "text", "state": result.get("status", "done") if isinstance(result, dict) else "done"},
-        )
-        if run is not None:
-            repository.finish_chat_agent_run(
-                run.id, assistant_message.id, ConversationRunStatus.COMPLETED,
-                str(facts.get("message") or "命令已执行"), [facts],
-            )
-        else:
-            execution_run.response_message_id = assistant_message.id
-    user_message.response_message_id = assistant_message.id
-    session.commit()
-    execution_payload = chat_agent_run_to_dict(execution_run, repository) if execution_run is not None else None
-    logger.info("chat_agent_command_executed session_id=%s command=%s status=%s", session_id, parsed.name, facts.get("status"))
-    return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": execution_payload}
 
 
 @router.post("/drafts/{draft_id}/rewrite")

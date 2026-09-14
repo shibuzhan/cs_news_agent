@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 import app.worker as worker
-from app.domain.models import AgentRunStatus
+from app.services import chat_dispatch
+from app.domain.models import AgentRunStatus, ConversationIntent
 
 
 class FakeSession:
@@ -32,13 +33,25 @@ class FakeRepository:
         self.notifications: list[dict] = []
         self.memories: list[dict] = []
         self.messages: list[SimpleNamespace] = []
+        self.appended: list[dict] = []
         FakeRepository.instances.append(self)
 
     def update_chat_message(self, _message_id: str, content: str) -> None:
         self.message = content
 
     def get_chat_agent_run(self, _run_id: str):
-        return SimpleNamespace(status=worker.ConversationRunStatus.RUNNING.value)
+        return SimpleNamespace(
+            status=worker.ConversationRunStatus.RUNNING.value,
+            intent="general_chat",
+            # 受理运行已经挂着一条确定性回执消息；最终回复必须**追加**而不是覆盖它。
+            response_message_id="message-receipt",
+            summary="正在处理",
+        )
+
+    def append_run_reply(self, run_id: str, text: str) -> str:
+        row = self.create_chat_message("session-1", "assistant", text)
+        self.appended.append({"run_id": run_id, "message_id": row.id})
+        return row.id
 
     def create_chat_message(self, _session_id: str, role: str, content: str):
         row = SimpleNamespace(id=f"message-{len(self.messages) + 1}", role=role, content=content)
@@ -205,31 +218,39 @@ async def test_worker_marks_cancelled_collection_as_failed(monkeypatch: pytest.M
 
 @pytest.mark.asyncio
 async def test_general_chat_job_persists_the_background_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    """受理回执已经写好了；Worker 只把最终回复**追加**为新消息并结束运行。"""
     configure_worker_success(monkeypatch)
 
     class FakeDeepAgent:
         def __init__(self, _settings) -> None:
             pass
 
-        async def resolve(self, session_id: str, content: str, has_attachment: bool):
+        async def resolve(self, session_id: str, content: str, has_attachment: bool, chat_run_id=None, on_delta=None):
             assert session_id == "session-1"
             assert content == "为什么新增为零"
             assert has_attachment is False
+            # 受理运行必须传给 DeepAgent，工具才能复用同一条运行而不是新建卡片。
+            assert chat_run_id == "run-1"
             return SimpleNamespace(
                 success=True,
                 failure_kind=None,
-                decision=SimpleNamespace(reply="因为候选项目已按去重规则跳过。"),
+                tools_called=frozenset(),
+                decision=SimpleNamespace(
+                    intent=ConversationIntent.GENERAL_CHAT,
+                    reply="因为候选项目已按去重规则跳过。",
+                ),
             )
 
-    monkeypatch.setattr(worker, "ContentDeepAgent", FakeDeepAgent)
+    monkeypatch.setattr(chat_dispatch, "ContentDeepAgent", FakeDeepAgent)
 
     await worker.process_general_chat_job({}, "run-1", "session-1", "为什么新增为零")
 
     repository = FakeRepository.instances[-1]
+    assert repository.appended == [{"run_id": "run-1", "message_id": repository.messages[0].id}]
     assert repository.messages[0].content == "因为候选项目已按去重规则跳过。"
     assert repository.finished == {
         "status": worker.ConversationRunStatus.COMPLETED,
-        "summary": "已完成会话回复",
+        "summary": "因为候选项目已按去重规则跳过。",
     }
 
 

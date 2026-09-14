@@ -80,16 +80,25 @@ async def enqueue_draft_regeneration_job(
 
 
 async def enqueue_general_chat_job(
-    settings: Settings, run_id: str, session_id: str, content: str,
+    settings: Settings,
+    run_id: str,
+    session_id: str,
+    content: str,
+    attachment_id: str | None = None,
+    auto_review: bool = False,
+    auto_illustration: bool = False,
 ) -> str:
-    """普通会话回复独立入队，确保 HTTP 请求不等待外部模型。"""
+    """对话派发独立入队：HTTP 只写回执，意图识别与工具执行都在 Worker 里完成。"""
     logger.info(
         "general_chat_enqueue_started run_id=%s session_id=%s content_length=%s",
         run_id, session_id, len(content),
     )
     pool = await create_pool(redis_settings(settings))
     try:
-        job = await pool.enqueue_job("process_general_chat_job", run_id, session_id, content)
+        job = await pool.enqueue_job(
+            "process_general_chat_job", run_id, session_id, content,
+            attachment_id, auto_review, auto_illustration,
+        )
         if job is None:
             raise RuntimeError("会话回复任务未能入队")
         logger.info("general_chat_enqueue_finished run_id=%s job_id=%s", run_id, job.job_id)

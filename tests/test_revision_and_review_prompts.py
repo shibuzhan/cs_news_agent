@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from types import SimpleNamespace
 
@@ -325,10 +326,10 @@ def test_review_prompt_bounds_what_counts_as_a_defect(monkeypatch) -> None:
     # 范围限定与可执行意见。
     assert "没做竞品对比" in prompt
     assert "必须可直接执行" in prompt
-    # 不扣字眼：同义改写、同类补充、措辞偏好都不算缺陷，minor 有上限。
+    # 不扣字眼：同义改写、同类补充、措辞偏好都不算缺陷；minor 上限收紧到 2 条（只用于语气与通顺）。
     assert "不扣字眼" in prompt
     assert "同义改写" in prompt
-    assert "最多 3 条" in prompt
+    assert "最多 2 条" in prompt
     # 开头必须交代主体与背景，无主语或从操作场景开头算 major。
     assert "开头是否在第一段交代了主体与背景" in prompt
     assert "无主语" in prompt
@@ -357,7 +358,7 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "安装步骤、价格与套餐、官方渠道清单、支持语言列表、命令与参数、版本号一律不写" in instruction
     # 开头必须交代主体与背景，禁止无主语的操作场景开头。
     assert "【开头】" in instruction
-    assert "谁做的或来自哪里、为什么值得看" in instruction
+    assert "谁做的或来自哪里、它想解决什么麻烦" in instruction
     assert "每个句子都要有明确主语" in instruction
     assert "本地运行后，浏览器中会显示" in instruction
     # 长度给目标带而不是只给上下限，避免贴着下限写。
@@ -366,6 +367,76 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "不要贴着下限写" in instruction
     # 禁止每篇同一结构。
     assert "不要每篇都套同一个顺序" in instruction
+
+
+def test_generation_instruction_carries_the_sharing_persona() -> None:
+    """真实反馈：文案语气太过严谨严肃。人设与反百科腔清单必须在提示词里。"""
+    instruction = _natural_article_instruction(1200, 3200)
+
+    assert "【人设与语气】" in instruction
+    assert "分享者" in instruction
+    # 分享口吻 ≠ 营销腔：叫卖词与烂梗仍然禁止。
+    assert "绝了" in instruction and "家人们" in instruction
+    assert "第一人称" in instruction
+    # 反百科腔：点名要禁的句式 + 段末概括句。
+    assert "【不要百科腔与研报腔】" in instruction
+    assert "“X 是……的一个……”" in instruction
+    assert "对读者来说" in instruction
+    assert "这也让它成为……的入口" in instruction
+    assert "只是复述本段" in instruction
+    # 对照示例是模型最容易照做的一层。
+    assert "【对照示例】" in instruction
+    assert instruction.count("→") >= 3
+    # 事实纪律没有被语气改写挤掉。
+    assert "不得补充未经来源支持的" in instruction or "只能使用给定的证据包" in instruction
+
+
+def test_generation_instruction_bans_padding_by_repetition() -> None:
+    """实测发现：改掉百科腔后，模型改用“列举→逐条复述→总括句”凑字数，审核连报重复。"""
+    instruction = _natural_article_instruction(1200, 3200)
+
+    assert "尤其禁止这种凑字数的写法" in instruction
+    assert "逐条复述" in instruction or "逐个复述" in instruction
+    assert "每个要点只讲一次" in instruction
+    assert "如果一段的最后一句能删掉而信息不减，就删掉它" in instruction
+    # 实测发现的另两类来源细节问题：把采集时间当日期、描述来源里没有的界面文字。
+    assert "都不是来源事实" in instruction
+    assert "不要描述来源里没有的界面文字" in instruction
+    assert "原样引用" in instruction
+
+
+def test_review_and_revision_protect_the_sharing_tone() -> None:
+    """审核与改稿不得把分享者口吻判成缺陷、也不得把它改回百科腔。"""
+    from app.tools.auto_review import AutoReviewTool
+    from app.tools.auto_revision import AutoRevisionTool
+
+    review_source = inspect.getsource(AutoReviewTool.invoke)
+    revision_source = inspect.getsource(AutoRevisionTool.invoke)
+
+    assert "分享者口吻是目标文体" in review_source
+    assert "属于 major 缺陷" in review_source
+    assert "分享者" in revision_source
+    assert "不要把文章改成百科定义句" in revision_source
+
+
+def test_review_focuses_on_tone_and_fluency_not_details() -> None:
+    """真实反馈：审核要主要改进语气与通顺，而不是过多关注细节。"""
+    from app.tools.auto_review import AutoReviewTool
+    from app.tools.auto_revision import AutoRevisionTool
+
+    review_source = inspect.getsource(AutoReviewTool.invoke)
+
+    assert "本次审核只看两件事" in review_source
+    assert "**语气**" in review_source and "**通顺**" in review_source
+    assert "都不属于本次审核范围" in review_source
+    # 细节挑刺被明确压掉：minor 上限降到 2 条，且只用于语气与通顺。
+    assert "最多 2 条" in review_source
+    assert "不要为细节挑刺" in review_source
+    # 打分锚点改成以语气与通顺为达标线。
+    assert "语气是分享者口吻、语句通顺" in review_source
+    # 改稿按同一优先级处理，不顺手重写全文。
+    revision_source = inspect.getsource(AutoRevisionTool.invoke)
+    assert "改写优先级" in revision_source
 
 
 def test_evidence_packs_carry_metrics_for_the_review_model() -> None:

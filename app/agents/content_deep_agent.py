@@ -110,6 +110,8 @@ class DeepAgentResolution:
     decision: ConversationDecision
     success: bool
     failure_kind: str | None = None
+    # 本次已经调用过的业务 Tool 名：服务端据此避免重复执行同一步（例如生成两张封面）。
+    tools_called: frozenset[str] = frozenset()
 
 
 class StructuredDecisionError(ValueError):
@@ -152,6 +154,25 @@ def _final_message_text(result: dict[str, Any]) -> str:
     return ""
 
 
+def _tools_called(result: dict[str, Any]) -> frozenset[str]:
+    """只取工具名，不保留参数与返回内容。"""
+    names: set[str] = set()
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return frozenset()
+    for message in messages:
+        calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+        for call in calls or []:
+            name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+            if isinstance(name, str) and name:
+                names.add(name)
+        name = message.get("name") if isinstance(message, dict) else getattr(message, "name", None)
+        role = message.get("type") if isinstance(message, dict) else getattr(message, "type", None)
+        if role == "tool" and isinstance(name, str) and name:
+            names.add(name)
+    return frozenset(names)
+
+
 def _decision_from_agent_result(result: dict[str, Any]) -> tuple[ConversationDecision, str]:
     """原生结构优先；兼容网关缺字段时仅接受完整 JSON 再走 Pydantic。"""
     structured = result.get("structured_response")
@@ -181,6 +202,76 @@ def _decision_from_agent_result(result: dict[str, Any]) -> tuple[ConversationDec
         raise StructuredDecisionError("final_json_schema_invalid") from exc
 
 
+def _chunk_text(message: Any) -> str:
+    """只取分片的文本内容（json 模式下决策就是这段 JSON 文本）。"""
+    content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "") for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        )
+    return ""
+
+
+class _DecisionToolArgs:
+    """累积**结构化决策工具**的参数分片，忽略同一轮里其他工具的调用。
+
+    tool 模式下模型把 ConversationDecision 当作工具调用，reply 就在这些参数 JSON 里；
+    但同一轮还可能有 list_source_images 之类的工具，它们的参数不能混进来。
+    """
+
+    def __init__(self) -> None:
+        self._names: dict[Any, str] = {}
+
+    def feed(self, message: Any) -> str:
+        chunks = getattr(message, "tool_call_chunks", None)
+        if not chunks and isinstance(message, dict):
+            chunks = message.get("tool_call_chunks")
+        out: list[str] = []
+        for chunk in chunks or []:
+            name = chunk.get("name") if isinstance(chunk, dict) else getattr(chunk, "name", None)
+            index = chunk.get("index") if isinstance(chunk, dict) else getattr(chunk, "index", None)
+            if name:
+                self._names[index] = name
+            if self._names.get(index) != "ConversationDecision":
+                continue
+            args = chunk.get("args") if isinstance(chunk, dict) else getattr(chunk, "args", None)
+            if isinstance(args, str) and args:
+                out.append(args)
+        return "".join(out)
+
+
+def _invoke_agent(
+    agent: Any, payload: dict[str, Any], config: dict[str, Any], *,
+    mode: str, on_delta,
+) -> dict[str, Any]:
+    """执行 DeepAgent：需要增量时改用流式，任何异常都向上抛（由调用方回退）。
+
+    `stream_mode=["messages", "values"]` 同时给出 token 分片与最终状态：前者用于推送
+    增量，后者仍是原先 `invoke` 的返回值，所以决策校验逻辑完全不变。
+    """
+    if on_delta is None:
+        return agent.invoke(payload, config=config)
+    from app.services.reply_stream import ReplyFieldExtractor
+
+    extractor = ReplyFieldExtractor()
+    tool_args = _DecisionToolArgs()
+    final_state: Any = None
+    for stream_mode, chunk in agent.stream(payload, config=config, stream_mode=["messages", "values"]):
+        if stream_mode == "messages":
+            message = chunk[0] if isinstance(chunk, tuple) else chunk
+            text = _chunk_text(message) if mode == "json" else tool_args.feed(message)
+            for piece in extractor.feed(text):
+                on_delta(piece)
+        elif stream_mode == "values":
+            final_state = chunk
+    if not isinstance(final_state, dict):
+        raise DeepAgentStageError("agent_stream", RuntimeError("missing_final_state"))
+    return final_state
+
+
 class ContentDeepAgent:
     """会话级 DeepAgent：以持久 checkpoint 输出一次受限业务决策。"""
 
@@ -190,6 +281,8 @@ class ContentDeepAgent:
 
     async def resolve(
         self, session_id: str, content: str, has_attachment: bool,
+        chat_run_id: str | None = None,
+        on_delta=None,
     ) -> DeepAgentResolution:
         selected_model = model_for(self.settings, "conversation")
         selected_api_key = api_key_for(self.settings, "conversation")
@@ -205,12 +298,17 @@ class ContentDeepAgent:
             selected_model,
         )
         try:
-            decision = await asyncio.wait_for(
-                asyncio.to_thread(self._resolve_sync, session_id, content, has_attachment),
+            decision, tools_called = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._resolve_sync, session_id, content, has_attachment, chat_run_id, on_delta
+                ),
                 timeout=self.settings.conversation_agent_timeout_seconds,
             )
-            logger.info("deep_agent_resolution_finished session_id=%s intent=%s", session_id, decision.intent.value)
-            return DeepAgentResolution(decision=decision, success=True)
+            logger.info(
+                "deep_agent_resolution_finished session_id=%s intent=%s tools=%s",
+                session_id, decision.intent.value, sorted(tools_called),
+            )
+            return DeepAgentResolution(decision=decision, success=True, tools_called=tools_called)
         except TimeoutError:
             logger.warning(
                 "deep_agent_resolution_timed_out session_id=%s timeout_seconds=%s",
@@ -234,7 +332,10 @@ class ContentDeepAgent:
         resolution = await self.resolve(session_id, content, False)
         return resolution.decision.reply if resolution.success else None
 
-    def _resolve_sync(self, session_id: str, content: str, has_attachment: bool) -> ConversationDecision:
+    def _resolve_sync(
+        self, session_id: str, content: str, has_attachment: bool, chat_run_id: str | None = None,
+        on_delta=None,
+    ) -> tuple[ConversationDecision, frozenset[str]]:
         global _checkpoint_initialized
         _configure_profile()
         model = ChatOpenAI(
@@ -257,7 +358,7 @@ class ContentDeepAgent:
                 "model": model,
                 "tools": build_conversation_context_tools(session_id)
                 + build_draft_asset_tools(session_id)
-                + build_draft_action_tools(session_id)
+                + build_draft_action_tools(session_id, chat_run_id=chat_run_id)
                 + build_source_media_tools(session_id),
                 "system_prompt": _SYSTEM_PROMPT if mode == "tool" else f"{_SYSTEM_PROMPT}\n{_JSON_DECISION_SUFFIX}",
                 "skills": ["/skills"],
@@ -277,7 +378,8 @@ class ContentDeepAgent:
             except Exception as exc:
                 raise DeepAgentStageError("agent_creation", exc) from exc
             try:
-                result: dict[str, Any] = agent.invoke(
+                result: dict[str, Any] = _invoke_agent(
+                    agent,
                     {
                         "messages": [
                             ("user", "当前会话受控上下文快照：" + json.dumps(context_snapshot, ensure_ascii=False)),
@@ -285,7 +387,9 @@ class ContentDeepAgent:
                         ],
                         "files": _agent_files(),
                     },
-                    config={"configurable": {"thread_id": session_id}},
+                    {"configurable": {"thread_id": session_id}},
+                    mode=mode,
+                    on_delta=on_delta,
                 )
             except Exception as exc:
                 raise DeepAgentStageError("agent_invoke", exc) from exc
@@ -301,7 +405,7 @@ class ContentDeepAgent:
         )
         if decision.intent == ConversationIntent.ATTACHMENT_DRAFT and not has_attachment:
             raise StructuredDecisionError("attachment_intent_without_attachment")
-        return decision
+        return decision, _tools_called(result)
 
     @staticmethod
     def _failure_kind(exc: Exception) -> str:

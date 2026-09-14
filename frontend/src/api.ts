@@ -2,6 +2,9 @@ import type { AgentRun, Attachment, AutoReviewRun, ChatMessage, ChatSession, Con
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api";
 
+/** 运行事件流地址：增量回复、里程碑与结束状态都由它推送；断开时前端回退到 2 秒轮询。 */
+export const chatRunStreamUrl = (runId: string) => `${API_BASE_URL}/chat/agent-runs/${runId}/stream`;
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
@@ -50,7 +53,8 @@ export const api = {
     return response.json() as Promise<Attachment>;
   },
   sendMessage: (sessionId: string, content: string, attachmentId?: string, autoReview = false, autoIllustration = false) =>
-    request<{ message: ChatMessage; processing: { id: string; draft_id: string | null } | null; execution: AgentRun | null }>(
+    // receipt 是服务端在入队前写好的确定性回执：请求立即返回，不必等模型或配图。
+    request<{ message: ChatMessage; receipt?: ChatMessage; processing: { id: string; draft_id: string | null } | null; execution: AgentRun | null }>(
       `/chat/sessions/${sessionId}/messages`,
       { method: "POST", body: JSON.stringify({ content, attachment_id: attachmentId || null, auto_review: autoReview, auto_illustration: autoIllustration }) },
     ),

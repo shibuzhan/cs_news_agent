@@ -76,6 +76,10 @@ GENERATION_RECORD_INTENTS: tuple[str, ...] = (
     "discard_draft",
     "revoke_approval",
 )
+# 收束遗留运行比“生成记录”多一类：普通对话也必须有收尾，否则一条僵死运行会让对话页永远轮询。
+RECONCILABLE_RUN_INTENTS: tuple[str, ...] = GENERATION_RECORD_INTENTS + (
+    ConversationIntent.GENERAL_CHAT.value,
+)
 
 
 class RepositoryError(RuntimeError):
@@ -311,7 +315,9 @@ class ContentRepository:
         self.session.add(row)
         self.session.flush()
         run.response_message_id = row.id
-        self.flush()
+        # 这里曾经写成 self.flush()（仓储没有这个方法）：每次追加回复都抛 AttributeError，
+        # 后台任务因此既写不进结果、也结束不了运行（真实反馈：已完成的任务下方一直显示“处理中”）。
+        self.session.flush()
         return row.id
 
     def list_chat_messages(self, session_id: str) -> list[ChatMessageRow]:
@@ -907,7 +913,7 @@ class ContentRepository:
             self.session.scalars(
                 select(ChatAgentRunRow)
                 .where(
-                    ChatAgentRunRow.intent.in_(GENERATION_RECORD_INTENTS),
+                    ChatAgentRunRow.intent.in_(RECONCILABLE_RUN_INTENTS),
                     ChatAgentRunRow.status == ConversationRunStatus.RUNNING.value,
                     ChatAgentRunRow.attempt_started_at <= cutoff,
                 )

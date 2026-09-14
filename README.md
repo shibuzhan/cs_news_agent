@@ -39,6 +39,8 @@
 - **公众号草稿留言开关**：创建与覆盖草稿时显式下发 `need_open_comment`／`only_fans_can_comment`。
 - **素材库工具**：`list_wechat_materials`（只读盘点可清理项）与 `delete_wechat_material`（删除永久素材，仍被投递记录引用的封面会被拒绝）。
 - **完成后追加新消息**：任务结束以**新消息**汇报，占位消息（“正在生成…”）保留，历史不被覆盖。
+- **入队即回执**：发消息后立即收到确定性回执（不调用模型），多步指令（“先配图，然后自动审核”）会按顺序规划并逐步执行；同一条消息只对应一条运行卡片，状态用短状态刷新。
+- **对话回复与任务汇报支持 SSE 流式**：增量逐字渲染，失败或断开自动回退非流式/轮询；结构化路径保持非流式。
 - **审核等待配图**：配图未完成时不立即发起审核，由配图收束逻辑自动接续，避免“审核早于配图”。
 - **生成记录状态块按真实数据**：文字依据草稿是否存在（`文案已生成（版本 N）`），配图依据图片任务真实状态（`配图已完成（N 张）`等）。
 - **GitHub API 令牌**：配置 `GITHUB_TOKEN` 后核心 API 配额由 60 次/小时提升到 5000 次/小时。
@@ -77,7 +79,8 @@
 - `POST /api/drafts/{draft_id}/review`：批准或驳回草稿。
 - `POST /api/chat/sessions`：创建运营对话。
 - `POST /api/chat/sessions/{session_id}/attachments`：私有保存文本附件；不会读取附件或调用 LLM。
-- `POST /api/chat/sessions/{session_id}/messages`：发送对话消息；只有明确的附件提取指令才可能进入受控处理。
+- `POST /api/chat/sessions/{session_id}/messages`：发送对话消息。**写入用户消息与一条确定性回执后立即返回**（不调用模型、不入库等待执行结果），真正的意图识别与工具执行在 Worker 中完成。
+- `GET /api/chat/agent-runs/{run_id}/stream`：SSE 事件流（`delta` 增量文本、`milestone` 里程碑、`done` 完整文本与状态）。Redis 不可用或客户端断开时自动退化为按数据库轮询，最终仍下发完整文本。
 - `GET /api/attachments/{attachment_id}/download?token=...`：通过短时签名链接下载附件。
 - `POST /api/schedule-plans/{plan_id}/confirm`：确认已创建的定时计划记录；当前不会注册或执行任务。
 - `POST /api/publish-plans/{plan_id}/confirm`：确认已创建的发布计划记录；当前不会连接账号或发布内容。
@@ -205,6 +208,18 @@ REVIEW_STRUCTURED_OUTPUT_MODE=
 ## 通用对话与计划 Tool
 
 普通消息会先被识别为受限意图，再决定是否调用已登记 Tool：`general_chat`、`collect_news`、`create_schedule_plan`、`create_publish_plan` 和 `attachment_draft`。模型只返回经过 JSON 校验的意图和受限字段，不能选择任意工具、URL、数据库操作或发布接口。每次响应会保存“执行过程摘要”，前端可折叠展开查看已识别意图、调用的 Tool 与结果；该摘要不是模型原始思维链。
+
+### 对话响应：入队即回执、同一条消息一条运行
+
+`POST /api/chat/sessions/{session_id}/messages` 只做四件事：写用户消息、写一条**确定性回执**（`app/services/chat_receipts.py`，复用 `parse_agent_command()` 的分类，不调用模型）、建一条受理运行、入队 `process_general_chat_job`。因此响应时间与模型、图片生成无关（实测 30–60 ms）。
+
+- 回执会先说明理解到的步骤：界面按钮命令 → 单步；自然语言里的多条指令（例如“帮我给这篇文章配图，然后自动审核”）→ 按出现顺序规划成多步并逐步执行；问句不会被误报成动作。
+- 同一条用户消息只对应**一条运行**：Agent 工具通过 `chat_run_id` 复用它，运行卡片上的短状态（配图已入队／审核中／采集已入队…）与里程碑逐步刷新；结束时的汇报作为**新消息追加**，不覆盖受理回执。
+- 对话页在存在运行中任务时每 2 秒轮询消息与运行事件，空闲时自动停止；同时按运行的 SSE 流实时渲染增量文本。遗留运行会在会话接口被顺带收束，不会永久显示“处理中”。
+- **正文也是流式可见的**：长文生成是一次 9–12 分钟的模型调用，系统用同一套增量提取器把 `body` 字段边写边推到对话页（标记“正在写正文 · 已 N 字”，多来源采集换篇时自动清空上一段）。流式不可用时只影响可见性，不影响生成本身。
+- 流式只用于“对话回复”“任务汇报”与“正文写作”三处。生成结果的结构校验、审核与改稿等**结构化输出**路径保持非流式：它们要求完整 JSON 才能通过 Pydantic 校验。
+- **语气口径**：正文按“资讯分享者”写（第一人称判断克制使用、可以口语化），禁止百科定义句与研报腔；长期规范放在仓库文件 `preferences/style.md`，会同时注入生成/改稿/审核三处。
+- **审核口径**：只审两件事——**语气**（是不是分享者在讲，而不是百科词条）与**通顺**（重复绕圈、指代不清、句子接不上）；术语选择、措辞偏好、要不要补背景等细节不再计入缺陷，minor 最多 2 条且只用于语气与通顺。
 
 “每天 9 点采集 AI 资讯”会创建 `pending_confirmation` 定时计划；“发布到某平台”会创建 `pending_confirmation` 发布计划。确认按钮当前只把计划状态改为 `confirmed`，不注册调度器、不连接平台账号、不执行发布。计划 Tool 与规则 Skill 分别位于 `app/tools/plan_tools.py` 和 `agent_skills/controlled-operations/SKILL.md`。
 

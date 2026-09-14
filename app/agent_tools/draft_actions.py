@@ -14,7 +14,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from app.config import Settings, get_settings
-from app.domain.models import ConversationIntent, ReviewCommand, ReviewStatus
+from app.domain.models import ConversationIntent, ConversationRunStatus, ReviewCommand, ReviewStatus
 from app.jobs import (
     enqueue_auto_review_job,
     enqueue_draft_regeneration_job,
@@ -68,15 +68,65 @@ def _announce(repository: ContentRepository, session_id: str, run: Any, pending:
 
     后台任务结束时 `_report_*` 会更新这条消息，用户才能在**对话里**看到结果；
     否则结果只留在运行摘要里，看起来像“没有回复”（真实反馈：报告不在聊天框里）。
+
+    受理运行（HTTP 入队时已经写过确定性回执）不再追加“好，正在…”：回执已经说明了这一步，
+    重复气泡只会让对话变长（真实反馈：任务详情太啰嗦）。此时把这句话降级成运行事件。
     """
+    if run.response_message_id:
+        repository.add_chat_agent_event(
+            run.id, "已开始处理", pending, "running",
+            metadata={"phase": "intake", "state": "running"},
+        )
+        return run.response_message_id
     message = repository.create_chat_message(session_id, "assistant", pending)
     run.response_message_id = message.id
     repository.session.flush()
     return message.id
 
 
+def _task_run(
+    repository: ContentRepository,
+    session_id: str,
+    chat_run_id: str | None,
+    intent: ConversationIntent,
+    *,
+    auto_illustration: bool = False,
+) -> Any:
+    """复用用户消息的受理运行（有则改意图），否则新建一条。
+
+    同一条用户消息只应该有一条运行：否则“生成记录”里会出现两条，对话里也会出现两张卡片。
+    """
+    if chat_run_id:
+        run = repository.get_chat_agent_run(chat_run_id)
+        if run.status == ConversationRunStatus.RUNNING.value:
+            run.intent = intent.value if isinstance(intent, ConversationIntent) else str(intent)
+            return run
+    return repository.create_chat_agent_run(session_id, None, intent, False, auto_illustration)
+
+
+async def start_auto_review(
+    settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
+    deliver: bool, chat_run_id: str | None = None,
+) -> dict[str, Any]:
+    """自动审核的公开入口：对话派发与 Agent 工具共用同一实现。"""
+    return await _start_review(
+        settings, repository, session_id, draft, deliver=deliver, chat_run_id=chat_run_id
+    )
+
+
+async def start_draft_rewrite(
+    settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
+    origin_run: Any | None = None, chat_run_id: str | None = None,
+) -> dict[str, Any]:
+    """按已保存来源证据重写的公开入口。"""
+    return await _start_rewrite(
+        settings, repository, session_id, draft, origin_run=origin_run, chat_run_id=chat_run_id
+    )
+
+
 async def _start_review(
-    settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *, deliver: bool
+    settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
+    deliver: bool, chat_run_id: str | None = None,
 ) -> dict[str, Any]:
     from app.services.pending_reviews import ACTIVE_IMAGE_STATUSES, mark_pending_review
 
@@ -87,7 +137,7 @@ async def _start_review(
     # 配图还在生成时不立刻审核：否则审核会看到“还没有正文插图”的草稿，
     # 汇报也会与实际时序矛盾（真实反馈：“感觉这样不是很合理”）。
     active_images = repository.count_active_image_jobs(draft.id, ACTIVE_IMAGE_STATUSES)
-    chat_run = repository.create_chat_agent_run(session_id, None, ConversationIntent.RUN_AUTO_REVIEW, False, False)
+    chat_run = _task_run(repository, session_id, chat_run_id, ConversationIntent.RUN_AUTO_REVIEW)
     if active_images:
         mark_pending_review(repository, draft.id, deliver=deliver, chat_run_id=chat_run.id)
         _announce(
@@ -102,6 +152,7 @@ async def _start_review(
         )
         return {
             "status": "queued_after_images",
+            "status_text": "审核已排队（等待配图）",
             "draft_id": draft.id,
             "draft_title": _draft_label(draft),
             "pending_images": active_images,
@@ -123,6 +174,7 @@ async def _start_review(
     )
     return {
         "status": "started",
+        "status_text": "审核中",
         "draft_id": draft.id,
         "draft_title": _draft_label(draft),
         "deliver": deliver,
@@ -134,15 +186,30 @@ async def _start_review(
 
 
 async def _start_rewrite(
-    settings: Settings, repository: ContentRepository, session_id: str, draft: Any
+    settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
+    origin_run: Any | None = None, chat_run_id: str | None = None,
 ) -> dict[str, Any]:
-    origin_run = repository.find_generation_run_for_draft(draft.id)
+    if origin_run is None:
+        origin_run = repository.find_generation_run_for_draft(draft.id)
     if origin_run is None:
         return {"status": "rejected", "message": "这篇缺少可回溯的原生成记录，无法按已保存证据重写。"}
-    assistant_message = repository.create_chat_message(
-        session_id, "assistant", f"正在用已保存的 README 与证据包重写《{_draft_label(draft)}》…"
-    )
-    repository.reopen_generation_run(origin_run, assistant_message.id, False, False)
+    if chat_run_id:
+        # 重写会在原生成记录里跑：受理运行只作为“已受理”的对话锚点，随即结束，
+        # 否则对话里会一直挂着一条“处理中”的运行。
+        chat_run = _task_run(repository, session_id, chat_run_id, ConversationIntent.REGENERATE_DRAFT)
+        anchor_message_id = _announce(
+            repository, session_id, chat_run,
+            f"正在用已保存的 README 与证据包重写《{_draft_label(draft)}》…",
+        )
+        repository.finish_chat_agent_run(
+            chat_run.id, anchor_message_id, ConversationRunStatus.COMPLETED,
+            f"已转交重写任务：{_draft_label(draft)}", [{"tool": "rewrite_draft", "draft_id": draft.id}],
+        )
+    else:
+        anchor_message_id = repository.create_chat_message(
+            session_id, "assistant", f"正在用已保存的 README 与证据包重写《{_draft_label(draft)}》…"
+        ).id
+    repository.reopen_generation_run(origin_run, anchor_message_id, False, False)
     origin_run.summary = "正在重写文案"
     repository.add_chat_agent_event(
         origin_run.id, "重写文案",
@@ -160,6 +227,7 @@ async def _start_rewrite(
     )
     return {
         "status": "started",
+        "status_text": "重写已开始",
         "draft_id": draft.id,
         "draft_title": _draft_label(draft),
         "run_id": origin_run.id,
@@ -167,8 +235,133 @@ async def _start_rewrite(
     }
 
 
-def build_draft_action_tools(session_id: str):
-    """构造只作用于本会话草稿的动作 Tool。"""
+async def start_illustration_generation(
+    settings: Settings,
+    repository: ContentRepository,
+    session: Any,
+    *,
+    session_id: str,
+    draft: Any,
+    purpose: str,
+    placement: int,
+    chat_run_id: str | None = None,
+) -> dict[str, Any]:
+    """配图公开入口：只入队，绝不同步等图片生成（那是对话“卡住”的根因）。
+
+    对话派发与 Agent 工具共用；运行复用用户消息的受理运行，事件也写在它上面。
+    """
+    from app.tools.illustration_planner import style_for, subject_for
+
+    resolved = purpose if purpose in {"cover", "inline"} else "cover"
+    placement = 0 if resolved == "cover" else max(0, min(int(placement), MAX_PLACEMENT))
+    chat_run = _task_run(
+        repository, session_id, chat_run_id, ConversationIntent.GENERATE_DRAFT_IMAGE,
+        auto_illustration=True,
+    )
+    _announce(
+        repository, session_id, chat_run,
+        f"好，正在为《{_draft_label(draft)}》生成{'封面图' if resolved == 'cover' else '正文插图'}。",
+    )
+    task = repository.create_image_generation_job(
+        chat_run.id, draft.id, resolved, placement,
+        subject_for(draft, resolved), style_for(draft, resolved),
+    )
+    repository.add_chat_agent_event(
+        chat_run.id, "图片任务已入队",
+        f"正在生成{'封面图' if resolved == 'cover' else f'第 {placement} 段后的正文插图'}。",
+        "running",
+        metadata={"phase": "image", "state": "queued", "draft_ids": [draft.id], "task_id": task.id},
+    )
+    session.commit()
+    arq_job_id = await enqueue_image_generation_job(settings, task.id)
+    repository.update_image_generation_job(task.id, "queued", arq_job_id=arq_job_id)
+    session.commit()
+    logger.info(
+        "start_illustration_generation session_id=%s draft_id=%s purpose=%s job_id=%s",
+        session_id, draft.id, resolved, arq_job_id,
+    )
+    return {
+        "status": "started",
+        "status_text": "配图已入队",
+        "draft_id": draft.id,
+        "draft_title": _draft_label(draft),
+        "purpose": resolved,
+        "placement_after_paragraph": placement,
+        "task_id": task.id,
+        "chat_run_id": chat_run.id,
+        "message": f"已开始为《{_draft_label(draft)}》生成{'封面图' if resolved == 'cover' else '正文插图'}。",
+    }
+
+
+async def _start_wechat_draft_delivery(
+    settings: Settings,
+    repository: ContentRepository,
+    session: Any,
+    *,
+    session_id: str,
+    draft: Any,
+    chat_run_id: str | None = None,
+    updating: bool = False,
+) -> dict[str, Any]:
+    """公众号草稿投递公开入口：入队后由后台完成并汇报（不会发表）。"""
+    from app.jobs import enqueue_wechat_delivery_job
+
+    chat_run = _task_run(
+        repository, session_id, chat_run_id, ConversationIntent.PUBLISH_TO_WECHAT_DRAFT
+    )
+    _announce(
+        repository, session_id, chat_run,
+        f"好，正在{'更新' if updating else '创建'}公众号草稿（{_draft_label(draft)}）；不会发表，完成后我会汇报。",
+    )
+    repository.add_chat_agent_event(
+        chat_run.id, "投递任务已入队",
+        f"将{'原地覆盖' if updating else '创建'}公众号草稿（{_draft_label(draft)}），不会发表。",
+        "running",
+        metadata={"phase": "text", "state": "queued", "draft_ids": [draft.id]},
+    )
+    session.commit()
+    try:
+        job_id = await enqueue_wechat_delivery_job(settings, draft.id, chat_run.id)
+    except Exception as exc:
+        logger.warning("wechat_delivery_enqueue_failed draft_id=%s error_type=%s", draft.id, type(exc).__name__)
+        return {"status": "failed", "draft_id": draft.id, "message": f"投递任务未能入队：{exc}"}
+    repository.add_chat_agent_event(
+        chat_run.id, "投递任务已创建", f"任务编号：{job_id}",
+        metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [draft.id]},
+    )
+    session.commit()
+    logger.info("wechat_delivery_enqueued draft_id=%s updating=%s job_id=%s", draft.id, updating, job_id)
+    return {
+        "status": "started",
+        "status_text": "投递已入队",
+        "draft_id": draft.id,
+        "draft_title": _draft_label(draft),
+        "updated_remote": updating,
+        "chat_run_id": chat_run.id,
+        "message": f"已开始{'更新' if updating else '创建'}公众号草稿（{_draft_label(draft)}），完成后我会汇报；不会发表。",
+    }
+
+
+async def start_wechat_draft_delivery(
+    settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
+    chat_run_id: str | None = None,
+) -> dict[str, Any]:
+    """对话派发用的投递入口：自己开会话，状态由后台投递任务汇报。"""
+    if not settings.auto_wechat_draft_enabled:
+        return {"status": "rejected", "message": "公众号草稿投递开关未启用（AUTO_WECHAT_DRAFT_ENABLED=false）。"}
+    existing = repository.get_wechat_publication_for_draft(draft.id)
+    updating = bool(existing is not None and existing.wechat_draft_media_id)
+    return await _start_wechat_draft_delivery(
+        settings, repository, repository.session, session_id=session_id, draft=draft,
+        chat_run_id=chat_run_id, updating=updating,
+    )
+
+
+def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None):
+    """构造只作用于本会话草稿的动作 Tool。
+
+    `chat_run_id` 传入用户消息的受理运行时，工具不再各自新建运行与重复气泡。
+    """
 
     async def _impl_run_auto_review(draft_id: str = "", deliver: bool = False) -> dict[str, Any]:
         """对当前文章发起自动审核（规则 + 模型审核，并按意见改稿一轮）。
@@ -181,7 +374,9 @@ def build_draft_action_tools(session_id: str):
             draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=REVIEWABLE_STATUSES)
             if draft is None:
                 return {"status": "rejected", "message": reason}
-            result = await _start_review(settings, repository, session_id, draft, deliver=deliver)
+            result = await _start_review(
+                settings, repository, session_id, draft, deliver=deliver, chat_run_id=chat_run_id
+            )
             session.commit()
         logger.info("agent_tool_run_auto_review session_id=%s draft_id=%s status=%s", session_id, draft_id or "-", result.get("status"))
         return result
@@ -194,7 +389,9 @@ def build_draft_action_tools(session_id: str):
             draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=EDITABLE_STATUSES)
             if draft is None:
                 return {"status": "rejected", "message": reason}
-            result = await _start_rewrite(settings, repository, session_id, draft)
+            result = await _start_rewrite(
+                settings, repository, session_id, draft, chat_run_id=chat_run_id
+            )
             session.commit()
         logger.info("agent_tool_rewrite_draft session_id=%s draft_id=%s status=%s", session_id, draft_id or "-", result.get("status"))
         return result
@@ -249,39 +446,11 @@ def build_draft_action_tools(session_id: str):
             draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=REVIEWABLE_STATUSES)
             if draft is None:
                 return {"status": "rejected", "message": reason}
-            chat_run = repository.create_chat_agent_run(session_id, None, ConversationIntent.GENERATE_DRAFT_IMAGE, False, True)
-            _announce(
-                repository, session_id, chat_run,
-                f"好，正在为《{_draft_label(draft)}》生成{'封面图' if resolved == 'cover' else '正文插图'}。",
+            return await start_illustration_generation(
+                settings, repository, session,
+                session_id=session_id, draft=draft, purpose=resolved, placement=placement,
+                chat_run_id=chat_run_id,
             )
-            from app.tools.illustration_planner import style_for, subject_for
-
-            task = repository.create_image_generation_job(
-                chat_run.id, draft.id, resolved, placement,
-                subject_for(draft, resolved), style_for(draft, resolved),
-            )
-            repository.add_chat_agent_event(
-                chat_run.id, "图片任务已入队",
-                f"正在生成{'封面图' if resolved == 'cover' else f'第 {placement} 段后的正文插图'}。",
-                "running",
-                metadata={"phase": "image", "state": "queued", "draft_ids": [draft.id], "task_id": task.id},
-            )
-            session.commit()
-        arq_job_id = await enqueue_image_generation_job(settings, task.id)
-        with SessionLocal() as session:
-            ContentRepository(session).update_image_generation_job(task.id, "queued", arq_job_id=arq_job_id)
-            session.commit()
-        logger.info("agent_tool_generate_illustration session_id=%s draft_id=%s purpose=%s", session_id, draft.id, resolved)
-        return {
-            "status": "started",
-            "draft_id": draft.id,
-            "draft_title": _draft_label(draft),
-            "purpose": resolved,
-            "placement_after_paragraph": placement,
-            "task_id": task.id,
-            "chat_run_id": chat_run.id,
-            "message": f"已开始为《{_draft_label(draft)}》生成{'封面图' if resolved == 'cover' else '正文插图'}。",
-        }
 
     async def _impl_publish_to_wechat_draft(draft_id: str = "") -> dict[str, Any]:
         """把当前已审核通过的文章投递到微信公众号草稿箱（绝不发表）。
@@ -303,41 +472,10 @@ def build_draft_action_tools(session_id: str):
             existing = repository.get_wechat_publication_for_draft(draft.id)
             updating = bool(existing is not None and existing.wechat_draft_media_id)
             # 投递要上传图片并调用微信写接口，耗时远超对话请求时限：只入队，由后台完成并汇报。
-            chat_run = repository.create_chat_agent_run(session_id, None, ConversationIntent.PUBLISH_TO_WECHAT_DRAFT, False, False)
-            _announce(
-                repository, session_id, chat_run,
-                f"好，正在{'更新' if updating else '创建'}公众号草稿（{_draft_label(draft)}）；不会发表，完成后我会汇报。",
+            return await _start_wechat_draft_delivery(
+                settings, repository, session,
+                session_id=session_id, draft=draft, chat_run_id=chat_run_id, updating=updating,
             )
-            repository.add_chat_agent_event(
-                chat_run.id, "投递任务已入队",
-                f"将{'原地覆盖' if updating else '创建'}公众号草稿（{_draft_label(draft)}），不会发表。",
-                "running",
-                metadata={"phase": "text", "state": "queued", "draft_ids": [draft.id]},
-            )
-            session.commit()
-        try:
-            from app.jobs import enqueue_wechat_delivery_job
-
-            job_id = await enqueue_wechat_delivery_job(settings, draft.id, chat_run.id)
-        except Exception as exc:
-            logger.warning("agent_tool_publish_enqueue_failed draft_id=%s error_type=%s", draft.id, type(exc).__name__)
-            return {"status": "failed", "draft_id": draft.id, "message": f"投递任务未能入队：{exc}"}
-        with SessionLocal() as session:
-            repository = ContentRepository(session)
-            repository.add_chat_agent_event(
-                chat_run.id, "投递任务已创建", f"任务编号：{job_id}",
-                metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [draft.id]},
-            )
-            session.commit()
-        logger.info("agent_tool_publish_enqueued draft_id=%s updating=%s job_id=%s", draft.id, updating, job_id)
-        return {
-            "status": "started",
-            "draft_id": draft.id,
-            "draft_title": _draft_label(draft),
-            "updated_remote": updating,
-            "chat_run_id": chat_run.id,
-            "message": f"已开始{'更新' if updating else '创建'}公众号草稿（{_draft_label(draft)}），完成后我会汇报；不会发表。",
-        }
 
     async def _impl_reselect_publication_assets(draft_id: str = "") -> dict[str, Any]:
         """作废当前投递素材选择并按最新口径重新选择（真实截图优先、AI 配图补足）。
@@ -359,8 +497,8 @@ def build_draft_action_tools(session_id: str):
             invalidated = repository.invalidate_unfinished_wechat_publication_for_regeneration(
                 draft.id, "用户要求按最新口径重新选择投递配图。"
             )
-            chat_run = repository.create_chat_agent_run(
-                session_id, None, ConversationIntent.RESELECT_PUBLICATION_ASSETS, False, False
+            chat_run = _task_run(
+                repository, session_id, chat_run_id, ConversationIntent.RESELECT_PUBLICATION_ASSETS
             )
             _announce(
                 repository, session_id, chat_run,
@@ -394,6 +532,7 @@ def build_draft_action_tools(session_id: str):
         )
         return {
             "status": "started",
+            "status_text": "正在重新选择配图",
             "draft_id": draft.id,
             "draft_title": _draft_label(draft),
             "previous_selection_invalidated": invalidated,

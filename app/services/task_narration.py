@@ -50,6 +50,14 @@ def _client(settings: Settings):
     return wrap_openai(client) if langsmith_enabled(settings) else client
 
 
+def _prompt_for(task: str, facts: dict) -> str:
+    return (
+        f"任务：{task}\n"
+        f"结果（JSON）：{json.dumps(facts, ensure_ascii=False, default=str)}\n"
+        "请写出给用户的汇报。"
+    )
+
+
 def compose_task_reply(
     settings: Settings,
     *,
@@ -63,14 +71,12 @@ def compose_task_reply(
     if not (getattr(settings, "llm_enabled", False) and api_key_for(settings, "conversation") and selected_model):
         return fallback
     try:
-        prompt = (
-            f"任务：{task}\n"
-            f"结果（JSON）：{json.dumps(facts, ensure_ascii=False, default=str)}\n"
-            "请写出给用户的汇报。"
-        )
         response = _client(settings).chat.completions.create(
             model=selected_model,
-            messages=[{"role": "system", "content": _SYSTEM}, {"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user", "content": _prompt_for(task, facts)},
+            ],
             temperature=0.3,
         )
         reply = (response.choices[0].message.content or "").strip()
@@ -81,3 +87,51 @@ def compose_task_reply(
     except Exception as exc:  # 汇报失败不能影响任务结果
         logger.warning("task_reply_failed task=%s run_id=%s error_type=%s", task, run_id, type(exc).__name__)
         return fallback
+
+
+def compose_task_reply_streaming(
+    settings: Settings,
+    *,
+    task: str,
+    facts: dict,
+    fallback: str,
+    run_id: str = "",
+    on_delta=None,
+) -> str:
+    """流式汇报：边收边推增量，**失败自动回退非流式**，返回值始终是完整文本。
+
+    结构化路径（生成/审核/改稿）不在这里：它们要求完整 JSON，无法边生成边用。
+    """
+    selected_model = model_for(settings, "conversation")
+    if not (getattr(settings, "llm_enabled", False) and api_key_for(settings, "conversation") and selected_model):
+        return fallback
+    try:
+        stream = _client(settings).chat.completions.create(
+            model=selected_model,
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user", "content": _prompt_for(task, facts)},
+            ],
+            temperature=0.3,
+            stream=True,
+        )
+        pieces: list[str] = []
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            delta = getattr(choices[0].delta, "content", None) if choices else None
+            if not delta:
+                continue
+            pieces.append(delta)
+            if on_delta is not None:
+                on_delta(delta)
+        reply = "".join(pieces).strip()
+        if not reply:
+            logger.warning("task_reply_stream_empty task=%s run_id=%s", task, run_id)
+            return compose_task_reply(settings, task=task, facts=facts, fallback=fallback, run_id=run_id)
+        logger.info("task_reply_streamed task=%s run_id=%s chars=%s", task, run_id, len(reply))
+        return reply[:MAX_REPLY_CHARS]
+    except Exception as exc:  # 网络中断、网关不支持 stream 等：回退非流式
+        logger.warning(
+            "task_reply_stream_failed task=%s run_id=%s error_type=%s", task, run_id, type(exc).__name__
+        )
+        return compose_task_reply(settings, task=task, facts=facts, fallback=fallback, run_id=run_id)

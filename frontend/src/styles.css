@@ -100,3 +100,26 @@ nav { display: grid; gap: 6px; }.nav-item { display:flex; gap:10px; align-items:
 .model-profile-row { min-height:48px; }.profile-key-state { display:flex; align-items:center; gap:8px; color:#8290a7; font-size:13px; white-space:nowrap; }.profile-key-state strong { color:#151d2d; letter-spacing:1.5px; font-size:14px; }
 .settings-modal-backdrop { position:fixed; inset:0; z-index:80; display:grid; place-items:center; padding:20px; background:rgba(17,25,43,.46); backdrop-filter:blur(3px); }.settings-modal { width:min(560px,100%); max-height:calc(100vh - 40px); overflow:auto; box-sizing:border-box; padding:24px; border:1px solid #e5e1fd; border-radius:20px; background:#fff; box-shadow:0 24px 72px rgba(30,35,68,.25); }.settings-modal h2 { margin:3px 0 4px; color:#202c45; }.settings-modal label { display:flex; flex-direction:column; gap:7px; margin-top:17px; color:#40506e; font-weight:650; }.settings-modal label small { color:#8792a8; font-weight:400; }.settings-modal input { width:100%; box-sizing:border-box; border:1px solid #dfe3f1; border-radius:10px; padding:10px 12px; color:#263653; background:#fff; font:inherit; }.settings-modal .panel-heading { align-items:flex-start; }.icon-button { display:grid; place-items:center; width:34px; height:34px; border:0; border-radius:9px; background:#f3f2fb; color:#52617c; cursor:pointer; }.api-key-input-row { display:flex; gap:9px; align-items:center; }.api-key-input-row input { flex:1; letter-spacing:2px; }.api-key-input-row .text-button { flex:none; padding:8px 4px; white-space:nowrap; }.settings-modal-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:24px; }
 @media (max-width:920px) { .settings-row { align-items:flex-start; flex-wrap:wrap; }.profile-key-state { order:3; width:100%; }.settings-modal-backdrop { padding:12px; }.settings-modal { padding:20px; } }
+
+/* 流式回复的临时气泡：持久化消息到达后立即消失，所以只做轻量提示。 */
+.streaming-text { position:relative; }.stream-caret { display:inline-block; margin-left:1px; color:#7569e9; animation:stream-blink 1s steps(2, start) infinite; }
+@keyframes stream-blink { to { visibility:hidden; } }
+
+/* 对话工作区：三栏等高，消息区吃掉剩余空间并在自身滚动。 */
+:root { --chat-workspace-height: max(720px, calc(100vh - 190px)); }
+.chat-layout { align-items:stretch; min-height:var(--chat-workspace-height); }
+.chat-panel,.session-panel,.attachment-panel { min-height:var(--chat-workspace-height); }
+.chat-panel { height:var(--chat-workspace-height); }
+.session-panel,.attachment-panel { height:var(--chat-workspace-height); max-height:none; overflow-y:auto; scrollbar-gutter:stable; }
+.messages { min-height:0; max-height:none; overflow-y:auto; }
+
+/* 模型档案：名称、固定掩码和操作区使用稳定列，避免每行因按钮数量或名称长度错位。 */
+.settings-row.model-profile-row { display:grid; grid-template-columns:minmax(220px,1fr) 184px minmax(242px,auto); align-items:center; }
+.model-profile-row > :first-child { min-width:0; }
+.model-profile-row .profile-key-state { display:grid; grid-template-columns:58px minmax(0,1fr); column-gap:10px; align-items:center; min-width:184px; }
+.model-profile-row .inline-actions { justify-self:end; justify-content:flex-end; min-width:242px; }
+@media (max-width:760px) { .settings-row.model-profile-row { grid-template-columns:1fr; gap:10px; }.model-profile-row .profile-key-state,.model-profile-row .inline-actions { width:100%; min-width:0; justify-self:stretch; }.model-profile-row .inline-actions { justify-content:flex-start; } }
+
+/* 正文流式：和对话回复区分开，标明这是正在写的文章正文。 */
+.draft-stream p { background:#f7f6ff; border:1px dashed #dcd7ff; color:#3c4560; }
+.draft-stream small { color:#7b74c9; }

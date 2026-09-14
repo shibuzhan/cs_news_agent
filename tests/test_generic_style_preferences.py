@@ -50,7 +50,10 @@ def test_style_notes_round_trip_and_dedupe() -> None:
     assert remove_style_note(repository, "正文不要用问句做小标题") == ("每篇文末加一行：本文由 AI 整理",)
 
 
-def test_rules_block_is_empty_without_notes_and_renders_otherwise() -> None:
+def test_rules_block_is_empty_without_notes_and_renders_otherwise(tmp_path, monkeypatch) -> None:
+    # 仓库里的 preferences/style.md 现在有正式生效的语气规范，这里必须隔离到临时目录，
+    # 否则断言的是“当前仓库正好没写风格”，而不是代码行为。
+    monkeypatch.setenv("NEWS_AGENT_PREFERENCES_DIR", str(tmp_path))
     repository = _Repository()
 
     assert preference_rules_block(repository) == ""

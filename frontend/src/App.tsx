@@ -1,6 +1,6 @@
 import { Component, type ErrorInfo, useCallback, useEffect, useRef, useState } from "react";
 import { Bell, Check, ChevronDown, CircleAlert, CircleCheck, Download, FileText, Image, LoaderCircle, MessageSquareText, Paperclip, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X } from "lucide-react";
-import { api } from "./api";
+import { api, chatRunStreamUrl } from "./api";
 import type { AgentRun, Attachment, AutoReviewRun, ChatMessage, ChatSession, Conversation, Draft, DraftIllustration, DraftRevision, ModelProfile, Notification, RuntimeSettingsSnapshot, WechatPublicationJob, WechatRemoteDraft, PublicationPreferences } from "./types";
 
 type View = "chat" | "review" | "publishing" | "settings";
@@ -235,11 +235,49 @@ function ChatPage() {
 
   const activeRun = conversation?.agent_runs?.some((run) => run.status === "running") ?? false;
   const activeSessionId = conversation?.session.id;
+  const streamingRunId = conversation?.agent_runs?.find((run) => run.status === "running")?.id;
+  // 按类别分开累积：draft＝正在写的正文，chat/report＝对话回复与任务汇报。
+  const [streams, setStreams] = useState<Record<string, string>>({});
   useEffect(() => {
     if (!activeRun || !activeSessionId) return;
     const timer = window.setInterval(() => void reload(activeSessionId), 2000);
     return () => window.clearInterval(timer);
   }, [activeRun, activeSessionId, reload]);
+
+  // 有运行在跑时才连 SSE：增量文本逐字出现；连接失败/中断就静默关闭，轮询仍会带回最终消息。
+  useEffect(() => {
+    if (!streamingRunId) {
+      setStreams({});
+      return;
+    }
+    setStreams({});
+    const source = new EventSource(chatRunStreamUrl(streamingRunId));
+    source.addEventListener("delta", (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as { text?: string; kind?: string; reset?: boolean };
+      const kind = payload.kind || "chat";
+      if (payload.reset) {
+        setStreams((current) => ({ ...current, [kind]: "" }));
+        return;
+      }
+      if (payload.text) setStreams((current) => ({ ...current, [kind]: (current[kind] || "") + payload.text }));
+    });
+    source.addEventListener("done", (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as { text?: string; kind?: string };
+      const kind = payload.kind || "chat";
+      if (kind === "draft") {
+        // 正文这一类结束只是“写完了”，运行还在继续（审核/配图），不要断开连接。
+        setStreams((current) => ({ ...current, draft: "" }));
+        return;
+      }
+      if (payload.text) setStreams((current) => ({ ...current, [kind]: payload.text || "" }));
+      if (activeSessionId) void reload(activeSessionId);
+    });
+    // 运行结束时服务端会关闭连接（浏览器随后触发 error）：这里关掉即可，轮询是兜底。
+    source.onerror = () => { source.close(); };
+    return () => source.close();
+  }, [streamingRunId, activeSessionId, reload]);
+  const replyStream = streams.chat || streams.report || "";
+  const draftStream = streams.draft || "";
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -288,13 +326,19 @@ function ChatPage() {
       setConversation((current) => current?.session.id === sessionId
         ? {
           ...current,
-          messages: current.messages.map((message) => message.id === optimisticId ? response.message : message),
+          // 用户消息与确定性回执一起落到界面上：不必等 reload，也不必等模型。
+          messages: [
+            ...current.messages.map((message) => message.id === optimisticId ? response.message : message),
+            ...(response.receipt && !current.messages.some((message) => message.id === response.receipt?.id)
+              ? [response.receipt]
+              : []),
+          ],
           agent_runs: response.execution
             ? [...current.agent_runs.filter((run) => run.id !== response.execution?.id), response.execution]
             : current.agent_runs,
         }
         : current);
-      console.info("chat_message_send_accepted", { sessionId, messageId: response.message.id, runId: response.execution?.id || null });
+      console.info("chat_message_send_accepted", { sessionId, messageId: response.message.id, receiptId: response.receipt?.id || null, runId: response.execution?.id || null });
       await reload(sessionId);
       if (response.processing?.draft_id) setNotice(`草稿 ${response.processing.draft_id} 已进入生成记录。`);
     } catch (error) {
@@ -321,6 +365,10 @@ function ChatPage() {
         <div className="messages" ref={messageListRef}>
           {!conversation && <div className="empty"><LoaderCircle className="spin" /> 正在创建对话…</div>}
           {conversation?.messages?.map((message) => <MessageBubble key={message.id} message={message} execution={conversation.agent_runs?.find((run) => (run.response_message_id || run.request_message_id) === message.id)} onConfirmPlan={async (tool, planId) => { setBusy(true); setNotice(""); try { await (tool === "create_schedule_plan" ? api.confirmSchedulePlan(planId) : api.confirmPublishPlan(planId)); await reload(conversation.session.id); setNotice("计划已确认。当前版本只记录确认，不会真正执行定时任务或发布内容。"); } catch (error) { setNotice(error instanceof Error ? error.message : "确认失败"); } finally { setBusy(false); } }} />)}
+          {/* 流式回复：内容逐字出现；持久化消息一到（下一轮轮询）这块临时气泡就被清掉。 */}
+          {replyStream && activeRun && <article className="message assistant"><span className="avatar">A</span><div><p className="streaming-text">{replyStream}<span className="stream-caret">▍</span></p><small>正在生成…</small></div></article>}
+          {/* 正文生成中：一次调用要写几分钟，边写边显示，避免长时间黑箱等待。 */}
+          {draftStream && activeRun && <article className="message assistant draft-stream"><span className="avatar">A</span><div><p className="streaming-text">{draftStream}<span className="stream-caret">▍</span></p><small>正在写正文 · 已 {draftStream.length} 字</small></div></article>}
         </div>
         {selectedAttachment && <div className="selected-file"><FileText size={18} /><span><b>{selectedAttachment.original_name}</b><small>{displaySize(selectedAttachment.size_bytes)} · {statusLabel(selectedAttachment.status)}</small></span><button aria-label="取消选择附件" onClick={() => setSelectedAttachment(null)}><X size={16} /></button></div>}
         <div className="composer">
@@ -334,12 +382,40 @@ function ChatPage() {
   </>;
 }
 
+// 卡片标题只给状态：运行摘要可能是历史遗留的整句话，绝不能整段显示（真实反馈：下方太详细）。
+const RUN_INTENT_LABELS: Record<string, string> = {
+  collect_news: "采集完成",
+  attachment_draft: "附件草稿已生成",
+  generate_draft_image: "配图完成",
+  run_auto_review: "审核完成",
+  regenerate_draft: "重写完成",
+  publish_to_wechat_draft: "投递完成",
+  reselect_publication_assets: "配图已重选",
+  reuse_draft_assets: "已复用配图",
+  general_chat: "已回复",
+};
+const RUN_STATUS_MAX_CHARS = 18;
+
+function shortRunStatus(run: AgentRun | undefined): string {
+  if (!run) return "";
+  const summary = (run.summary || "").trim();
+  if (summary && summary.length <= RUN_STATUS_MAX_CHARS) return summary;
+  if (run.status === "running") return "正在处理中";
+  if (run.status === "failed") return "处理失败";
+  if (run.status === "waiting_confirmation") return "等待确认";
+  return RUN_INTENT_LABELS[run.intent] || "已完成处理";
+}
+
 function MessageBubble({ message, execution, onConfirmPlan }: { message: ChatMessage; execution?: AgentRun; onConfirmPlan: (tool: string, planId: string) => Promise<void> }) {
   const toolResults = Array.isArray(execution?.tool_results) ? execution.tool_results : [];
   const planTool = toolResults.find((item) => item.plan_id && item.tool);
   const pendingPlan = planTool?.status !== "confirmed";
   const failed = execution?.status === "failed";
-  return <article className={message.role === "user" ? "message user" : "message assistant"}><span className="avatar">{message.role === "user" ? "你" : "A"}</span><div><p>{message.content}</p>{message.delivery_state === "sending" && <small>正在发送…</small>}{message.delivery_state === "failed" && <small className="failed">发送失败：{message.delivery_error || "请重试"}</small>}{execution && <details className="execution-summary"><summary className={failed ? "failed" : undefined}>{failed ? <CircleAlert size={15} /> : <CircleCheck size={15} />} {execution.summary || (execution.status === "running" ? "正在处理中" : "已完成处理")}<ChevronDown size={15} /></summary><ol>{[...execution.events].reverse().map((event) => <li key={event.id}><b>{event.title}</b><span>{event.detail}</span></li>)}</ol>{execution.status === "waiting_confirmation" && pendingPlan && planTool?.plan_id && <button className="confirm-plan" onClick={() => void onConfirmPlan(planTool.tool!, planTool.plan_id!)}>确认计划（不执行）</button>}</details>}<small>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small></div></article>;
+  const running = execution?.status === "running";
+  const statusText = shortRunStatus(execution);
+  // 完整摘要不丢：需要细节时展开即可看到。
+  const fullSummary = (execution?.summary || "").trim();
+  return <article className={message.role === "user" ? "message user" : "message assistant"}><span className="avatar">{message.role === "user" ? "你" : "A"}</span><div><p>{message.content}</p>{message.delivery_state === "sending" && <small>正在发送…</small>}{message.delivery_state === "failed" && <small className="failed">发送失败：{message.delivery_error || "请重试"}</small>}{execution && <details className="execution-summary"><summary className={failed ? "failed" : undefined}>{failed ? <CircleAlert size={15} /> : running ? <LoaderCircle className="spin" size={15} /> : <CircleCheck size={15} />} {statusText}<ChevronDown size={15} /></summary><ol>{fullSummary && fullSummary !== statusText && <li><b>处理结果</b><span>{fullSummary}</span></li>}{[...execution.events].reverse().map((event) => <li key={event.id}><b>{event.title}</b><span>{event.detail}</span></li>)}</ol>{execution.status === "waiting_confirmation" && pendingPlan && planTool?.plan_id && <button className="confirm-plan" onClick={() => void onConfirmPlan(planTool.tool!, planTool.plan_id!)}>确认计划（不执行）</button>}</details>}<small>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small></div></article>;
 }
 
 function autoReviewStatusLabel(status: string) {

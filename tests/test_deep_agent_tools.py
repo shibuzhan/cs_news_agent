@@ -138,7 +138,10 @@ def test_deep_agent_returns_structured_decision_with_session_checkpoint(monkeypa
     monkeypatch.setattr(content_deep_agent, "PostgresSaver", FakePostgresSaver)
     monkeypatch.setattr(content_deep_agent, "build_conversation_context_tools", lambda _session_id: ["context-tool"])
     monkeypatch.setattr(content_deep_agent, "build_draft_asset_tools", lambda _session_id: ["asset-tool"])
-    monkeypatch.setattr(content_deep_agent, "build_draft_action_tools", lambda _session_id: ["action-tool"])
+    monkeypatch.setattr(
+        content_deep_agent, "build_draft_action_tools",
+        lambda _session_id, chat_run_id=None: ["action-tool"],
+    )
     monkeypatch.setattr(content_deep_agent, "build_source_media_tools", lambda _session_id: ["media-tool"])
     monkeypatch.setattr(
         content_deep_agent,
@@ -160,7 +163,7 @@ def test_deep_agent_returns_structured_decision_with_session_checkpoint(monkeypa
         conversation_agent_timeout_seconds=45,
     )
 
-    decision = ContentDeepAgent(settings)._resolve_sync("session-1", "继续处理这篇文章", False)
+    decision, _tools_called = ContentDeepAgent(settings)._resolve_sync("session-1", "继续处理这篇文章", False)
 
     kwargs = captured["agent_kwargs"]
     assert decision.reply == "已读取当前会话上下文。"
@@ -212,7 +215,10 @@ def test_deep_agent_json_mode_omits_structured_tool(monkeypatch) -> None:
     monkeypatch.setattr(content_deep_agent, "PostgresSaver", FakePostgresSaver)
     monkeypatch.setattr(content_deep_agent, "build_conversation_context_tools", lambda _session_id: ["context-tool"])
     monkeypatch.setattr(content_deep_agent, "build_draft_asset_tools", lambda _session_id: ["asset-tool"])
-    monkeypatch.setattr(content_deep_agent, "build_draft_action_tools", lambda _session_id: ["action-tool"])
+    monkeypatch.setattr(
+        content_deep_agent, "build_draft_action_tools",
+        lambda _session_id, chat_run_id=None: ["action-tool"],
+    )
     monkeypatch.setattr(content_deep_agent, "build_source_media_tools", lambda _session_id: ["media-tool"])
     monkeypatch.setattr(
         content_deep_agent,
@@ -234,7 +240,7 @@ def test_deep_agent_json_mode_omits_structured_tool(monkeypatch) -> None:
         conversation_structured_output_mode="json",
     )
 
-    decision = ContentDeepAgent(settings)._resolve_sync("session-1", "继续处理这篇文章", False)
+    decision, _tools_called = ContentDeepAgent(settings)._resolve_sync("session-1", "继续处理这篇文章", False)
 
     kwargs = captured["agent_kwargs"]
     assert decision.reply == "已读取当前会话上下文。"

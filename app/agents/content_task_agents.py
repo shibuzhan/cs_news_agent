@@ -177,6 +177,78 @@ def _structured_payload(result: Any, name: str) -> Any:
     return payload
 
 
+def _invoke_task_agent(
+    agent: Any, payload: dict[str, Any], *, mode: str, on_delta=None
+) -> dict[str, Any]:
+    """执行任务子 Agent；需要增量时改用流式，失败时回退非流式（生成不能因为流式而失败）。
+
+    `stream_mode=["messages", "values"]` 同时给出 token 分片与最终状态：前者用来推 `body`，
+    后者仍是原先 `invoke` 的返回值，因此结构校验逻辑完全不变。
+    """
+    if on_delta is None:
+        return agent.invoke(payload)
+    from app.services.reply_stream import JsonFieldExtractor
+
+    extractor = JsonFieldExtractor("body")
+    tool_args = _TaskToolArgs()
+    final_state: Any = None
+    try:
+        for stream_mode, chunk in agent.stream(payload, stream_mode=["messages", "values"]):
+            if stream_mode == "messages":
+                message = chunk[0] if isinstance(chunk, tuple) else chunk
+                text = _chunk_content(message) if mode == "json" else tool_args.feed(message)
+                for piece in extractor.feed(text):
+                    on_delta(piece)
+            elif stream_mode == "values":
+                final_state = chunk
+    except Exception as exc:  # noqa: BLE001 - 网关不支持流式/中途断开都退回非流式
+        logger.warning(
+            "content_task_agent_stream_failed mode=%s error_type=%s", mode, type(exc).__name__
+        )
+        return agent.invoke(payload)
+    if not isinstance(final_state, dict):
+        logger.warning("content_task_agent_stream_incomplete mode=%s", mode)
+        return agent.invoke(payload)
+    return final_state
+
+
+class _TaskToolArgs:
+    """累积结构化输出工具的参数分片（tool 模式下正文就在这些 JSON 参数里）。"""
+
+    def __init__(self) -> None:
+        self._names: dict[Any, str] = {}
+
+    def feed(self, message: Any) -> str:
+        chunks = getattr(message, "tool_call_chunks", None)
+        if not chunks and isinstance(message, dict):
+            chunks = message.get("tool_call_chunks")
+        out: list[str] = []
+        for chunk in chunks or []:
+            name = chunk.get("name") if isinstance(chunk, dict) else getattr(chunk, "name", None)
+            index = chunk.get("index") if isinstance(chunk, dict) else getattr(chunk, "index", None)
+            if name:
+                self._names[index] = name
+            tool = self._names.get(index)
+            if tool is None or not str(tool).startswith("DraftWritingResponse"):
+                continue
+            args = chunk.get("args") if isinstance(chunk, dict) else getattr(chunk, "args", None)
+            if isinstance(args, str) and args:
+                out.append(args)
+        return "".join(out)
+
+
+def _chunk_content(message: Any) -> str:
+    content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "") for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        )
+    return ""
+
+
 class RestrictedContentTaskAgent:
     """每次调用临时创建一个任务子 Agent，不共享会话 checkpoint 或记忆。"""
 
@@ -196,11 +268,20 @@ class RestrictedContentTaskAgent:
     def write(self, prompt: str) -> DraftWritingResponse:
         if self.task != "content":
             raise ContentTaskAgentError("审核子 Agent 不能生成文案")
+        # 正文是整个流程里最慢的一步（一次调用 9–12 分钟）：把 body 字段边写边推给前端，
+        # 用户能看到“正在写正文”，而不是一个多小时的黑箱等待。
+        from app.services.reply_stream import active_publisher
+
+        publisher = active_publisher()
+        if publisher is not None:
+            # 一次采集可能连续生成多篇：新的一篇开始时清空前端上一段的临时文本。
+            publisher.reset()
         return self._invoke(
             prompt,
             DraftWritingResponse,
             _WRITER_SYSTEM_PROMPT,
             "news_draft_writer",
+            on_delta=None if publisher is None else publisher.delta,
         )
 
     def review(self, prompt: str) -> ReviewResponse:
@@ -219,6 +300,7 @@ class RestrictedContentTaskAgent:
         schema: type[BaseModel],
         system_prompt: str,
         name: str,
+        on_delta=None,
     ) -> Any:
         _configure_profile()
         mode = structured_output_mode_for(self.settings, self.task)
@@ -258,7 +340,7 @@ class RestrictedContentTaskAgent:
             agent_kwargs["response_format"] = ToolStrategy(schema)
         try:
             agent = create_deep_agent(**agent_kwargs)
-            result = agent.invoke({"messages": [("user", prompt)]})
+            result = _invoke_task_agent(agent, {"messages": [("user", prompt)]}, mode=mode, on_delta=on_delta)
         except Exception as exc:
             logger.warning(
                 "content_task_agent_failed task=%s model_category=%s model=%s agent=%s structured_output_mode=%s error_type=%s",

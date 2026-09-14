@@ -3340,4 +3340,50 @@
 - 并行会话警告（未变）：工作区仍混有另一会话的未提交改动，本轮**未提交 git**。
 - 授权状态：已确认并完成
 
+### 2026-09-14｜变更 321
+
+- 用户指令：执行清单 A/B/C —— A 入队即回执（后端）；B 前端短轮询；C 仅“对话回复”与“任务汇报”两处流式。附加三条：①任务详情只给状态；②已完成任务的下方状态要更新；③两条命令只跑一条是否为缺少规划/待办工具。
+- 影响范围：新增 `app/services/chat_receipts.py`（确定性计划与回执）、`app/services/chat_dispatch.py`（对话派发：命令/附件/意图/多步计划）、`app/services/reply_stream.py`（SSE 增量通道 + `reply` 字段增量提取器）；`app/api/routes.py`（发送接口改为“回执 + 入队”、新增 `GET /chat/agent-runs/{run_id}/stream`、会话接口顺带收束遗留运行）；`app/worker.py`（`process_general_chat_job` 改为调用派发器、`_compose_report` 统一流式汇报）；`app/agent_tools/draft_actions.py`（工具复用受理运行、`_announce` 不再重复气泡、抽出配图/投递/审核/重写公开入口）；`app/agents/content_deep_agent.py`（`chat_run_id`、`tools_called`、`stream_mode=["messages","values"]`）；`app/storage/repositories.py`（`append_run_reply` 缺陷、`RECONCILABLE_RUN_INTENTS`）；`frontend/src/App.tsx` / `api.ts` / `styles.css`；新增 `tests/test_chat_receipt_on_enqueue.py`、`tests/test_reply_streaming.py`、`tests/test_append_run_reply.py`。
+- 根因（为什么“直到任务结束才响应聊天”）：`POST /chat/sessions/{id}/messages` 在请求内同步执行 `ContentDeepAgent.resolve()`（模型意图识别），GENERATE_DRAFT_IMAGE 分支还同步 `await ImageGenerationTool.invoke()` 等图片生成完；`enqueue_general_chat_job`/`process_general_chat_job` 早已存在却**没有任何调用方**（死代码）。
+- 结论 A（入队即回执）：接口只做 用户消息 → 确定性回执（复用 `parse_agent_command()` 分类，多步自然语言按关键词出现顺序规划）→ 受理运行 → 入队 → 返回；模型识别与工具执行全部移入 Worker。**实测**：POST **32–62 ms** 返回，立即 GET 即见回执；回执示例“收到，共 2 步：1）生成配图；2）自动审核。配图入队后立即审核，完成后我会汇报。”
+- 结论 A2（一条消息一条运行）：工具改为复用受理运行（`chat_run_id`），`_announce` 在已有回执时降级为运行事件——此前同一条消息会产生两个运行、两条气泡（截图中的“好，正在为《…》生成封面图。”与“已为《…》生成私有封面…”）。配图/审核/投递/重写都在**同一张卡片**上逐步显示里程碑。
+- 结论 B（短轮询已存在，补两处）：对话页原本就有“有运行在跑时 2 秒轮询、空闲自动停”；新增 `GET /chat/sessions/{id}` 顺带收束遗留运行（`RECONCILABLE_RUN_INTENTS` 增加 `general_chat`），否则一条僵死运行会让页面永远轮询、永远显示“处理中”。
+- 结论 B2（**关键缺陷**）：`ContentRepository.append_run_reply` 末行误写 `self.flush()`（仓储没有该方法）→ 每次追加汇报都在最后一步抛 `AttributeError`：消息写不进去、运行结束不了。这正是“已完成的任务下方状态没更新/一直处理中”的根因，已修复并加回归测试 `tests/test_append_run_reply.py`。
+- 结论 C（流式）：`GET /chat/agent-runs/{run_id}/stream` 推送 `delta`/`milestone`/`done`；Worker 侧用 `ReplyFieldExtractor` 从增量输出里提取 `reply` 字段（json 模式取文本分片、tool 模式取 ConversationDecision 参数分片），任务汇报走 `compose_task_reply_streaming`，空/异常/网关不支持时**自动回退非流式**；Redis 不可用或断开时端点退化为数据库轮询，最终仍下发完整文本。结构化路径（生成/审核/改稿/取材）保持非流式。**实测**：`curl -N` 与 Python 流式读取均看到逐片 delta（63 帧）+ `done` 完整文本 + 里程碑；前端在运行中自动连 EventSource、增量渲染到临时气泡，`done` 后由轮询带回持久化消息。
+- 结论③（两条命令只跑一条）：`ConversationDecision` 只有单个 `intent` 字段，模型只能选一个意图，另一条被丢弃——不是模型“不听话”。现在多步指令由确定性计划器识别并按用户顺序执行（配图→审核会走“配图完成后自动审核”的既有排队机制），回执里直接列出计划。
+- 追加反馈（2026-09-14）：用户指出运行卡片标题仍然是整句“已为「…」生成私有封面，可在生成记录中调整位置或移除。”。根因是**历史遗留的运行摘要本身就是整句话**（旧代码把回复当 summary 存）；现改为前端统一口径：摘要 ≤18 字才直接显示，否则按意图显示短状态（配图完成／审核完成／采集完成／投递完成／已回复…），失败显示“处理失败”，完整摘要放进折叠区的“处理结果”，因此历史数据无需改库也立刻变短。
+- 同时修掉多步运行的摘要泄露内部代号：`已完成：image → review` → `已完成：生成配图 → 自动审核`。
+- 附加①：卡片标题只用短状态（`status_text`：配图已入队/审核中/采集已入队/投递已入队…），详细说明留在折叠的里程碑里。
+- 验证：后端 **364 项通过、0 失败**（基线 342 + 新增 22）；前端 `tsc` 0 错误；app/worker/frontend 已重建并实测。
+- 未提交 git：等待用户指令。
+- 授权状态：已确认并完成
+
+### 2026-09-14｜变更 322
+
+- 用户指令：优化前端视觉效果；拉长对话页面并让聊天记录、消息区、附件区对齐；修正 API Key 掩码显示不齐。明确保留“自动审核”开关、默认项及其“审核通过后投递公众号草稿箱”的既有业务逻辑，且不改相关文案。
+- 影响范围：`frontend/src/styles.css`。
+- 处理结论：对话三栏在桌面端使用同一响应式最小高度；聊天消息区占用对话卡片余量并独立滚动；模型档案行固定为“模型信息 / API Key 掩码 / 操作”三列，窄屏改为单列排列。未修改 `App.tsx`、接口、运行设置或微信公众号投递行为。
+- 验证：待执行前端构建与本次文件差异检查。
+- 授权状态：已确认
+
+### 2026-09-14｜变更 323
+
+- 用户指令：完成已确认的前端视觉效果调整后验证。
+- 影响范围：无新增代码改动；验证 `frontend/src/styles.css` 与 `process.md`。
+- 处理结论：前端生产构建成功；本次文件的 `git diff --check` 通过。工作区既有的其他未提交改动保持不动，未进行提交、发布或公众号操作。
+- 授权状态：已确认并完成
+
+### 2026-09-14｜变更 322
+
+- 用户指令：①“现在的文案语气太过严谨和严肃了，改进提示词，把生成的人设改为资讯分享者或者你认为该怎么改？先给方案再做”；②“审核主要改进语气上的不足和语句的通顺性，而不是过多关注细节”；③“为什么这么慢”；④“我只想要流式可见：正文用我们已有的增量提取器边写边推”。
+- 影响范围：`app/services/generator.py`（人设段、反百科腔清单、对照示例、反凑字数、事实护栏）、`preferences/style.md`（生效的语气规范，生成/改稿/审核三处共用）、`app/tools/auto_review.py`（审核重点改为语气+通顺）、`app/tools/auto_revision.py`（改写优先级 + 不得改回百科腔）、四个 `agent_skills/*-content-writing/SKILL.md`（来源口吻）、`app/services/reply_stream.py`（`JsonFieldExtractor` + 发布上下文 + `reset`）、`app/agents/content_task_agents.py`（正文流式 + 回退）、`app/worker.py`（采集/重生成包在 `streaming_run` 里）、`app/api/routes.py`（SSE 转发 reset、done 不再提前结束连接）、`frontend/src/App.tsx` / `styles.css`（按 kind 分桶渲染、正文块）；新增 `tests/test_draft_body_streaming.py`。
+- 结论①（人设）：原提示词只写了“不要什么空话”，没有“以什么身份、对谁说”，模型退回训练语料里最稳的文体——百科词条 + 研报。现在先给身份（每天翻技术资讯的分享者）与口吻，再给禁用句式清单和**三条 before/after 对照示例**。
+- 结论②（实测 A/B，同一来源同一份快照）：旧提示词 **72 分**（4 条 major 全是 tone：百科定义句、编辑分析腔、元评论）；新提示词 **75 分**，**tone 问题归零**，开头已变成“OpenAI 给自家编码 agent Codex 准备了一组插件样例……我是在 GitHub Trending 上看到它的”，标题变成“想给 Codex 写插件，可以先翻 openai/plugins”。同时暴露下一层问题：模型改用“先列举 → 再逐条复述 → 最后总括”来凑字数（8 条里 6 条是重复绕圈），已补**反凑字数**规则与“段末那句能删就删”。
+- 结论③（审核口径）：审核只审**语气**与**通顺**，明确“术语选择、措辞偏好、句序、要不要补背景、要不要做对比都不属于本次审核范围”，minor 上限从 3 条降到 2 条且只用于语气与通顺；打分锚点改成“事实准确、语气是分享者口吻、语句通顺＝85 到 89 分”。改稿端同步：先解决语气与通顺，其余尽量保留原文，不得改回百科腔。
+- 结论④（为什么慢，实测数据）：内容生成用的 `qwen3.8-max-0902` 一次调用 **8分57秒 / 9分43秒 / 12分19秒**（日志里那条 HTTP 请求 10:33:56 → 10:46:16 才 200）；审核 `qwen3.8-27b` 约 2–4 分钟；取材 `deepseek-flash` 3–10 秒。原因：max 档思考模型 + 一次产出整篇 JSON（2896 字符）+ 非流式 + 无重试。日志里另外两次 7.5 分钟/3 分钟就结束的是**开发期间重建容器把 worker SIGTERM 掉**（`collection_job_timed_out`），不是模型慢。
+- 结论⑤（正文流式可见）：新增 `JsonFieldExtractor("body")` 从增量 JSON 里提取正文；Worker 用 `streaming_run(chat_run_id, "draft")` 设置发布上下文（`asyncio.to_thread` 会复制上下文，因此线程里的生成代码能读到）；内容子 Agent 改走 `agent.stream(stream_mode=["messages","values"])`，**流式失败自动回退 `invoke`**（生成绝不因为“想流式”而失败）；换篇时先发 `reset` 清空前端上一段。前端按 kind 分桶：`draft` 显示为“正在写正文 · 已 N 字”的独立气泡，`chat`/`report` 仍是回复与汇报；SSE 端点收到 done 不再提前断开连接（正文可能还在写）。
+- 验证：后端 **377 项通过、0 失败**；前端 `tsc` 0 错误；app/worker/frontend 已重建。端到端探针（不调用模型）：容器内按真实发布路径推增量，宿主侧读到 `open → delta(kind=draft, 逐条累计) → RESET(清空) → delta → done(status=completed)`，确认分片、换篇清空与收尾都正常。
+- 未提交 git：等待用户指令。
+- 授权状态：已确认并完成
+
 -->

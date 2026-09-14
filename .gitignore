@@ -29,3 +29,6 @@ frontend/.build-check/
 
 # 本地配图样例（仅用于人工比对，不进入仓库）
 image_samples/
+
+# 浼氳瘽鍐呮寔涔呭寲璁″垝锛堟湰鍦板伐浣滆蹇嗭紝涓嶅叆搴擄級
+.planning/
