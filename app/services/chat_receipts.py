@@ -116,6 +116,15 @@ def _multi_step_text(steps: tuple[str, ...]) -> str:
     return f"收到，共 {len(steps)} 步：{listed}。{tail}，完成后我会汇报。"
 
 
+def command_draft_id(text: str) -> str:
+    """界面命令里点名的草稿 id（不是命令时返回空串）。
+
+    回执要按标题称呼文章，但界面的按钮命令只带 id；这里把 id 取出来给调用方查标题用。
+    """
+    parsed = parse_agent_command(text)
+    return parsed.draft_id if parsed is not None else ""
+
+
 def plan_chat_message(text: str, *, has_attachment: bool = False) -> ChatPlan:
     """确定性规划：界面命令 > 附件提取 > 多步自然语言 > 单步关键词 > 普通对话。"""
     raw = (text or "").strip()

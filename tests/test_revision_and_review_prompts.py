@@ -101,6 +101,65 @@ def _review_agent_stub(captured: dict, *, score: int, issues: list[dict], search
     return FakeReviewAgent
 
 
+def test_revision_retries_once_when_trimming_drops_below_the_floor(monkeypatch) -> None:
+    """真实故障：审核说“第 2/3/4 段重复”，模型删重复删过头 → 正文低于硬下限 → 整轮改稿失败。
+
+    这类失败可修复：带“当前字数不够”的反馈再写一次，而不是把整轮改稿判死。
+    """
+    captured: dict = {}
+    too_short = json.dumps(
+        {"summary_cn": "摘要", "body": "\n\n".join(["　　太短的正文。" * 8] * 4), "tags": ["开源项目"]},
+        ensure_ascii=False,
+    )
+    good = json.dumps(
+        {"summary_cn": "摘要", "body": _paragraphs(), "tags": ["开源项目"]}, ensure_ascii=False
+    )
+
+    class RetryClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__(too_short, captured)
+            self.calls = 0
+
+        def _create(self, **kwargs):
+            self.calls += 1
+            captured[f"prompt{self.calls}"] = kwargs["messages"][0]["content"]
+            return _FakeCompletion(too_short if self.calls == 1 else good)
+
+    client = RetryClient()
+    monkeypatch.setattr(auto_revision_module, "OpenAI", lambda **_kwargs: client)
+
+    result = AutoRevisionTool(_settings(), SimpleNamespace()).invoke(
+        "draft-1",
+        {"failures": ["正文冗余"]},
+        {"issues": ["第 2/3/4 段有重复表述"]},
+        draft=_draft_snapshot(_paragraphs()),
+    )
+
+    assert client.calls == 2, "第一次不合格时必须带反馈重试一次"
+    assert "至少需要 1400" in captured["prompt2"], "重试提示词要写清被拒原因"
+    assert "这是第 1 段正文" in result.body and result.article_shape["body_chars"] >= 1400
+
+
+def test_revision_gives_up_after_the_retry(monkeypatch) -> None:
+    captured: dict = {}
+    _install_fake_client(
+        monkeypatch,
+        json.dumps(
+            {"summary_cn": "摘要", "body": "\n\n".join(["　　太短的正文。" * 8] * 4), "tags": []},
+            ensure_ascii=False,
+        ),
+        captured,
+    )
+
+    with pytest.raises(AutoRevisionError):
+        AutoRevisionTool(_settings(), SimpleNamespace()).invoke(
+            "draft-1",
+            {"failures": ["正文冗余"]},
+            {"issues": ["重复"]},
+            draft=_draft_snapshot(_paragraphs()),
+        )
+
+
 def test_revision_prompt_states_length_floor_and_forbids_translationese(monkeypatch) -> None:
     captured: dict = {}
     payload = json.dumps({"summary_cn": "摘要", "body": _paragraphs(), "tags": ["开源项目"]}, ensure_ascii=False)

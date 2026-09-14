@@ -131,6 +131,9 @@ class FakeRepository:
     def add_chat_agent_event(self, *_args, **_kwargs) -> None:
         self.calls.append("event")
 
+    def get_draft(self, draft_id: str):
+        return SimpleNamespace(id=draft_id, title_options_json=["openai/plugins：示例标题"])
+
     def finish_chat_agent_run(self, *_args, **_kwargs) -> None:
         self.calls.append("finish")
 
@@ -175,6 +178,17 @@ def test_send_message_writes_the_receipt_before_enqueueing(fake_endpoint) -> Non
     assert payload["receipt"]["content"] == receipt_texts[1]
     assert payload["execution"]["status"] == "running"
     assert session.commits == 1
+
+
+def test_receipt_names_the_article_by_title_not_by_id(fake_endpoint) -> None:
+    """用户反馈：返回的信息应该是稿件标题，而不是那串 draft id。"""
+    command = ChatMessageCreate(content="重写文案｜draft=11111111-2222-3333-4444-555555555555")
+
+    payload = asyncio.run(routes.send_chat_message("session-1", command, SimpleNamespace(), FakeSession()))
+
+    receipt = payload["receipt"]["content"]
+    assert "《openai/plugins：示例标题》" in receipt
+    assert "11111111-2222-3333-4444-555555555555" not in receipt
 
 
 def test_send_message_never_touches_a_model(fake_endpoint, monkeypatch: pytest.MonkeyPatch) -> None:

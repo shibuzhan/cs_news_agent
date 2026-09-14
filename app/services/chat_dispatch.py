@@ -277,13 +277,12 @@ async def _step_rewrite(ctx: ChatDispatchContext) -> dict[str, Any]:
     draft = current_editable_draft(ctx.repository, ctx.session_id)
     if draft is None:
         return {"status": "rejected", "message": "当前会话还没有可重写的文章。"}
-    origin_run = ctx.repository.find_generation_run_for_draft(draft.id)
-    if origin_run is None:
-        return {"status": "rejected", "message": "当前草稿缺少可回溯的原生成记录，未创建新任务。"}
+    # 老草稿可能没有 collect_news 生成审计：只要还有已保存的来源快照就能重写，
+    # 因此这里不做“必须有原生成记录”的拒绝（真实反馈：点重写却报缺少原生成记录）。
     from app.agent_tools.draft_actions import start_draft_rewrite
 
     return await start_draft_rewrite(
-        ctx.settings, ctx.repository, ctx.session_id, draft, origin_run=origin_run, chat_run_id=ctx.run_id
+        ctx.settings, ctx.repository, ctx.session_id, draft, chat_run_id=ctx.run_id
     )
 
 

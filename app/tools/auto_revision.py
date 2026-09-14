@@ -113,6 +113,42 @@ class AutoRevisionTool:
         self.settings = load_runtime_settings(settings)
         self.repository = repository
 
+    def _compose_with_length_repair(
+        self, *, client, model: str, prompt: str, minimum_chars: int, draft_id: str
+    ) -> tuple[RevisionPayload, str, dict]:
+        """生成改稿正文；只因为“删重复删过头”而不合格时，带反馈重试一次。
+
+        真实故障：审核意见是“第 2/3/4 段重复”，模型把重复删掉后正文掉到 1400 字以下，
+        `compose_natural_article` 直接抛错 → 整轮改稿失败（运行报“按意见改稿这一步失败了”），
+        用户拿到的还是原稿。这类失败是可修复的：告诉它当前字数与下限再写一次。
+        """
+        last_error: NaturalArticleError | None = None
+        current_prompt = prompt
+        for attempt in (1, 2):
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": current_prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.15,
+            )
+            payload = RevisionPayload.model_validate(json.loads(response.choices[0].message.content or "{}"))
+            try:
+                body, article_shape = compose_natural_article(payload.body, min_chars=minimum_chars)
+            except NaturalArticleError as exc:
+                last_error = exc
+                logger.warning(
+                    "auto_revision_length_retry draft_id=%s attempt=%s reason=%s", draft_id, attempt, exc
+                )
+                current_prompt = (
+                    f"{prompt}\n\n上一次改稿被拒绝：{exc}。"
+                    f"请重写正文：**必须不少于 {minimum_chars} 个中文字符**，"
+                    "删掉重复表述后要用来源证据里的其他事实补足篇幅，不要靠重复原话凑字数。"
+                )
+                continue
+            return payload, body, article_shape
+        assert last_error is not None
+        raise last_error
+
     def invoke(
         self,
         draft_id: str,
@@ -179,21 +215,18 @@ class AutoRevisionTool:
                 timeout=self.settings.content_llm_timeout_seconds,
             )
             client = wrap_openai(client) if langsmith_enabled(self.settings) else client
-            response = client.chat.completions.create(
-                model=selected_model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.15,
+            hard_minimum = max(
+                article_length_band(
+                    self.settings.draft_body_min_chars, self.settings.draft_body_max_chars
+                )[2],
+                MIN_HARD_BODY_CHARS,
             )
-            payload = RevisionPayload.model_validate(json.loads(response.choices[0].message.content or "{}"))
-            body, article_shape = compose_natural_article(
-                payload.body,
-                min_chars=max(
-                    article_length_band(
-                        self.settings.draft_body_min_chars, self.settings.draft_body_max_chars
-                    )[2],
-                    MIN_HARD_BODY_CHARS,
-                ),
+            payload, body, article_shape = self._compose_with_length_repair(
+                client=client,
+                model=selected_model,
+                prompt=prompt,
+                minimum_chars=hard_minimum,
+                draft_id=draft_id,
             )
             logger.info(
                 "auto_revision_article_validated draft_id=%s paragraph_count=%s",

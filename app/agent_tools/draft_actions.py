@@ -195,49 +195,77 @@ async def _start_rewrite(
     settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
     origin_run: Any | None = None, chat_run_id: str | None = None,
 ) -> dict[str, Any]:
+    """按已保存的来源证据重写正文。
+
+    只要求“有来源快照/证据”，**不再要求有原生成记录**：更早生成的草稿没有 collect_news 运行审计
+    （`draft_ids` 是后加的字段），旧逻辑会因此拒绝（用户实测：点“重写文案”报“这篇缺少可回溯的
+    原生成记录”）。没有原记录时，报告落在当前对话的受理运行上，用户看到的仍是同一张卡片。
+    """
+    label = _draft_label(draft)
     if origin_run is None:
         origin_run = repository.find_generation_run_for_draft(draft.id)
-    if origin_run is None:
-        return {"status": "rejected", "message": "这篇缺少可回溯的原生成记录，无法按已保存证据重写。"}
-    if chat_run_id:
-        # 重写会在原生成记录里跑：受理运行只作为“已受理”的对话锚点，随即结束，
-        # 否则对话里会一直挂着一条“处理中”的运行。
-        chat_run = _task_run(repository, session_id, chat_run_id, ConversationIntent.REGENERATE_DRAFT)
+    chat_run = (
+        _task_run(repository, session_id, chat_run_id, ConversationIntent.REGENERATE_DRAFT)
+        if chat_run_id
+        else None
+    )
+    if chat_run is not None:
         anchor_message_id = _announce(
-            repository, session_id, chat_run,
-            f"正在用已保存的 README 与证据包重写《{_draft_label(draft)}》…",
-        )
-        repository.finish_chat_agent_run(
-            chat_run.id, anchor_message_id, ConversationRunStatus.COMPLETED,
-            f"已转交重写任务：{_draft_label(draft)}", [{"tool": "rewrite_draft", "draft_id": draft.id}],
+            repository, session_id, chat_run, f"正在用已保存的 README 与证据包重写《{label}》…"
         )
     else:
         anchor_message_id = repository.create_chat_message(
-            session_id, "assistant", f"正在用已保存的 README 与证据包重写《{_draft_label(draft)}》…"
+            session_id, "assistant", f"正在用已保存的 README 与证据包重写《{label}》…"
         ).id
-    repository.reopen_generation_run(origin_run, anchor_message_id, False, False)
-    origin_run.summary = "正在重写文案"
+
+    if origin_run is not None:
+        # 报告写回原生成记录：受理运行只作为对话锚点，随即结束，避免挂着一张“处理中”的卡片。
+        repository.reopen_generation_run(origin_run, anchor_message_id, False, False)
+        origin_run.summary = "正在重写文案"
+        job_run_id = origin_run.id
+        auto_review_requested = bool(origin_run.auto_review_requested)
+        auto_illustration_requested = bool(origin_run.auto_illustration_requested)
+        if chat_run is not None:
+            repository.finish_chat_agent_run(
+                chat_run.id, anchor_message_id, ConversationRunStatus.COMPLETED,
+                f"已转交重写任务：{label}", [{"tool": "rewrite_draft", "draft_id": draft.id}],
+            )
+    else:
+        # 没有原记录：受理运行保持“处理中”，由重写任务在同一张卡片上汇报并收尾。
+        if chat_run is not None:
+            job_run_id = chat_run.id
+        else:
+            fallback_run = repository.create_chat_agent_run(
+                session_id, None, ConversationIntent.REGENERATE_DRAFT, False, False
+            )
+            fallback_run.response_message_id = anchor_message_id
+            repository.session.flush()
+            job_run_id = fallback_run.id
+        job_run = repository.get_chat_agent_run(job_run_id)
+        auto_review_requested = bool(getattr(job_run, "auto_review_requested", False))
+        auto_illustration_requested = bool(getattr(job_run, "auto_illustration_requested", False))
+
     repository.add_chat_agent_event(
-        origin_run.id, "重写文案",
-        f"使用已保存的 README 与证据包重写正文，目标草稿版本 {draft.version}；不重新采集、不新建草稿。",
+        job_run_id, "重写文案",
+        f"使用已保存的 README 与证据包重写《{label}》正文，目标草稿版本 {draft.version}；不重新采集、不新建草稿。",
         "running",
         metadata={"phase": "text", "state": "running", "draft_ids": [draft.id], "regeneration": True, "rewrite": True},
     )
     job_id = await enqueue_draft_regeneration_job(
-        settings, origin_run.id, session_id, assistant_message.id, draft.id,
-        origin_run.auto_review_requested, origin_run.auto_illustration_requested,
+        settings, job_run_id, session_id, anchor_message_id, draft.id,
+        auto_review_requested, auto_illustration_requested,
     )
     repository.add_chat_agent_event(
-        origin_run.id, "正在重写文案", f"任务编号：{job_id}；完成后会覆盖为新的草稿版本。",
+        job_run_id, "正在重写文案", f"任务编号：{job_id}；完成后会覆盖为新的草稿版本。",
         metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [draft.id], "rewrite": True},
     )
     return {
         "status": "started",
         "status_text": "重写已开始",
         "draft_id": draft.id,
-        "draft_title": _draft_label(draft),
-        "run_id": origin_run.id,
-        "message": f"已开始用已保存的来源证据重写《{_draft_label(draft)}》，完成后覆盖为新版本。",
+        "draft_title": label,
+        "run_id": job_run_id,
+        "message": f"已开始用已保存的来源证据重写《{label}》，完成后覆盖为新版本。",
     }
 
 

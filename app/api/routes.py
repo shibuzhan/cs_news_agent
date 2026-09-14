@@ -47,7 +47,7 @@ from app.services.attachments import (
     PrivateAttachmentStore,
     validate_image_attachment,
 )
-from app.services.chat_receipts import plan_chat_message
+from app.services.chat_receipts import command_draft_id, plan_chat_message
 from app.services.plain_text import SOURCE_FOOTER_PREFIXES, normalize_wechat_description
 from app.services.task_narration import compose_task_reply
 from app.services.review_feedback import normalized_review_report
@@ -1367,10 +1367,21 @@ async def send_chat_message(
         session.commit()
         return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
     plan = plan_chat_message(command.content, has_attachment=command.attachment_id is not None)
+    # 回执里点名到具体文章时用**标题**称呼它：界面按钮命令只带 draft id，用户不该看到那串 uuid。
+    receipt_text = plan.text
+    mentioned_draft_id = command_draft_id(command.content)
+    if mentioned_draft_id:
+        try:
+            mentioned = repository.get_draft(mentioned_draft_id)
+            receipt_text = (
+                f"{receipt_text}目标文章：《{(mentioned.title_options_json or ['这篇草稿'])[0]}》。"
+            )
+        except Exception:
+            logger.warning("chat_receipt_draft_title_unavailable draft_id=%s", mentioned_draft_id)
     run = repository.create_chat_agent_run(
         session_id, user_message.id, plan.intent, command.auto_review, command.auto_illustration,
     )
-    receipt = repository.create_chat_message(session_id, "assistant", plan.text)
+    receipt = repository.create_chat_message(session_id, "assistant", receipt_text)
     run.response_message_id = receipt.id
     run.summary = plan.status
     repository.add_chat_agent_event(

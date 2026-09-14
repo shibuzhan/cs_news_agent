@@ -11,7 +11,13 @@ from arq.worker import func
 from app.agents.content_main_agent import ContentMainAgent
 from app.agents.content_deep_agent import ContentDeepAgent
 from app.config import Settings
-from app.domain.models import AgentCollectCommand, ConversationRunStatus, RawSourceItem, SourceKind
+from app.domain.models import (
+    AgentCollectCommand,
+    ConversationIntent,
+    ConversationRunStatus,
+    RawSourceItem,
+    SourceKind,
+)
 from app.jobs import enqueue_collection_finalizer, enqueue_image_generation_job
 from app.observability import configure_observability
 from app.services.auto_delivery import auto_review_and_create_wechat_draft
@@ -189,9 +195,16 @@ def _generation_failure_detail(exc: Exception, *, preserved_draft: bool = False)
 
 
 def _regenerate_draft_in_thread(settings: Settings, draft_id: str, raw) -> dict:
-    """在线程里用独立会话重新生成草稿，避免阻塞事件循环与嵌套事件循环。"""
+    """在线程里用独立会话重新生成草稿，避免阻塞事件循环与嵌套事件循环。
+
+    这里**必须显式提交**：`regenerate_draft` 只 flush 不 commit，而 `with SessionLocal()`
+    退出时会把未提交的改动回滚——真实故障：运行报告“已更新原草稿至版本 2”，
+    但数据库里还是版本 1（用户看到“重写完了但文章没变”）。
+    """
     with SessionLocal() as session:
-        return ContentPipeline(session, build_generator(settings), settings).regenerate_draft(draft_id, raw)
+        result = ContentPipeline(session, build_generator(settings), settings).regenerate_draft(draft_id, raw)
+        session.commit()
+        return result
 
 
 async def process_collection_job(
