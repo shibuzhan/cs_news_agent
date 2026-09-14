@@ -946,10 +946,87 @@ async def process_collection_finalizer(_ctx: dict, chat_run_id: str, response_me
     logger.info("collection_finalized chat_run_id=%s", chat_run_id)
 
 
+async def process_draft_revision_job(
+    _ctx: dict,
+    draft_id: str,
+    review_id: str = "",
+    chat_run_id: str | None = None,
+    extra_issues: list[str] | None = None,
+) -> None:
+    """按审核意见再改一稿，并在对话里汇报（对话工具 `apply_revision_issues` 走这里）。"""
+    from app.services.auto_delivery import apply_revision_from_review
+
+    logger.info("draft_revision_job_started draft_id=%s review_id=%s chat_run_id=%s", draft_id, review_id, chat_run_id or "-")
+    with SessionLocal() as session:
+        repository = ContentRepository(session)
+        draft = repository.get_draft(draft_id)
+        title = (draft.title_options_json or ["当前草稿"])[0]
+        if chat_run_id:
+            repository.add_chat_agent_event(
+                chat_run_id, "按审核意见改稿中",
+                f"《{title}》正按上次审核意见改写正文；来源事实字段不变，不重新采集、不投递。",
+                "running",
+                metadata={"phase": "text", "state": "running", "draft_ids": [draft_id], "review_id": review_id},
+            )
+            session.commit()
+    try:
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            result = await apply_revision_from_review(
+                settings, repository, draft_id, review_id, chat_run_id, extra_issues
+            )
+            repository.add_chat_agent_event(
+                chat_run_id, "按审核意见改稿完成" if chat_run_id else "改稿完成",
+                f"已更新《{result['draft_title']}》至版本 {result['version']}（按 {result['issue_count']} 条审核意见）。",
+                "completed",
+                metadata={"phase": "text", "state": "completed", "draft_ids": [draft_id], **result},
+            )
+            session.commit()
+    except Exception as exc:
+        logger.exception("draft_revision_job_failed draft_id=%s error_type=%s", draft_id, type(exc).__name__)
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            repository.add_chat_agent_event(
+                chat_run_id, "按审核意见改稿失败", str(exc), "failed",
+                metadata={"phase": "text", "state": "failed", "draft_ids": [draft_id]},
+            )
+            session.commit()
+        if chat_run_id:
+            await _compose_report(
+                chat_run_id,
+                task="按审核意见改稿",
+                facts={"draft_id": draft_id, "review_id": review_id, "error": str(exc), "draft_title": title},
+                fallback=f"按审核意见改稿失败：{exc}；原文未改动。",
+            )
+        return
+    if chat_run_id:
+        reply = await _compose_report(
+            chat_run_id,
+            task="按审核意见改稿",
+            facts={
+                "draft_title": result["draft_title"],
+                "new_version": result["version"],
+                "issues": result["issues"],
+                "note": "只按审核意见改写正文，未重新采集、未投递",
+            },
+            fallback=f"已按审核意见把《{result['draft_title']}》改到版本 {result['version']}，可以重新审核或投递。",
+        )
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            message_id = repository.append_run_reply(chat_run_id, reply)
+            repository.finish_chat_agent_run(
+                chat_run_id, message_id, ConversationRunStatus.COMPLETED,
+                f"已按审核意见改到版本 {result['version']}", [result],
+            )
+            session.commit()
+    logger.info("draft_revision_job_finished draft_id=%s version=%s", draft_id, result["version"])
+
+
 class WorkerSettings:
     functions = [
         func(process_collection_job, timeout=settings.collection_job_timeout_seconds),
         func(process_draft_regeneration_job, timeout=settings.collection_job_timeout_seconds),
+        func(process_draft_revision_job, timeout=settings.collection_job_timeout_seconds),
         func(process_general_chat_job, timeout=settings.conversation_agent_timeout_seconds + 15),
         func(process_auto_review_job, timeout=settings.collection_job_timeout_seconds),
         func(process_wechat_delivery_job, timeout=settings.collection_job_timeout_seconds),

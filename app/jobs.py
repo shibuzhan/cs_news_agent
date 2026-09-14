@@ -107,6 +107,31 @@ async def enqueue_general_chat_job(
         await pool.aclose()
 
 
+async def enqueue_draft_revision_job(
+    settings: Settings,
+    draft_id: str,
+    review_id: str,
+    chat_run_id: str | None = None,
+    extra_issues: list[str] | None = None,
+) -> str:
+    """按审核意见改稿独立入队：一次内容模型调用要几分钟，不能占着对话请求。"""
+    logger.info(
+        "draft_revision_enqueue_started draft_id=%s review_id=%s chat_run_id=%s extra_issues=%s",
+        draft_id, review_id or "-", chat_run_id or "-", len(extra_issues or []),
+    )
+    pool = await create_pool(redis_settings(settings))
+    try:
+        job = await pool.enqueue_job(
+            "process_draft_revision_job", draft_id, review_id, chat_run_id, extra_issues or []
+        )
+        if job is None:
+            raise RuntimeError("改稿任务未能入队")
+        logger.info("draft_revision_enqueue_finished draft_id=%s job_id=%s", draft_id, job.job_id)
+        return job.job_id
+    finally:
+        await pool.aclose()
+
+
 async def enqueue_image_generation_job(settings: Settings, image_task_id: str) -> str:
     """图片任务和采集任务分离，返回 ARQ ID 供审计而非暴露 Redis 细节给前端。"""
     pool = await create_pool(redis_settings(settings))

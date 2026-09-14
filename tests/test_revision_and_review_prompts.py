@@ -438,7 +438,9 @@ def test_generation_instruction_carries_the_sharing_persona() -> None:
     assert "分享者" in instruction
     # 分享口吻 ≠ 营销腔：叫卖词与烂梗仍然禁止。
     assert "绝了" in instruction and "家人们" in instruction
-    assert "第一人称" in instruction
+    # 用户明确要求：不要第一人称。
+    assert "不许用第一人称" in instruction
+    assert "不写“我”“我们”“笔者”“小编”" in instruction
     # 反百科腔：点名要禁的句式 + 段末概括句。
     assert "【不要百科腔与研报腔】" in instruction
     assert "“X 是……的一个……”" in instruction
@@ -496,6 +498,9 @@ def test_review_matches_the_writer_on_numbers_and_tone_bounds() -> None:
     assert "绝了" in instruction
     assert "分享口吻的边界" in review_source
     assert "叫卖词与网络烂梗属于 tone 上的 minor" in review_source
+    # 生成端禁止第一人称，审核端必须同口径（否则写了“我”也没人管）。
+    assert "不许用第一人称" in instruction
+    assert "出现第一人称" in review_source
 
 
 def test_review_focuses_on_tone_and_fluency_not_details() -> None:

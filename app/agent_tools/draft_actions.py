@@ -604,6 +604,152 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
             )
         )
 
+    @tool("read_current_draft")
+    def read_current_draft(draft_id: str = "", max_chars: int = 4000) -> dict[str, Any]:
+        """读取当前文章的标题、版本、摘要与正文（最多 max_chars 字）。
+
+        用于回答“这篇现在写了什么”“帮我按内容改一改”这类问题；只读，不改动任何内容。
+        """
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            limit = max(500, min(int(max_chars or 4000), 12000))
+            body = draft.body or ""
+            return {
+                "status": "ok",
+                "draft_id": draft.id,
+                "draft_title": _draft_label(draft),
+                "draft_status": draft.status,
+                "version": draft.version,
+                "summary_cn": draft.summary_cn,
+                "paragraph_count": len([item for item in body.split("\n\n") if item.strip()]),
+                "body": body[:limit],
+                "truncated": len(body) > limit,
+                "source_name": draft.source_name,
+                "source_url": draft.source_url,
+            }
+
+    @tool("read_latest_review")
+    def read_latest_review(draft_id: str = "") -> dict[str, Any]:
+        """读取当前文章最近一次自动审核的评分与意见（没有则返回 empty）。
+
+        这是“按上次的意见再改一遍”的依据；只读，不触发审核或改稿。
+        """
+        from app.tools.auto_revision import revision_issues
+
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            reviews = repository.list_auto_review_runs(draft.id)
+            if not reviews:
+                return {"status": "empty", "message": "这篇还没有自动审核记录。", "draft_title": _draft_label(draft)}
+            latest = reviews[0]
+            model_report = latest.model_report_json or {}
+            return {
+                "status": "ok",
+                "review_id": latest.id,
+                "review_status": latest.status,
+                "score": model_report.get("score"),
+                "summary": model_report.get("summary"),
+                "issues": revision_issues(latest.rule_report_json or {}, model_report),
+                "draft_title": _draft_label(draft),
+                "draft_version": draft.version,
+                "created_at": latest.created_at.isoformat() if latest.created_at else None,
+            }
+
+    async def _impl_apply_revision_issues(
+        draft_id: str = "", review_id: str = "", extra_issues: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """把审核意见**应用到草稿**（后台改稿一次内容模型调用）。
+
+        这是“零件”：只负责“按这些意见改这一稿”，不替你决定该用哪次审核、要不要先重新审核。
+        `extra_issues` 让 Agent 把用户临时提出的要求（例如“第 3 段那句重复删掉”）一起带进来。
+        """
+        from app.jobs import enqueue_draft_revision_job
+
+        settings = get_settings()
+        extra = [str(item)[:300] for item in (extra_issues or []) if str(item).strip()][:8]
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=EDITABLE_STATUSES)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            run = None
+            if review_id:
+                try:
+                    run = repository.get_auto_review_run(review_id)
+                except Exception:
+                    return {"status": "rejected", "message": "找不到指定的审核记录。"}
+                if run.draft_id != draft.id:
+                    return {"status": "rejected", "message": "该审核记录不属于这篇文章。"}
+            else:
+                reviews = repository.list_auto_review_runs(draft.id)
+                run = reviews[0] if reviews else None
+            if run is None and not extra:
+                return {
+                    "status": "rejected",
+                    "message": "这篇还没有自动审核记录；可以先运行审核，或直接在 extra_issues 里给出要改的点。",
+                }
+            chat_run = _task_run(repository, session_id, chat_run_id, ConversationIntent.REGENERATE_DRAFT)
+            _announce(repository, session_id, chat_run, f"正在按审核意见重改《{_draft_label(draft)}》…")
+            repository.add_chat_agent_event(
+                chat_run.id, "按审核意见改稿已入队",
+                f"审核记录 {run.id if run else '（无，使用临时意见）'}；"
+                f"将按其中的意见改写正文并覆盖为新版本，不重新采集、不投递。",
+                "running",
+                metadata={
+                    "phase": "text", "state": "queued", "draft_ids": [draft.id],
+                    "review_id": run.id if run else None, "extra_issues": extra,
+                },
+            )
+            session.commit()
+        try:
+            job_id = await enqueue_draft_revision_job(
+                settings, draft.id, run.id if run else "", chat_run.id, extra,
+            )
+        except Exception as exc:
+            logger.warning("revision_enqueue_failed draft_id=%s error_type=%s", draft.id, type(exc).__name__)
+            return {"status": "failed", "draft_id": draft.id, "message": f"改稿任务未能入队：{exc}"}
+        with SessionLocal() as session:
+            ContentRepository(session).add_chat_agent_event(
+                chat_run.id, "改稿任务已创建", f"任务编号：{job_id}",
+                metadata={"phase": "text", "state": "running", "job_id": job_id, "draft_ids": [draft.id]},
+            )
+            session.commit()
+        logger.info(
+            "agent_tool_apply_revision_issues draft_id=%s review_id=%s extra=%s job_id=%s",
+            draft.id, run.id if run else "-", len(extra), job_id,
+        )
+        return {
+            "status": "started",
+            "status_text": "按审核意见改稿中",
+            "draft_id": draft.id,
+            "draft_title": _draft_label(draft),
+            "review_id": run.id if run else None,
+            "chat_run_id": chat_run.id,
+            "message": f"已开始按审核意见重改《{_draft_label(draft)}》，完成后覆盖为新版本。",
+        }
+
+    @tool("apply_revision_issues")
+    def apply_revision_issues(
+        draft_id: str = "", review_id: str = "", extra_issues: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """按审核意见改写当前文章正文，覆盖为新版本（不重新采集、不投递）。
+
+        典型用法：先用 `read_latest_review` 看这次审核说了什么，再把要采纳的意见交给本工具；
+        用户临时补充的要求放进 `extra_issues`。改稿是一次内容模型调用，会入队后台执行并在对话里汇报，
+        因此调用后不要假设已经改完。
+        """
+        return run_coroutine_sync(
+            _impl_apply_revision_issues(
+                draft_id=draft_id, review_id=review_id, extra_issues=extra_issues
+            )
+        )
+
     @tool("publish_to_wechat_draft")
     def publish_to_wechat_draft(draft_id: str = "") -> dict[str, Any]:
         """把当前已审核通过的文章投递到微信公众号草稿箱（绝不发表）。
@@ -621,6 +767,9 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
     return [
         run_auto_review,
         rewrite_draft,
+        read_current_draft,
+        read_latest_review,
+        apply_revision_issues,
         approve_draft,
         discard_draft,
         revoke_approval,

@@ -353,6 +353,68 @@ async def retry_agent_selected_wechat_draft(
     return created
 
 
+async def apply_revision_from_review(
+    settings: Settings,
+    repository: ContentRepository,
+    draft_id: str,
+    review_id: str,
+    chat_agent_run_id: str | None = None,
+    extra_issues: list[str] | None = None,
+) -> dict:
+    """把审核意见真正应用到草稿上，覆盖为新版本。
+
+    对话工具（`apply_revision_issues`）与审核流程共用同一条改稿实现，避免两套口径；
+    `extra_issues` 是用户/Agent 临时补充的要求，与审核意见一起交给改稿模型。
+    """
+    rule_report: dict = {}
+    model_report: dict = {}
+    applied_review_id = review_id
+    if review_id:
+        run = repository.get_auto_review_run(review_id)
+        if run.draft_id != draft_id:
+            raise ValueError("该审核记录不属于这篇文章")
+        rule_report = run.rule_report_json or {}
+        model_report = run.model_report_json or {}
+    extra = [str(item) for item in (extra_issues or []) if str(item).strip()]
+    if extra:
+        model_report = {**model_report, "issues": [*model_report.get("issues", []), *extra]}
+    if not model_report and not rule_report:
+        raise ValueError("没有可用的审核意见")
+    issues = revision_issues(rule_report, model_report)
+    search_evidence = await _revision_search_evidence(
+        settings, repository, draft_id, chat_agent_run_id, model_report
+    )
+    revised = await run_in_threadpool(
+        AutoRevisionTool(settings, repository).invoke,
+        draft_id,
+        rule_report,
+        model_report,
+        draft=_model_draft_snapshot(repository, draft_id),
+        search_evidence=search_evidence,
+    )
+    draft = repository.apply_auto_revision(
+        draft_id,
+        applied_review_id or "manual",
+        revised.summary_cn,
+        revised.body,
+        revised.tags,
+        {"issues": issues, "revision_count": 0, "source": "apply_revision_issues"},
+        revised.article_shape,
+    )
+    logger.info(
+        "revision_from_review_applied draft_id=%s review_id=%s version=%s issues=%s extra=%s",
+        draft_id, applied_review_id or "-", draft.version, len(issues), len(extra),
+    )
+    return {
+        "draft_id": draft.id,
+        "draft_title": (draft.title_options_json or ["当前草稿"])[0],
+        "version": draft.version,
+        "issue_count": len(issues),
+        "issues": issues,
+        "article_shape": revised.article_shape,
+    }
+
+
 async def auto_review_and_create_wechat_draft(
     settings: Settings,
     repository: ContentRepository,
