@@ -325,6 +325,132 @@ def _draft_title(draft: Any) -> str:
     return str(titles[0]) if titles else "当前文章"
 
 
+# 计划里的步骤 → 任务清单的动作代号与依赖。
+_TASK_KINDS = {
+    STEP_COLLECT: "collect",
+    STEP_IMAGE: "image",
+    STEP_REVIEW: "review",
+    STEP_DELIVER: "deliver",
+    STEP_REWRITE: "rewrite",
+}
+# 「投递」依赖哪些步骤：审核通过（配图/重写同理，因为它们都会改写正文）。
+_TASK_DEPENDENCIES = {
+    "deliver": (STEP_REVIEW,),
+    "review": (STEP_REWRITE,),
+}
+
+
+def _finish_plan_tasks(
+    ctx: ChatDispatchContext, task_ids: dict[str, str], facts: list[dict[str, Any]],
+    *, complete_handed_off: bool,
+) -> None:
+    """按每一步的真实结果收尾清单：交接出去的算完成，被拒的算失败。"""
+    from app.services import session_tasks as tasks
+
+    for step, task_id in task_ids.items():
+        result = next((item for item in facts if item.get("step") == step), None)
+        if result is None:
+            continue
+        status = str(result.get("status") or "")
+        note = str(result.get("message") or "")[:200]
+        if status in {"started", "queued_after_images", "queued_after_rewrite", "queued_after_review"}:
+            if complete_handed_off:
+                tasks.complete_task(ctx.repository, task_id, note or "已交给后台任务")
+            else:
+                ctx.repository.update_session_task(task_id, status=tasks.STATUS_RUNNING, note=note)
+        elif status == "already_running":
+            tasks.complete_task(ctx.repository, task_id, note or "已有任务在处理")
+        elif status == "folded_into_collection":
+            tasks.complete_task(ctx.repository, task_id, "已并入采集流程")
+        else:
+            tasks.fail_task(ctx.repository, task_id, note or "未执行")
+
+
+def _record_plan_tasks(
+    ctx: ChatDispatchContext, steps: tuple[str, ...], *, deliver_after_review: bool,
+) -> dict[str, str]:
+    """把多步计划登记进会话任务清单，返回 步骤 → task_id。
+
+    依赖关系只在**同一计划内**连线（投递依赖审核、审核依赖重写）：跨消息的“还等着的事”
+    由 worker 收尾时放行，这样“审核通过 → 投递”在对话里也有据可查。
+    """
+    from app.services import session_tasks as tasks
+
+    mapping: dict[str, str] = {}
+    draft = current_editable_draft(ctx.repository, ctx.session_id)
+    draft_id = getattr(draft, "id", None)
+    for step in steps:
+        kind = _TASK_KINDS.get(step)
+        if kind is None:
+            continue
+        depends = [
+            mapping[dep]
+            for dep in _TASK_DEPENDENCIES.get(kind, ())
+            if dep in mapping
+        ]
+        task = tasks.add_task(
+            ctx.repository,
+            ctx.session_id,
+            tasks.kind_label(kind),
+            kind,
+            depends_on=depends,
+            draft_id=draft_id,
+        )
+        mapping[step] = task.id
+    return mapping
+
+
+def complete_task_for_kind(ctx: ChatDispatchContext, kind: str, *, note: str = "") -> None:
+    """动作成功时把清单里对应的任务标完成（并放行依赖它的后继）。"""
+    from app.services import session_tasks as tasks
+
+    task = tasks.ready_task_for_kind(ctx.repository, ctx.session_id, kind)
+    if task is None:
+        return
+    tasks.complete_task(ctx.repository, task.id, note)
+
+
+# 界面命令 → 清单动作代号（按钮点出来的事也要进清单）。
+_COMMAND_TASK_KINDS = {
+    "run_auto_review": "review",
+    "review_draft": "review",
+    "rewrite_draft": "rewrite",
+    "regenerate_draft_body": "rewrite",
+    "refresh_draft_source": "refresh_source",
+    "publish_to_wechat_draft": "deliver",
+    "reselect_publication_assets": "deliver",
+    "plan_publication_assets": "deliver",
+    "generate_draft_illustration": "image",
+    "apply_revision_issues": "rewrite",
+}
+# 这些状态表示“已经交给后台去做”，可以把清单项标完成。
+_COMMAND_DONE_STATUSES = {
+    "started", "queued_after_images", "queued_after_rewrite", "refreshed", "completed", "done",
+}
+
+
+def _record_command_task(ctx: ChatDispatchContext, parsed: Any, repository: Any) -> None:
+    kind = _COMMAND_TASK_KINDS.get(parsed.name)
+    if kind is None:
+        return
+    from app.services import session_tasks as tasks
+
+    draft = current_editable_draft(repository, ctx.session_id)
+    tasks.add_task(
+        repository, ctx.session_id, tasks.kind_label(kind), kind,
+        draft_id=getattr(draft, "id", None),
+    )
+
+
+def _mark_command_task_done(ctx: ChatDispatchContext, parsed: Any, result: Any) -> None:
+    kind = _COMMAND_TASK_KINDS.get(parsed.name)
+    if kind is None:
+        return
+    status = str((result or {}).get("status") or "")
+    if status in _COMMAND_DONE_STATUSES:
+        complete_task_for_kind(ctx, kind, note=str((result or {}).get("message") or "")[:200])
+
+
 def _step_outcome(ctx: ChatDispatchContext, step: str, facts: dict[str, Any]) -> ChatDispatchOutcome:
     """把一步的执行事实变成运行状态与（必要时）对话回复。
 
@@ -375,6 +501,9 @@ async def _dispatch_plan(ctx: ChatDispatchContext, plan: ChatPlan) -> ChatDispat
     # 计划里同时出现审核与投递时，第一步就把 deliver=True 一起交给审核任务，
     # 第二步只回头看结论——审核没过就明确说“未投递 + 为什么”，不再各自为政。
     deliver_after_review = STEP_REVIEW in plan.steps and STEP_DELIVER in plan.steps
+    # 把计划落成**任务清单**（跨消息保留）：多步指令过去只写在回执文案里，运行一结束就没人记得。
+    # 有依赖的步骤（投递等审核）先记成“等待前置”，由审核完成时放行。
+    task_ids = _record_plan_tasks(ctx, plan.steps, deliver_after_review=deliver_after_review)
     for index, step in enumerate(plan.steps):
         if step == STEP_COLLECT:
             target = normalize_github_target(ctx.content) or ""
@@ -423,6 +552,9 @@ async def _dispatch_plan(ctx: ChatDispatchContext, plan: ChatPlan) -> ChatDispat
         if message:
             replies.append(message)
     if handoff:
+        # 已交给后台任务：清单里这些步骤算“已交接”，别让它们永远停在“待执行”。
+        # （真正等前置的那些由后台收尾时的完成/失败来放行或跳过。）
+        _finish_plan_tasks(ctx, task_ids, facts, complete_handed_off=True)
         return ChatDispatchOutcome(
             reply=None,
             # 卡片标题用中文步骤名，不要泄露内部代号（image/review）。
@@ -430,6 +562,7 @@ async def _dispatch_plan(ctx: ChatDispatchContext, plan: ChatPlan) -> ChatDispat
             results=facts,
             keep_running=True,
         )
+    _finish_plan_tasks(ctx, task_ids, facts, complete_handed_off=False)
     return ChatDispatchOutcome(
         # 多步都要如实回答：只报最后一步会让人以为第一步没跑（真实反馈：两条命令只回一条）。
         reply="\n".join(replies) if replies else "收到，已经按顺序处理完成。",
@@ -482,7 +615,10 @@ async def _dispatch_command(ctx: ChatDispatchContext, parsed: AgentCommand) -> C
             },
         )
         ctx.session.commit()
+        # 界面按钮命令也要进清单：否则用户过一会儿问“接下来还有什么”，清单里是空的。
+        _record_command_task(ctx, parsed, repository)
         result = await tools[parsed.name].ainvoke(arguments)
+        _mark_command_task_done(ctx, parsed, result)
         facts = {"command": parsed.name, "label": parsed.label, **(result or {})}
     elif parsed.name == "reuse_draft_assets":
         draft = current_editable_draft(repository, ctx.session_id) if not parsed.draft_id else repository.get_draft(parsed.draft_id)

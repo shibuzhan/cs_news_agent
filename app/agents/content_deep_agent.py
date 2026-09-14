@@ -22,6 +22,7 @@ from app.agent_tools.draft_actions import build_draft_action_tools
 from app.agent_tools.draft_assets import build_draft_asset_tools
 from app.agent_tools.source_media_tools import build_source_media_tools
 from app.agent_tools.publication_preferences import build_publication_preference_tools
+from app.agent_tools.session_task_tools import build_session_task_tools
 from app.agent_tools.wechat_materials import build_wechat_material_tools
 from app.config import (
     Settings,
@@ -55,6 +56,8 @@ reply 面向用户、简洁中文；不虚构事实、执行结果、内部推�
 长期偏好与素材库也由你直接读写：show_publication_preferences / set_publication_preferences（封面是否作正文首图、文字尾注开关）、set_article_footer_image / clear_article_footer_image（固定结尾图）、show_style_guide / update_style_guide / add_style_preference / remove_style_preference（长期写作偏好，写入仓库文件 preferences/style.md，生成/改稿/审核三处都会生效）、list_wechat_materials（只读盘点可清理的素材）与 delete_wechat_material（删除永久素材，破坏性、需 media_id，且被投递引用的封面会被拒绝）。改长期偏好或删素材前，先说明会长期生效/不可恢复，用户确认后再调用。
 需要真实截图时用 list_source_images 查看来源可用的图（项目 README 自带的图；include_official_site=true 会联网抓官方页面，消耗一次检索配额），再用 attach_source_image 下载并绑定为封面或正文插图。**只允许来源仓库与项目官方页面的图片**，绑定后在正文里标注图片来源，不得使用第三方文章里的图。
 当用户是在回答你的追问（例如“要”“现在审核”“复用原来的图”）时，按对应意图返回：要立刻自动审核用 run_auto_review；保留/复用已有配图用 reuse_draft_assets；两个都做时分两步回复，先做用户最先提到的那一个。
+用户一次提出多件事、或前后有依赖时（“审核如果通过就投递草稿箱”“先重写再审核”），**先把清单列出来再动手**：用 list_tasks 看有没有已经在等的事，用 add_task 逐条登记（kind 用动作代号，后一件事用 depends_on 指向前面那件事的 task_id，例如投递依赖审核），再用 read_current_draft / list_active_tasks 看现状决定现在能做哪一条。任务开始时用 update_task 标记 running，做完标 completed（失败标 failed，放弃标 skipped）——完成或失败会自动放行或跳过它的后继任务。用户提到“接下来/还差什么/还剩什么”时，先 list_tasks 再回答，不要凭记忆猜。
+**不要在清单里已经有同一件事（status 为 pending/ready/running）时再登记一遍，也不要在前置任务没完成时抢跑**：先 list_tasks 确认，再决定排队还是执行。
 """
 
 _MEMORY_RULES = """# 会话记忆规则
@@ -365,7 +368,9 @@ class ContentDeepAgent:
                 # 长期排版偏好与公众号素材库：这两个构造器很早就写好了，却一直**没有挂上来**，
                 # 于是界面按钮“排版偏好/素材库盘点”解析出的工具在两条路径里都找不到（能力缺失）。
                 + build_publication_preference_tools(session_id)
-                + build_wechat_material_tools(session_id),
+                + build_wechat_material_tools(session_id)
+                # 会话任务清单：让“先做什么、还等谁”跨消息保留，而不是收到消息就立刻执行。
+                + build_session_task_tools(session_id),
                 "system_prompt": _SYSTEM_PROMPT if mode == "tool" else f"{_SYSTEM_PROMPT}\n{_JSON_DECISION_SUFFIX}",
                 "skills": ["/skills"],
                 "memory": ["/memory/AGENTS.md"],

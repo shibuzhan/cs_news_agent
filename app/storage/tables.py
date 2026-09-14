@@ -484,6 +484,37 @@ class ChatAgentEventRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class SessionTaskRow(Base):
+    """会话级任务清单：让“任务”跨消息存活，而不是收到一条消息就立刻执行。
+
+    真实反馈（2026-09-14）：“目前 agent 是不是缺少 todolist 能力？收到什么消息就立刻去执行。”
+    用户先说“仅运行审核”，紧接着说“审核如果通过就投递草稿箱”——旧实现把第二条当成一个新任务，
+    既不知道第一条还在跑，也不知道“投递”依赖“审核通过”。有了这张表，清单能记住
+    “要做什么、做到哪一步、还等谁”，并在回执与生成记录里显示出来。
+    """
+
+    __tablename__ = "session_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    # 同一会话内的显示顺序（清单按此排序，前端也能据此定位）。
+    position: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    # 动作代号：collect / rewrite / refresh_source / review / deliver / image / chat …
+    kind: Mapped[str] = mapped_column(String(40), default="chat", index=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    # 依赖的前置任务 id（JSON 数组）：前置完成才轮到它，前置失败/跳过就跟着跳过。
+    depends_on_json: Mapped[list] = mapped_column(JSONB, default=list)
+    draft_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class AppSettingRow(Base):
     """长期运行偏好（键值）：让 Agent 的“长期修改”落到数据库而不是每次重建都丢。
 

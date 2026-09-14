@@ -74,6 +74,42 @@ class FakeRepository:
         self.events.append(_args)
         return SimpleNamespace(id=f"event-{len(self.events)}")
 
+    # --- 会话任务清单（多步计划会把每一步登记进来） ---
+    tasks: list[SimpleNamespace]
+
+    def list_session_tasks(self, _session_id: str):
+        return getattr(self, "tasks", [])
+
+    def get_session_task(self, task_id: str):
+        return next((row for row in getattr(self, "tasks", []) if row.id == task_id), None)
+
+    def create_session_task(self, session_id, title, kind, *, depends_on=None, draft_id=None, note="", status="pending"):  # noqa: ANN001
+        rows = getattr(self, "tasks", None)
+        if rows is None:
+            rows = self.tasks = []
+        row = SimpleNamespace(
+            id=f"task-{len(rows) + 1}", session_id=session_id, position=0, title=title, kind=kind,
+            status=status, depends_on_json=list(depends_on or []), draft_id=draft_id, note=note,
+            created_at=None, updated_at=None,
+        )
+        rows.append(row)
+        return row
+
+    def update_session_task(self, task_id, *, status=None, note=None, depends_on=None):  # noqa: ANN001
+        row = self.get_session_task(task_id)
+        if row is None:
+            return None
+        if status is not None:
+            row.status = status
+        if note is not None:
+            row.note = note
+        if depends_on is not None:
+            row.depends_on_json = list(depends_on)
+        return row
+
+    def list_session_tasks_by_dependency(self, task_id: str):
+        return [row for row in getattr(self, "tasks", []) if task_id in (row.depends_on_json or [])]
+
     def create_chat_message(self, _session_id: str, _role: str, content: str):
         return SimpleNamespace(id="message-anchor", content=content)
 

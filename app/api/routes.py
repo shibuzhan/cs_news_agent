@@ -933,6 +933,20 @@ def get_chat_session(
             chat_agent_run_to_dict(row, repository)
             for row in repository.list_chat_agent_runs(session_id)
         ],
+        # 会话任务清单：界面上要能看到“要做什么、做到哪一步、还等谁”。
+        "tasks": [
+            session_task_to_dict(row) for row in repository.list_session_tasks(session_id)
+        ],
+    }
+
+
+def session_task_to_dict(row: Any) -> dict[str, Any]:
+    from app.services import session_tasks as tasks
+
+    return {
+        **tasks.describe_task(row),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
 
 
@@ -1367,6 +1381,15 @@ async def send_chat_message(
         session.commit()
         return {"message": chat_message_to_dict(assistant_message), "processing": None, "execution": None}
     plan = plan_chat_message(command.content, has_attachment=command.attachment_id is not None)
+    # 回执末尾带上**此前就积压的清单**（这次要执行的任务由派发阶段登记，不算“等待中”）。
+    from app.services import session_tasks as session_task_service
+
+    try:
+        open_line = session_task_service.task_summary_line(
+            repository.list_session_tasks(session_id)
+        )
+    except Exception:
+        open_line = ""
     # 回执里点名到具体文章时用**标题**称呼它：界面按钮命令只带 draft id，用户不该看到那串 uuid。
     receipt_text = plan.text
     mentioned_draft_id = command_draft_id(command.content)
@@ -1378,6 +1401,8 @@ async def send_chat_message(
             )
         except Exception:
             logger.warning("chat_receipt_draft_title_unavailable draft_id=%s", mentioned_draft_id)
+    if open_line:
+        receipt_text = f"{receipt_text}{open_line}。"
     run = repository.create_chat_agent_run(
         session_id, user_message.id, plan.intent, command.auto_review, command.auto_illustration,
     )

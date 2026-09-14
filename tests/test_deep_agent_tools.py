@@ -152,6 +152,9 @@ def test_deep_agent_returns_structured_decision_with_session_checkpoint(monkeypa
         content_deep_agent, "build_wechat_material_tools", lambda _session_id: ["material-tool"]
     )
     monkeypatch.setattr(
+        content_deep_agent, "build_session_task_tools", lambda _session_id: ["task-tool"]
+    )
+    monkeypatch.setattr(
         content_deep_agent,
         "get_conversation_context_snapshot",
         lambda _session_id: {"active_draft": {"id": "draft-1"}, "recent_messages": []},
@@ -177,7 +180,7 @@ def test_deep_agent_returns_structured_decision_with_session_checkpoint(monkeypa
     assert decision.reply == "已读取当前会话上下文。"
     assert kwargs["tools"] == [
         "context-tool", "asset-tool", "action-tool", "media-tool",
-        "preference-tool", "material-tool",
+        "preference-tool", "material-tool", "task-tool",
     ]
     assert "middleware" not in kwargs
     assert kwargs["subagents"] == []
@@ -240,6 +243,9 @@ def test_deep_agent_json_mode_omits_structured_tool(monkeypatch) -> None:
         content_deep_agent, "build_wechat_material_tools", lambda _session_id: ["material-tool"]
     )
     monkeypatch.setattr(
+        content_deep_agent, "build_session_task_tools", lambda _session_id: ["task-tool"]
+    )
+    monkeypatch.setattr(
         content_deep_agent,
         "get_conversation_context_snapshot",
         lambda _session_id: {"active_draft": None, "recent_messages": []},
@@ -267,7 +273,7 @@ def test_deep_agent_json_mode_omits_structured_tool(monkeypatch) -> None:
     assert "JSON 文本模式" in kwargs["system_prompt"]
     assert kwargs["tools"] == [
         "context-tool", "asset-tool", "action-tool", "media-tool",
-        "preference-tool", "material-tool",
+        "preference-tool", "material-tool", "task-tool",
     ]
 
 

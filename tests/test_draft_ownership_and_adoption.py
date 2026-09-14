@@ -41,6 +41,42 @@ class FakeRepository:
         self.adopted.append(active_draft_id)
         self.memory_draft = active_draft_id
 
+    # --- 会话任务清单（命令路径也会登记一条待办） ---
+    def get_chat_session_memory(self, _session_id: str):
+        return SimpleNamespace(active_draft_id=self.memory_draft)
+
+    tasks: list[SimpleNamespace]
+
+    def list_session_tasks(self, _session_id: str):
+        return getattr(self, "tasks", [])
+
+    def get_session_task(self, task_id: str):
+        return next((row for row in getattr(self, "tasks", []) if row.id == task_id), None)
+
+    def create_session_task(self, session_id, title, kind, *, depends_on=None, draft_id=None, note="", status="pending"):  # noqa: ANN001
+        rows = getattr(self, "tasks", None)
+        if rows is None:
+            rows = self.tasks = []
+        row = SimpleNamespace(
+            id=f"task-{len(rows) + 1}", session_id=session_id, position=0, title=title, kind=kind,
+            status=status, depends_on_json=list(depends_on or []), draft_id=draft_id, note=note,
+        )
+        rows.append(row)
+        return row
+
+    def update_session_task(self, task_id, *, status=None, note=None, depends_on=None):  # noqa: ANN001
+        row = self.get_session_task(task_id)
+        if row is None:
+            return None
+        if status is not None:
+            row.status = status
+        if note is not None:
+            row.note = note
+        return row
+
+    def list_session_tasks_by_dependency(self, task_id: str):
+        return [row for row in getattr(self, "tasks", []) if task_id in (row.depends_on_json or [])]
+
     def add_chat_agent_event(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
         self.events.append((args, kwargs))
 

@@ -26,11 +26,27 @@ export type Attachment = {
   download_url: string;
 };
 
+export type SessionTask = {
+  task_id: string;
+  title: string;
+  kind: string;
+  kind_label: string;
+  status: "pending" | "ready" | "running" | "completed" | "failed" | "skipped";
+  status_label: string;
+  depends_on: string[];
+  draft_id: string | null;
+  note: string;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
 export type Conversation = {
   session: ChatSession;
   messages: ChatMessage[];
   attachments: Attachment[];
   agent_runs: AgentRun[];
+  // 会话任务清单：跨消息保留的“要做什么、做到哪一步、还等谁”。
+  tasks?: SessionTask[];
 };
 
 export type AgentEvent = {

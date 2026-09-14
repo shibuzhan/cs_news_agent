@@ -52,6 +52,7 @@ from app.storage.tables import (
     ReviewEventRow,
     PublishPlanRow,
     SchedulePlanRow,
+    SessionTaskRow,
     SourceItemRow,
     RuntimeSettingAuditRow,
     TrendingSnapshotRow,
@@ -1301,6 +1302,83 @@ class ContentRepository:
                 select(ChatAgentEventRow)
                 .where(ChatAgentEventRow.run_id == run_id)
                 .order_by(ChatAgentEventRow.sequence.asc())
+            )
+        )
+
+    # --- 会话任务清单（跨消息的 todo） ---------------------------------------------------
+
+    def list_session_tasks(self, session_id: str) -> list[SessionTaskRow]:
+        self.get_chat_session(session_id)
+        return list(
+            self.session.scalars(
+                select(SessionTaskRow)
+                .where(SessionTaskRow.session_id == session_id)
+                .order_by(SessionTaskRow.position.asc(), SessionTaskRow.created_at.asc())
+            )
+        )
+
+    def get_session_task(self, task_id: str) -> SessionTaskRow | None:
+        return self.session.get(SessionTaskRow, task_id)
+
+    def create_session_task(
+        self,
+        session_id: str,
+        title: str,
+        kind: str,
+        *,
+        depends_on: list[str] | None = None,
+        draft_id: str | None = None,
+        note: str = "",
+        status: str = "pending",
+    ) -> SessionTaskRow:
+        self.get_chat_session(session_id)
+        from app.services.session_tasks import KIND_ORDER
+
+        row = SessionTaskRow(
+            session_id=session_id,
+            position=KIND_ORDER.get(kind, KIND_ORDER["other"]),
+            title=title,
+            kind=kind,
+            status=status,
+            depends_on_json=list(depends_on or []),
+            draft_id=draft_id,
+            note=note,
+        )
+        self.session.add(row)
+        self.session.flush()
+        logger.info(
+            "session_task_created session_id=%s task_id=%s kind=%s status=%s",
+            session_id, row.id, kind, status,
+        )
+        return row
+
+    def update_session_task(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+        note: str | None = None,
+        depends_on: list[str] | None = None,
+    ) -> SessionTaskRow | None:
+        row = self.session.get(SessionTaskRow, task_id)
+        if row is None:
+            return None
+        if status is not None:
+            row.status = status
+        if note is not None:
+            row.note = note
+        if depends_on is not None:
+            row.depends_on_json = list(depends_on)
+        self.session.flush()
+        return row
+
+    def list_session_tasks_by_dependency(self, task_id: str) -> list[SessionTaskRow]:
+        """列出把该任务当作前置的任务（JSONB 包含判断，避免全表扫描后再过滤）。"""
+        return list(
+            self.session.scalars(
+                select(SessionTaskRow)
+                .where(SessionTaskRow.depends_on_json.contains([task_id]))
+                .order_by(SessionTaskRow.position.asc())
             )
         )
 

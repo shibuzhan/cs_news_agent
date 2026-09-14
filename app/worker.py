@@ -458,6 +458,10 @@ async def process_draft_regeneration_job(
                 summary="本会话当前草稿已在原生成记录内重新生成。",
             )
             repository.release_run_target_draft(chat_run_id)
+            _advance_session_tasks(
+                repository, session_id, "rewrite",
+                note=f"已更新为版本 {regenerated['version']}",
+            )
             source_note = (
                 "只使用已保存的来源正文（未联网重抓）" if mode == "snapshot" else "已按已保存或重新获取的来源正文"
             )
@@ -704,6 +708,34 @@ async def process_auto_review_job(
         raise
 
 
+def _advance_session_tasks(
+    repository: ContentRepository, session_id: str, kind: str, *, note: str = "", done: bool = True,
+) -> list:
+    """把清单里对应动作的任务标完成/失败，并放行（或跳过）依赖它的后继任务。
+
+    这是清单“活着”的关键：任务由对话登记，但**结束在后台任务**——不在这里收尾，
+    清单就会永远停在“进行中”，用户下次问“还差什么”会得到错的答案。
+    """
+    from app.services import session_tasks as tasks
+
+    try:
+        task = tasks.ready_task_for_kind(repository, session_id, kind)
+        if task is None:
+            return []
+        if done:
+            _task, released = tasks.complete_task(repository, task.id, note)
+        else:
+            _task, released = tasks.fail_task(repository, task.id, note)
+        logger.info(
+            "session_task_advanced session_id=%s kind=%s done=%s released=%s",
+            session_id, kind, done, [item.kind for item in released],
+        )
+        return released
+    except Exception as exc:  # 清单收尾失败不能影响任务本身的结果
+        logger.warning("session_task_advance_failed session_id=%s kind=%s error_type=%s", session_id, kind, type(exc).__name__)
+        return []
+
+
 async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: dict) -> None:
     """审核结束：结束运行，并让模型根据真实审核结果写汇报（含是否追问）。"""
     with SessionLocal() as session:
@@ -756,6 +788,10 @@ async def _report_auto_review_result(chat_run_id: str, draft_id: str, result: di
         )
         if chat_run.response_message_id:
             repository.append_run_reply(chat_run_id, reply)
+        _advance_session_tasks(
+            repository, chat_run.session_id, "review",
+            note=summary, done=bool(passed) or status in {"reviewed", "reviewed_while_rewriting"},
+        )
         repository.finish_chat_agent_run(
             chat_run_id, chat_run.response_message_id, ConversationRunStatus.COMPLETED, summary, [result]
         )
@@ -844,6 +880,10 @@ async def _report_publication_selection_result(chat_run_id: str, draft_id: str, 
         )
         if chat_run.response_message_id:
             repository.append_run_reply(chat_run_id, reply)
+        _advance_session_tasks(
+            repository, chat_run.session_id, "deliver",
+            note=f"已重新选择配图（未投递）：封面 1 张、正文 {inline_count} 张",
+        )
         repository.finish_chat_agent_run(
             chat_run_id, chat_run.response_message_id, ConversationRunStatus.COMPLETED,
             f"已重新选择配图（未投递）：封面 1 张、正文 {inline_count} 张", [{"draft_id": draft_id}],
@@ -878,6 +918,9 @@ async def _report_wechat_delivery_result(chat_run_id: str, draft_id: str, *, upd
         )
         if chat_run.response_message_id:
             repository.append_run_reply(chat_run_id, reply)
+        _advance_session_tasks(
+            repository, chat_run.session_id, "deliver", note=fallback, done=not error,
+        )
         repository.finish_chat_agent_run(
             chat_run_id, chat_run.response_message_id,
             ConversationRunStatus.FAILED if error else ConversationRunStatus.COMPLETED,
