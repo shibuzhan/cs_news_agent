@@ -1,7 +1,7 @@
 import { Component, type ErrorInfo, useCallback, useEffect, useRef, useState } from "react";
 import { Bell, Check, ChevronDown, CircleAlert, CircleCheck, Download, FileText, Image, LoaderCircle, MessageSquareText, Paperclip, Plus, RefreshCw, Send, Settings, ShieldCheck, Trash2, X } from "lucide-react";
 import { api, chatRunStreamUrl } from "./api";
-import type { AgentRun, Attachment, AutoReviewRun, ChatMessage, ChatSession, Conversation, Draft, DraftIllustration, DraftRevision, ModelProfile, Notification, RuntimeSettingsSnapshot, WechatPublicationJob, WechatRemoteDraft, PublicationPreferences } from "./types";
+import type { AgentRun, Attachment, AutoReviewRun, ChatMessage, ChatSession, Conversation, Draft, DraftIllustration, DraftRevision, ModelProfile, Notification, RuntimeSettingsSnapshot, SessionTask, WechatPublicationJob, WechatRemoteDraft, PublicationPreferences } from "./types";
 
 type View = "chat" | "review" | "publishing" | "settings";
 
@@ -167,6 +167,41 @@ function AppShell({ view, setView, children }: { view: View; setView: (view: Vie
     </aside>
     <section className="workspace"><NotificationCenter onNavigate={setView} />{children}</section>
   </main>;
+}
+
+function SessionTaskList({ tasks }: { tasks?: SessionTask[] }) {
+  const items = Array.isArray(tasks) ? tasks : [];
+  const open = items.filter((task) => ["pending", "ready", "running"].includes(task.status));
+  const done = items.filter((task) => !["pending", "ready", "running"].includes(task.status));
+  // 清单跨消息保留：先列未完成的（还等谁、在做哪一步），已完成/跳过的收进折叠区。
+  return (
+    <section className="task-panel">
+      <div className="panel-heading"><h2>任务清单</h2><span>{open.length ? `${open.length} 项待办` : "无待办"}</span></div>
+      {open.length
+        ? <ol className="task-list">{open.map((task) => (
+          <li className="task-item" data-status={task.status} key={task.task_id}>
+            <span className="task-dot" data-status={task.status} />
+            <div>
+              <b>{task.title}</b>
+              <small>
+                {task.status_label}
+                {task.depends_on.length ? ` · 等 ${task.depends_on.length} 个前置` : ""}
+                {task.note ? ` · ${task.note.slice(0, 40)}` : ""}
+              </small>
+            </div>
+          </li>
+        ))}</ol>
+        : <p className="muted">还没有待办。多步指令（“先重写，再审核，通过后投递”）会自动登记到这里。</p>}
+      {done.length > 0 && (
+        <details className="task-history">
+          <summary>已完成 {done.length} 项</summary>
+          <ul>{done.map((task) => (
+            <li key={task.task_id}><span>{task.title}</span><small>{task.status_label}{task.note ? ` · ${task.note.slice(0, 40)}` : ""}</small></li>
+          ))}</ul>
+        </details>
+      )}
+    </section>
+  );
 }
 
 function ChatPage() {
@@ -385,7 +420,7 @@ function ChatPage() {
         </div>
         {notice && <p className="notice">{notice}</p>}
       </section>
-        <aside className="attachment-panel"><div className="panel-heading"><h2>本次对话附件</h2><span>{conversation?.attachments?.length || 0}</span></div><p className="muted">支持文本和 JPG/PNG，单个不超过 2 MB。图片仅保存，需在“发布情况”明确选择后才会上传公众号。</p>{conversation?.attachments?.length ? conversation.attachments.map((attachment) => <button key={attachment.id} className={selectedAttachment?.id === attachment.id ? "attachment-card selected" : "attachment-card"} onClick={() => setSelectedAttachment(attachment)}>{attachment.content_type.startsWith("image/") ? <Image size={18} /> : <FileText size={18} />}<span>{attachment.original_name}<small>{displaySize(attachment.size_bytes)} · {statusLabel(attachment.status)}</small></span><a href={attachment.download_url} onClick={(event) => event.stopPropagation()} title="下载附件"><Download size={16} /></a></button>) : <div className="empty compact">还没有附件</div>}</aside>
+        <aside className="attachment-panel"><SessionTaskList tasks={conversation?.tasks} /><div className="panel-heading"><h2>本次对话附件</h2><span>{conversation?.attachments?.length || 0}</span></div><p className="muted">支持文本和 JPG/PNG，单个不超过 2 MB。图片仅保存，需在“发布情况”明确选择后才会上传公众号。</p>{conversation?.attachments?.length ? conversation.attachments.map((attachment) => <button key={attachment.id} className={selectedAttachment?.id === attachment.id ? "attachment-card selected" : "attachment-card"} onClick={() => setSelectedAttachment(attachment)}>{attachment.content_type.startsWith("image/") ? <Image size={18} /> : <FileText size={18} />}<span>{attachment.original_name}<small>{displaySize(attachment.size_bytes)} · {statusLabel(attachment.status)}</small></span><a href={attachment.download_url} onClick={(event) => event.stopPropagation()} title="下载附件"><Download size={16} /></a></button>) : <div className="empty compact">还没有附件</div>}</aside>
     </div>
   </>;
 }
