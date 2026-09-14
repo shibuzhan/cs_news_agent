@@ -56,6 +56,23 @@ def test_ui_button_command_maps_to_a_single_step_without_the_model() -> None:
     assert "自动审核" in plan.text
 
 
+def test_review_only_button_receipt_says_the_body_stays_untouched() -> None:
+    """“仅运行审核（只出意见，不改稿）”的回执必须写明不改稿，否则用户以为正文已被改过。"""
+    plan = plan_chat_message("仅运行审核｜draft=7a0e6ed6-1111-2222")
+
+    assert plan.steps == ("review",)
+    assert "不改稿" in plan.text
+    assert plan.status == "正在审核（不改稿）"
+
+
+def test_reselect_command_is_a_registered_step() -> None:
+    """界面按钮“重新选择配图”也要走确定性回执，而不是退化到关键词扫描。"""
+    plan = plan_chat_message("重新选择配图｜draft=7a0e6ed6-1111-2222")
+
+    assert plan.steps == ("deliver",)
+    assert plan.intent == ConversationIntent.PUBLISH_TO_WECHAT_DRAFT
+
+
 def test_attachment_message_gets_an_extraction_receipt() -> None:
     plan = plan_chat_message("提取附件并生成待审核草稿", has_attachment=True)
 

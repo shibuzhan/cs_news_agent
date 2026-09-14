@@ -48,6 +48,21 @@ def test_source_refresh_and_snapshot_rewrite_commands() -> None:
     assert parse_agent_command("生成封面图").name == "generate_draft_illustration"
 
 
+def test_review_only_command_never_revises_the_body() -> None:
+    """“仅审核”必须落在只审不改的 review_draft 上。
+
+    真实歧义：按钮写着“仅运行审核（改稿不投递）”，命令却解析成 run_auto_review，
+    而它会在有可执行意见时**改稿一轮**——用户以为只是看看意见，正文却被动了。
+    """
+    assert parse_agent_command("仅审核").name == "review_draft"
+    assert parse_agent_command("仅运行审核｜draft=abc12345").name == "review_draft"
+    assert parse_agent_command("仅审核｜draft=abc12345").draft_id == "abc12345"
+    # 会改稿的入口保持不变：默认自动审核与“重新审核”仍走 run_auto_review。
+    assert parse_agent_command("自动审核").name == "run_auto_review"
+    assert parse_agent_command("运行自动审核").name == "run_auto_review"
+    assert parse_agent_command("重新审核").name == "run_auto_review"
+
+
 def test_illustration_command_reads_purpose_and_paragraph() -> None:
     cover = parse_agent_command("生成封面图｜draft=abc12345")
     inline = parse_agent_command("生成正文第 3 段插图｜draft=abc12345")

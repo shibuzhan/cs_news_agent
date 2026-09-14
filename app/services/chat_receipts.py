@@ -51,10 +51,17 @@ _ATTACHMENT_HINT = re.compile(r"附件|文档|这个文件|文本")
 # 界面命令 → 步骤（顺序即执行顺序）。
 _COMMAND_STEPS: dict[str, tuple[str, ...]] = {
     "run_auto_review": (STEP_REVIEW,),
+    # 只审不改（review_draft）与“重新选择配图”是界面按钮命令：不在这里登记，
+    # 回执就会退化到关键词扫描，措辞与卡片标题都可能对不上点下去的动作。
+    "review_draft": (STEP_REVIEW,),
     "generate_draft_illustration": (STEP_IMAGE,),
     "publish_to_wechat_draft": (STEP_DELIVER,),
+    "reselect_publication_assets": (STEP_DELIVER,),
     "rewrite_draft": (STEP_REWRITE,),
 }
+
+# 这些命令不会改动正文：回执文案要区分“审核并改稿”与“只审不改”。
+_READ_ONLY_COMMANDS = {"review_draft"}
 
 # 步骤 → 受理运行的初始意图（前端卡片标题与“生成记录”分组要用）。
 _STEP_INTENTS = {
@@ -96,8 +103,11 @@ def _scan_steps(text: str) -> tuple[str, ...]:
     return tuple(step for _, step in found)
 
 
-def _single_step_receipt(step: str) -> tuple[str, str]:
+def _single_step_receipt(step: str, *, revise: bool = True) -> tuple[str, str]:
     """单步：回执文案 + 运行摘要（都要短，卡片标题直接显示摘要）。"""
+    if step == STEP_REVIEW and not revise:
+        # 只审不改必须说清“正文不会被改”，否则用户以为文章已经按意见改过了。
+        return "收到：只审核当前文章，不改稿。正在处理，完成后我会把意见列给你。", "正在审核（不改稿）"
     return {
         STEP_COLLECT: ("收到：采集资讯。正在获取资料并生成待审核草稿。", "正在采集"),
         STEP_IMAGE: ("收到：生成配图。正在排队生成，完成后我会汇报。", "正在生成配图"),
@@ -131,7 +141,9 @@ def plan_chat_message(text: str, *, has_attachment: bool = False) -> ChatPlan:
     parsed = parse_agent_command(raw)
     if parsed is not None and parsed.name in _COMMAND_STEPS:
         steps = _COMMAND_STEPS[parsed.name]
-        step_text, status = _single_step_receipt(steps[0])
+        step_text, status = _single_step_receipt(
+            steps[0], revise=parsed.name not in _READ_ONLY_COMMANDS
+        )
         if parsed.name == "generate_draft_illustration":
             step_text = (
                 "收到：生成正文插图。正在排队生成，完成后我会汇报。"

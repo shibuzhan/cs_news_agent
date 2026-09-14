@@ -32,7 +32,10 @@ _DELIVER_HINT = re.compile(r"投递|公众号草稿|deliver\s*[=:]\s*true")
 _PREFIXES: tuple[tuple[str, str, str], ...] = (
     ("运行自动审核", "run_auto_review", "运行自动审核"),
     ("自动审核", "run_auto_review", "运行自动审核"),
-    ("仅审核", "run_auto_review", "仅运行审核"),
+    # “仅审核”= 只出意见、**不改稿**：指向 review_draft，而不是会长篇改稿的 run_auto_review
+    # （真实歧义：按钮写着“仅审核”，点下去却动了正文）。
+    ("仅运行审核", "review_draft", "仅运行审核"),
+    ("仅审核", "review_draft", "仅运行审核"),
     ("重新审核", "run_auto_review", "重新运行审核"),
     ("审核通过", "approve_draft", "审核通过"),
     ("撤销审核", "revoke_approval", "撤销审核"),
