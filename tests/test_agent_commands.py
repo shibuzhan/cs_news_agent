@@ -70,17 +70,23 @@ def test_action_tools_are_registered_for_the_session() -> None:
 
 
 def test_action_tools_reject_foreign_draft(monkeypatch: pytest.MonkeyPatch) -> None:
-    """只能操作本会话生成过的草稿。"""
+    """只能操作本会话正在使用的草稿：从未被本会话碰过的草稿仍然拒绝。"""
     from app.agent_tools import draft_actions
 
     class _Repository:
         def get_draft(self, draft_id: str):
-            return type("Draft", (), {"id": draft_id, "status": "pending_review"})()
+            return type(
+                "Draft",
+                (),
+                {"id": draft_id, "status": "pending_review", "title_options_json": ["另一篇稿子"]},
+            )()
 
-        def find_generation_run_for_draft(self, draft_id: str):
-            return type("Run", (), {"session_id": "another-session"})()
+        def session_references_draft(self, _session_id: str, _draft_id: str) -> bool:
+            return False
 
     draft, reason = draft_actions._resolve_draft(_Repository(), "session-1", "draft-1")
 
     assert draft is None
     assert "不属于本会话" in reason
+    # 拒绝时也要说清是哪一篇（用户反馈：返回信息应该是稿件标题，不是草稿 id）。
+    assert "另一篇稿子" in reason

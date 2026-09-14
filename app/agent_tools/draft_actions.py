@@ -33,9 +33,12 @@ MAX_PLACEMENT = 20
 
 
 def _draft_belongs_to_session(repository: ContentRepository, session_id: str, draft_id: str) -> bool:
-    """草稿归属校验：只能操作本会话生成过的草稿。"""
-    run = repository.find_generation_run_for_draft(draft_id)
-    return bool(run is not None and run.session_id == session_id)
+    """草稿归属校验：只能操作本会话正在使用的草稿。
+
+    判定口径见 `ContentRepository.session_references_draft`：当前文章、生成记录，
+    或本会话任意运行事件里出现过的草稿都算；本会话从未碰过的草稿仍然拒绝。
+    """
+    return repository.session_references_draft(session_id, draft_id)
 
 
 def _resolve_draft(
@@ -48,7 +51,10 @@ def _resolve_draft(
         except Exception:
             return None, "找不到这篇草稿。"
         if not _draft_belongs_to_session(repository, session_id, draft_id):
-            return None, "该草稿不属于本会话，不能在这里操作。"
+            return None, (
+                f"《{_draft_label(draft)}》不属于本会话，不能在这里操作。"
+                "如果确实要改这一篇，先让我把它设为本会话当前文章，再重试。"
+            )
     else:
         memory = repository.get_chat_session_memory(session_id)
         if not memory.active_draft_id:

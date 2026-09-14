@@ -984,6 +984,36 @@ class ContentRepository:
             )
         )
 
+    def session_references_draft(self, session_id: str, draft_id: str) -> bool:
+        """本会话是否**正在使用**这篇草稿。
+
+        用户截图里的真实故障：草稿明明是会话的当前文章（配图、重写都在这个会话里做过），
+        但“重写文案｜draft=…”仍被判“该草稿不属于本会话”——因为归属只查了“本会话的 collect_news
+        运行事件里有没有 draft_ids”，而更早生成的草稿没有这个字段。
+
+        三条任一成立即算归属，既修好老数据，也不放松隔离（本会话从未碰过的草稿仍然拒绝）：
+        1. 它是本会话的当前文章（`chat_session_memories.active_draft_id`）；
+        2. 本会话的生成记录事件里出现过它；
+        3. 本会话的任意运行事件里出现过它（配图、重写、审核都会写 `draft_ids`）。
+        """
+        memory = self.session.get(ChatSessionMemoryRow, session_id)
+        if memory is not None and memory.active_draft_id == draft_id:
+            return True
+        run = self.find_generation_run_for_draft(draft_id)
+        if run is not None and run.session_id == session_id:
+            return True
+        return bool(
+            self.session.scalar(
+                select(ChatAgentEventRow.id)
+                .join(ChatAgentRunRow, ChatAgentRunRow.id == ChatAgentEventRow.run_id)
+                .where(
+                    ChatAgentRunRow.session_id == session_id,
+                    ChatAgentEventRow.metadata_json["draft_ids"].contains([draft_id]),
+                )
+                .limit(1)
+            )
+        )
+
     def find_generation_run_for_draft(self, draft_id: str) -> ChatAgentRunRow | None:
         """从文字阶段审计找回原生成记录，兼容既有数据。"""
         return self.session.scalar(

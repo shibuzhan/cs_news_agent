@@ -401,6 +401,21 @@ async def _dispatch_plan(ctx: ChatDispatchContext, plan: ChatPlan) -> ChatDispat
 
 async def _dispatch_command(ctx: ChatDispatchContext, parsed: AgentCommand) -> ChatDispatchOutcome | None:
     repository = ctx.repository
+    if parsed.draft_id:
+        # 界面命令里的 draft_id 是**用户点出来的**，不是模型猜的：如果这篇草稿本会话还没用过，
+        # 先把它设为本会话当前文章再执行，而不是回一句“该草稿不属于本会话”（真实反馈：点了按钮却被拒）。
+        try:
+            draft = repository.get_draft(parsed.draft_id)
+        except Exception:
+            draft = None
+        if draft is not None and not repository.session_references_draft(ctx.session_id, parsed.draft_id):
+            repository.update_chat_session_memory(ctx.session_id, active_draft_id=draft.id)
+            repository.add_chat_agent_event(
+                ctx.run_id, "已把这篇设为本会话当前文章",
+                f"《{(draft.title_options_json or ['当前草稿'])[0]}》来自界面命令，已切换到本会话继续处理。",
+                metadata={"phase": "intake", "state": "running", "draft_ids": [draft.id], "adopted": True},
+            )
+            ctx.session.commit()
     tools = {item.name: item for item in build_draft_action_tools(ctx.session_id, chat_run_id=ctx.run_id)}
     if parsed.name in tools:
         arguments: dict[str, Any] = {}
