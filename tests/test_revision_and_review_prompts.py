@@ -419,6 +419,24 @@ def test_review_and_revision_protect_the_sharing_tone() -> None:
     assert "不要把文章改成百科定义句" in revision_source
 
 
+def test_review_matches_the_writer_on_numbers_and_tone_bounds() -> None:
+    """生成与审核必须同口径：数字中文写法不能被判缺陷，分享口吻也要有边界。"""
+    from app.services.generator import _natural_article_instruction
+    from app.tools.auto_review import AutoReviewTool
+
+    instruction = _natural_article_instruction(1200, 4000)
+    review_source = inspect.getsource(AutoReviewTool.invoke)
+
+    # 生成端要求“41987 写成约 4.2 万”，审核端必须给同一口径的豁免。
+    assert "41987 写成约 4.2 万" in instruction
+    assert "数字按中文读者习惯改写属于写作规范" in review_source
+    assert "不得判为“来源证据中未出现”" in review_source
+    # 生成端禁止叫卖词，审核端要有对应边界，否则等于放行营销腔。
+    assert "绝了" in instruction
+    assert "分享口吻的边界" in review_source
+    assert "叫卖词与网络烂梗属于 tone 上的 minor" in review_source
+
+
 def test_review_focuses_on_tone_and_fluency_not_details() -> None:
     """真实反馈：审核要主要改进语气与通顺，而不是过多关注细节。"""
     from app.tools.auto_review import AutoReviewTool
