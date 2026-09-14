@@ -3454,4 +3454,15 @@
 - 未提交 git：`2b3dec3` 已提交（3 文件，+47/−8）。
 - 授权状态：已确认并完成
 
+### 2026-09-14｜变更 328
+
+- 用户指令：“实现口径统一”，并追加两问：“①我让 agent 改字数上限，但配置页并没有改，检查到底改没改？什么原因？②我手动改了生成文章的模型，实际有没有改？”
+- 影响范围：`app/services/plain_text.py`（新增 `body_char_count` / `body_source_lines_removed`，成为唯一口径）、`app/services/generator.py`（提示词）、`app/tools/auto_review.py`（规则审核）、`app/tools/auto_revision.py`（改稿提示词）、`app/agent_tools/publication_preferences.py`（新增 `show_generation_settings` / `set_generation_settings`）；新增 `tests/test_body_length_metric.py`。
+- 结论①（口径统一）：同一篇 v4 草稿过去被四条代码路径数成四个数——`len(body)` 2628、规则审核 2614（含 16 个段首全角缩进）、成形校验 2483（去空白）、提示词说的“中文字符”1657，而编辑器显示 1957。现在只有一个口径 `body_char_count()`＝**去掉来源尾注行 + 去掉所有空白后的字符数**（汉字/英文/数字/标点各算一个），生成提示词、成形校验、规则审核、改稿提示词、审核汇报全部改用它；提示词不再写“中文字符”，改为明确说明口径。实测该草稿统一为 **2471**，规则审核据此给出“2471 不在 1400 到 2400 字范围内”。
+- 结论②（agent 改字数的根因）：**它根本没改配置**。`app_settings` 里只多了一条 `publication.style_notes = ["正文目标字数上限为 2800 字，超出时需精简压缩到上限以内。"]`（updated_by=agent，13:00:51），而 `runtime.draft_body_max_chars` 从未写入——因为 Agent 手里只有“长期写作偏好”这一条路，它只能把要求记成一句偏好，配置页那两个数字当然不动（偏好只是注入提示词的一句话）。已新增 `set_generation_settings` / `show_generation_settings`：读写配置页同一处设置，共用 `validate_runtime_options` 校验（>6000、下限>上限当场拒绝），并明确告知“旧稿需重新生成/重写才应用”。容器内实测：工具把上限改成 2800 → 数据库写入 `runtime.draft_body_max_chars=2800`、生效区间变 1600–2800（硬 1400–3000）；非法值 9999 被拒；实测后已还原为默认 1600–2200（并删除还原时产生的两条空值行）。
+- 结论③（模型是否真改）：**改了，但还没被用到**。`runtime.model.content.profile_id` 已指向 profile `8b45ed7e…`（name/model_name 都是 `qwen3.8-max`，12:09 写入，updated_by=运营人员）；`model_for()` 按任务现查数据库、无缓存，容器内实测 `content -> qwen3.8-max`，与设置页显示一致。而日志里最近的内容生成都在 09:52 之前（用的仍是 `qwen3.8-max-0902`），因此“改了但下一次生成才生效”。
+- 验证（单测 + 只读实测）：后端 **452 项通过、0 失败**（新增 10 项）；app/worker 已重建（重建前在跑任务 0/0/0）；容器内实测口径一致（`body_char_count` 与规则审核都是 2471）、工具读写配置生效、非法值被拒、模型路由与设置页一致。
+- 未提交 git：`77010ec` 已提交（7 文件，+338/−17）。
+- 授权状态：已确认并完成
+
 -->
