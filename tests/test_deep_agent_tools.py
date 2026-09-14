@@ -142,7 +142,15 @@ def test_deep_agent_returns_structured_decision_with_session_checkpoint(monkeypa
         content_deep_agent, "build_draft_action_tools",
         lambda _session_id, chat_run_id=None: ["action-tool"],
     )
-    monkeypatch.setattr(content_deep_agent, "build_source_media_tools", lambda _session_id: ["media-tool"])
+    monkeypatch.setattr(
+        content_deep_agent, "build_source_media_tools", lambda _session_id: ["media-tool"]
+    )
+    monkeypatch.setattr(
+        content_deep_agent, "build_publication_preference_tools", lambda _session_id: ["preference-tool"]
+    )
+    monkeypatch.setattr(
+        content_deep_agent, "build_wechat_material_tools", lambda _session_id: ["material-tool"]
+    )
     monkeypatch.setattr(
         content_deep_agent,
         "get_conversation_context_snapshot",
@@ -167,7 +175,10 @@ def test_deep_agent_returns_structured_decision_with_session_checkpoint(monkeypa
 
     kwargs = captured["agent_kwargs"]
     assert decision.reply == "已读取当前会话上下文。"
-    assert kwargs["tools"] == ["context-tool", "asset-tool", "action-tool", "media-tool"]
+    assert kwargs["tools"] == [
+        "context-tool", "asset-tool", "action-tool", "media-tool",
+        "preference-tool", "material-tool",
+    ]
     assert "middleware" not in kwargs
     assert kwargs["subagents"] == []
     assert kwargs["skills"] == ["/skills"]
@@ -219,7 +230,15 @@ def test_deep_agent_json_mode_omits_structured_tool(monkeypatch) -> None:
         content_deep_agent, "build_draft_action_tools",
         lambda _session_id, chat_run_id=None: ["action-tool"],
     )
-    monkeypatch.setattr(content_deep_agent, "build_source_media_tools", lambda _session_id: ["media-tool"])
+    monkeypatch.setattr(
+        content_deep_agent, "build_source_media_tools", lambda _session_id: ["media-tool"]
+    )
+    monkeypatch.setattr(
+        content_deep_agent, "build_publication_preference_tools", lambda _session_id: ["preference-tool"]
+    )
+    monkeypatch.setattr(
+        content_deep_agent, "build_wechat_material_tools", lambda _session_id: ["material-tool"]
+    )
     monkeypatch.setattr(
         content_deep_agent,
         "get_conversation_context_snapshot",
@@ -246,7 +265,10 @@ def test_deep_agent_json_mode_omits_structured_tool(monkeypatch) -> None:
     assert decision.reply == "已读取当前会话上下文。"
     assert "response_format" not in kwargs
     assert "JSON 文本模式" in kwargs["system_prompt"]
-    assert kwargs["tools"] == ["context-tool", "asset-tool", "action-tool", "media-tool"]
+    assert kwargs["tools"] == [
+        "context-tool", "asset-tool", "action-tool", "media-tool",
+        "preference-tool", "material-tool",
+    ]
 
 
 @pytest.mark.asyncio

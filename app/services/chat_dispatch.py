@@ -23,6 +23,8 @@ from app.agent_tools.draft_actions import (
     start_auto_review,
     start_illustration_generation,
 )
+from app.agent_tools.publication_preferences import build_publication_preference_tools
+from app.agent_tools.wechat_materials import build_wechat_material_tools
 from app.agents.chat_agent import ChatAgent
 from app.agents.content_deep_agent import ContentDeepAgent, DeepAgentResolution
 from app.config import Settings
@@ -416,6 +418,10 @@ async def _dispatch_command(ctx: ChatDispatchContext, parsed: AgentCommand) -> C
             )
             ctx.session.commit()
     tools = {item.name: item for item in build_draft_action_tools(ctx.session_id, chat_run_id=ctx.run_id)}
+    # 长期排版偏好与素材库盘点也是界面按钮命令的目标：它们的工具在 DeepAgent 上挂着，
+    # 这里同样要能确定性执行，否则“排版偏好/素材库盘点”会被退化成一次模型闲聊。
+    for item in build_publication_preference_tools(ctx.session_id) + build_wechat_material_tools(ctx.session_id):
+        tools.setdefault(item.name, item)
     if parsed.name in tools:
         arguments: dict[str, Any] = {}
         if parsed.draft_id:
