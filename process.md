@@ -3431,4 +3431,15 @@
 - 未提交 git：`ae0af87` 已提交（5 文件，+53/−5，App.tsx 只暂存本轮 2 个 hunk，另一并行会话的改动未纳入）。
 - 授权状态：已确认并完成
 
+### 2026-09-14｜变更 326
+
+- 用户指令：①“问题是它会问我要不要审核，然后我说跑一轮审核就另起一个任务，我觉得原因应该是当前 agent 没有获取运行队列的工具或者根本不知道要查运行队列这个逻辑”；②“之前定义的两个子 agent 现在的定位是什么？”；③“我感觉搜索 mcp 没有使用。先给方案再改”→ 方案获全部选中（①串行化+队列工具、③搜索可见+证据不丢、②子 Agent 定位、③c search_web_evidence 工具；排队方式选“自动开审”）。
+- 影响范围：`app/agent_tools/draft_actions.py`（审核等待重写、改稿让位、新增 `list_active_tasks` 与 `search_web_evidence`）、`app/services/pending_reviews.py`（标记带 `revise`、`read_pending_review`、启动事件口径）、`app/services/auto_delivery.py`（重写期间不再并发改稿、检索事实回传）、`app/services/evidence_search.py`（新增）、`app/services/agent_commands.py`、`app/services/chat_receipts.py`、`app/storage/repositories.py`（证据合并、`find_active_regeneration_run` 改为按草稿全局判断）、`app/storage/tables.py`、`app/worker.py`（重写结束自动开审、汇报写入检索事实）、`app/workflows/content_workflow.py`（版本冲突换号重写）、`app/agents/content_task_agents.py`（角色文档化 + `DraftWriterRole`/`DraftReviewerRole` 别名）；`migrations/versions/0028_run_target_draft.py`、`0029_run_rewrite_job.py`；前端 `App.tsx`（证据一节 + 阶段角色标注）、`types.ts`；新增 `tests/test_task_serialization_and_search.py`、`tests/test_rewrite_dedupe.py`。
+- 结论①（真实根因）：不是“没有队列工具”那么简单——**审核入口的等待逻辑只覆盖配图**（`count_active_image_jobs`），没有看正在跑的重写。后果链（实测 09:52–10:01）：审核审的是 v1（马上要被替换）→ 审核内自动改稿写 v2 → 重写写 v3 → **重复入队的第二个重写任务**再写 v2 → `uq_draft_revision_version` 冲突 → 整条运行变“生成失败”，而正文其实已改。现在：重写在跑时审核登记待审、由重写任务结束自动开审（审新版本）；审核内改稿与 `apply_revision_issues` 在重写期间一律让位；新增只读 `list_active_tasks` 让 Agent 先看队列再决定。
+- 结论②（子 Agent 定位）：不是两个 Agent，而是**一个受限执行器 + 两个角色**——`RestrictedContentTaskAgent` 以 `task=content` 扮演 `DraftWriterRole`（qwen3.8-max-0902，输出 `DraftWritingResponse`），以 `task=review` 扮演 `DraftReviewerRole`（qwen3.8-27b，输出 `ReviewResponse`）。硬约束：无副作用（不落库/不外呼）、结构受限（只认 Pydantic schema）、模型分离（按 DB 档案路由）；决策与编排在会话 Agent 与确定性工作流手里。界面阶段卡改为标注“正文写作 · content 档模型 / 审核 · review 档模型”。
+- 结论③（搜索 MCP 事实核查）：**其实在用**——`runtime_logs/worker.log` 有 09-13 16:32/16:33、09-14 07:11/09:55 的 `exa_mcp_call_finished tool=web_search_exa`；开关 `exa_mcp_enabled=True`、`revision_search_enabled=True`。但触发面窄（只在“审核未过且要改稿”时，且审核模型必须给出 `search_queries`）且**完全不可见**：汇报不提检索、前端不渲染 `evidence`。另发现真会丢证据：`regenerate_draft` 原本整体替换 `evidence_json`，把改稿追加的 `origin=revision_search` 条目覆盖掉（实测该草稿 evidence_count=1、search_entries=0）。现在：汇报写明检索词/条数（无检索时明说）、生成记录页新增“证据”一节并标注联网来源、重写改为合并证据、新增 `search_web_evidence` 工具供对话直接调用。
+- 验证（单测 + 只读实测，**未跑生成/审核/检索外呼**）：后端 **441 项通过、0 失败**（新增 12 项）；前端 `tsc` 0 错误；app/worker/frontend 已重建（重建前在跑任务 0/0/0）；迁移 `0029_run_rewrite_job (head)`。容器内只读实测：造一个“正在重写”的运行后 `review_draft` 返回 `queued_after_rewrite` 且**入队数 0**；`list_active_tasks` 报出“重写正文（已进行 6 分钟）+ 审核已排队”；追加联网证据后 `_merge_regenerated_evidence` 保留 `agent-search-1`；实测前后草稿 `(版本 4, pending_review, 2628 字, 1 条证据)` 完全一致，临时会话已删除。命令路由实测：`查任务队列/队列状态/现在在跑什么 → list_active_tasks`，`仅运行审核 → review_draft`。
+- 未提交 git：`1cb196c` 已提交（22 文件，+1326/−51；App.tsx 只暂存本轮 4 个 hunk，另一并行会话的改动未纳入）。
+- 授权状态：已确认并完成
+
 -->
