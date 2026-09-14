@@ -41,6 +41,13 @@ _PREFIXES: tuple[tuple[str, str, str], ...] = (
     ("重写本次生成的文案", "rewrite_draft", "重写文案"),
     ("重新生成文案", "rewrite_draft", "重写文案"),
     ("重写", "rewrite_draft", "重写文案"),
+    # 只换证据：秒级返回且不动正文（用户说“来源更新了，重新抓一下”）。
+    ("刷新来源", "refresh_draft_source", "刷新来源"),
+    ("更新来源", "refresh_draft_source", "刷新来源"),
+    ("重新抓取来源", "refresh_draft_source", "刷新来源"),
+    # 只用已存证据重写：不联网重抓，避免换出一份不同的正文。
+    ("重新生成正文", "regenerate_draft_body", "重新生成正文"),
+    ("按已保存证据重写", "regenerate_draft_body", "重新生成正文"),
     ("排版偏好", "show_publication_preferences", "查看长期排版偏好"),
     ("清理素材库", "list_wechat_materials", "盘点素材库可清理项"),
     ("素材库盘点", "list_wechat_materials", "盘点素材库可清理项"),
@@ -66,17 +73,6 @@ def parse_agent_command(text: str) -> AgentCommand | None:
     raw = (text or "").strip()
     if not raw or len(raw) > MAX_COMMAND_CHARS:
         return None
-    if _ILLUSTRATION_START.match(raw) and _ILLUSTRATION_HINT.search(raw):
-        draft_match = _DRAFT_PARAM.search(raw)
-        paragraph = _PARAGRAPH_PARAM.search(raw)
-        inline = bool(_INLINE_HINT.search(raw)) or bool(paragraph)
-        return AgentCommand(
-            name="generate_draft_illustration",
-            label=f"生成{'正文插图' if inline else '封面图'}",
-            draft_id=draft_match.group(1) if draft_match else "",
-            purpose="inline" if inline else "cover",
-            placement=int(paragraph.group(1)) if paragraph else 0,
-        )
     for prefix, name, label in _PREFIXES:
         if not raw.startswith(prefix):
             continue
@@ -94,4 +90,17 @@ def parse_agent_command(text: str) -> AgentCommand | None:
                 deliver=bool(_DELIVER_HINT.search(raw)),
             )
         return command
+    # 前缀表优先于配图启发式：“重新生成正文”也以“生成”开头并含“正文”，
+    # 先跑启发式会被误判成“生成正文插图”（真实歧义：正文重写变成了配图任务）。
+    if _ILLUSTRATION_START.match(raw) and _ILLUSTRATION_HINT.search(raw):
+        draft_match = _DRAFT_PARAM.search(raw)
+        paragraph = _PARAGRAPH_PARAM.search(raw)
+        inline = bool(_INLINE_HINT.search(raw)) or bool(paragraph)
+        return AgentCommand(
+            name="generate_draft_illustration",
+            label=f"生成{'正文插图' if inline else '封面图'}",
+            draft_id=draft_match.group(1) if draft_match else "",
+            purpose="inline" if inline else "cover",
+            placement=int(paragraph.group(1)) if paragraph else 0,
+        )
     return None

@@ -26,6 +26,11 @@ from app.services.reply_stream import streaming_run
 from app.services.generator import GenerationError, build_generator
 from app.services.model_errors import sanitize_failure_text
 from app.services.source_snapshots import DraftSourceSnapshotStore
+from app.services.source_refresh import (
+    MIN_SOURCE_CONTENT_CHARS,
+    READMELESS_SOURCE_HINT,
+    fetch_live_source,
+)
 from app.services.task_narration import compose_task_reply
 from app.services.runtime_settings import load_runtime_settings
 from app.storage.database import SessionLocal
@@ -127,6 +132,20 @@ def _raw_source_from_draft(draft) -> RawSourceItem:
         metrics=source.metrics_json or {},
         metadata=source.metadata_json or {},
     )
+
+
+def _source_from_snapshot(repository: ContentRepository, draft_id: str, raw: RawSourceItem) -> RawSourceItem | None:
+    """只用已保存证据：私有 README 快照优先，其次写回来源记录的正文。
+
+    返回 None 表示“这份证据不足以重写”——README 没抓到、来源记录里也只剩 Trending 简介那几百字。
+    此时调用方必须拒绝重生成，而不是拿简介硬写（那只会得到空话连篇的长文）。
+    """
+    cached = DraftSourceSnapshotStore(settings, repository).restore_github_readme(draft_id, raw)
+    if cached is not None:
+        return cached
+    if len((raw.content or "").strip()) < MIN_SOURCE_CONTENT_CHARS:
+        return None
+    return raw
 
 
 def _finish_failed_run(chat_run_id: str, response_message_id: str, detail: str, title: str) -> None:
@@ -367,32 +386,35 @@ async def process_draft_regeneration_job(
     draft_id: str,
     auto_review_requested: bool = False,
     auto_illustration_requested: bool = False,
+    source_mode: str = "auto",
 ) -> None:
-    """重用原 ChatAgentRun 与 Draft；仅更新可编辑文案版本。"""
-    logger.info("draft_regeneration_started run_id=%s draft_id=%s", chat_run_id, draft_id)
+    """重用原 ChatAgentRun 与 Draft；仅更新可编辑文案版本。
+
+    `source_mode` 决定正文的证据来源（工具拆分后由 Agent 显式选择）：
+    - `auto`（默认）：已保存快照优先，缺失时联网重抓一次；`rewrite_draft` 用这条；
+    - `snapshot`：**只**用已保存证据，不联网；`regenerate_draft_body` 用这条——用户已用
+      `refresh_draft_source` 刷过来源，就是为了避免重写时又抓到不同的正文。
+    """
+    mode = source_mode if source_mode in {"auto", "snapshot"} else "auto"
+    logger.info("draft_regeneration_started run_id=%s draft_id=%s source_mode=%s", chat_run_id, draft_id, mode)
     try:
         with SessionLocal() as session:
             repository = ContentRepository(session)
             draft = repository.get_draft(draft_id)
             raw = _raw_source_from_draft(draft)
             snapshots = DraftSourceSnapshotStore(settings, repository)
-            cached = snapshots.restore_github_readme(draft_id, raw)
-            if cached is None:
+            if mode == "auto" and repository.get_active_draft_source_snapshot(draft_id) is None:
                 # 兼容本次改造前已成功保存到 source_items 的 README，先转存再生成。
                 snapshots.capture_github_readme(draft_id, raw)
-                cached = snapshots.restore_github_readme(draft_id, raw)
+            cached = _source_from_snapshot(repository, draft_id, raw)
         if cached is not None:
             raw = cached
             logger.info("draft_regeneration_using_source_snapshot run_id=%s draft_id=%s", chat_run_id, draft_id)
+        elif mode == "snapshot":
+            # 只用已保存证据却找不到证据：必须停在这里，原草稿一个字都不动。
+            raise ValueError("没有可用的已保存来源正文；请先刷新来源，或改用 rewrite_draft 重新获取。")
         else:
-            timeout = httpx.Timeout(settings.request_timeout_seconds)
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                tools = build_source_tools(client, settings)
-                tool = tools.get(raw.source_kind)
-                if tool is None:
-                    raise ValueError(f"当前草稿来源 {raw.source_kind.value} 不支持重新获取")
-                refreshed = await tool.enrich_items([raw])
-                raw = refreshed[0] if refreshed else raw
+            raw = await fetch_live_source(settings, raw)
         with SessionLocal() as session:
             repository = ContentRepository(session)
             # 与采集任务保持一致：同步生成放到线程里执行，避免阻塞事件循环（否则生成期间的
@@ -405,10 +427,16 @@ async def process_draft_regeneration_job(
                 session_id, active_draft_id=draft_id,
                 summary="本会话当前草稿已在原生成记录内重新生成。",
             )
+            source_note = (
+                "只使用已保存的来源正文（未联网重抓）" if mode == "snapshot" else "已按已保存或重新获取的来源正文"
+            )
             repository.add_chat_agent_event(
                 chat_run_id, "文字重新生成完成",
-                f"已更新原草稿至版本 {regenerated['version']}，未创建新的草稿或生成记录。",
-                metadata={"phase": "text", "state": "completed", "draft_ids": [draft_id], "regeneration": True, **regenerated},
+                f"{source_note}更新原草稿至版本 {regenerated['version']}，未创建新的草稿或生成记录。",
+                metadata={
+                    "phase": "text", "state": "completed", "draft_ids": [draft_id],
+                    "regeneration": True, "source_mode": mode, **regenerated,
+                },
             )
             image_task_ids: list[str] = []
             if auto_illustration_requested:

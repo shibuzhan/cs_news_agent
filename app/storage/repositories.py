@@ -129,7 +129,13 @@ class ContentRepository:
         existing.published_at = item.published_at
         existing.hot_score = item.hot_score
         existing.metrics_json = item.metrics
-        existing.metadata_json = item.metadata
+        metadata = dict(item.metadata)
+        # 刷新来源时正文来自私有快照：这个标记要留在来源记录里，否则刷新后
+        # 数据库又显示“正文来自 Trending 简介”，与实际入库内容不符。
+        origin = (existing.metadata_json or {}).get("content_origin")
+        if metadata.get("readme_snapshot_id") and origin:
+            metadata.setdefault("content_origin", origin)
+        existing.metadata_json = metadata
         existing.fetched_at = utcnow()
 
     def save_source(self, item: NormalizedItem) -> SaveSourceResult:
@@ -1864,6 +1870,21 @@ class ContentRepository:
         self.session.flush()
         return row
 
+    def delete_draft_source_snapshot(self, draft_id: str) -> int:
+        """硬删除草稿的来源快照行，让下一次保存能写入新的快照。
+
+        为什么不能只清空 object_key：`save_draft_source_snapshot` 见到同名草稿已有行就直接返回
+        旧行（防重复采集），于是“刷新来源”会静默地存不上新证据，重写仍读到旧 README
+        （真实故障：刷新后正文照旧）。删除动作发生在本地私有对象存储，只影响草稿期副本。
+        """
+        rows = list(self.session.scalars(
+            select(DraftSourceSnapshotRow).where(DraftSourceSnapshotRow.draft_id == draft_id)
+        ))
+        for row in rows:
+            self.session.delete(row)
+        self.session.flush()
+        return len(rows)
+
     def mark_draft_source_snapshot_deleted(self, draft_id: str) -> DraftSourceSnapshotRow | None:
         row = self.get_active_draft_source_snapshot(draft_id)
         if row is None:
@@ -1909,6 +1930,45 @@ class ContentRepository:
         ))
         self.session.flush()
         return row
+
+    def record_source_refresh(
+        self, draft_id: str, *, source_item_id: str, chars: int, reason: str,
+    ) -> tuple[DraftRow, bool]:
+        """刷新来源正文后登记一版**正文不变**的草稿版本，返回（草稿, 旧投递是否已失效）。
+
+        为什么也要涨版本：正文确实没变，但“写这篇所依据的来源”变了。不涨版本，
+        运营看到的仍是旧版本号，改稿/审核记录与“当时用的是哪份来源”就对不上；
+        版本快照沿用当前正文，因此这一版可以原样回退。
+        """
+        row = self.get_draft(draft_id)
+        if row.status in {
+            ReviewStatus.PUBLISHED.value,
+            ReviewStatus.DISCARDED.value,
+            ReviewStatus.DELETED.value,
+        }:
+            raise InvalidReviewTransition("已发布或已废弃草稿不能刷新来源")
+        # 来源变了，之前那次投递依据的证据就过时了：标记为过期，让下次投递覆盖远端草稿。
+        stale_delivery = self.invalidate_unfinished_wechat_publication_for_regeneration(
+            draft_id, "来源正文已刷新，需按新证据重新投递。"
+        )
+        row.version += 1
+        row.status = ReviewStatus.PENDING_REVIEW.value
+        self.session.add(DraftRevisionRow(
+            draft_id=row.id,
+            auto_review_run_id=None,
+            version=row.version,
+            summary_cn=row.summary_cn,
+            body=row.body,
+            tags_json=list(row.tags_json or []),
+            revision_reason_json={
+                "kind": "source_refresh",
+                "source_item_id": source_item_id,
+                "source_chars": chars,
+                "reason": reason,
+            },
+        ))
+        self.session.flush()
+        return row, stale_delivery
 
     def list_sources(self, limit: int = 100) -> list[SourceItemRow]:
         return list(

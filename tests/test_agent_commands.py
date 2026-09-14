@@ -36,6 +36,18 @@ def test_rewrite_and_review_decision_commands() -> None:
     assert parse_agent_command("重选配图").name == "reselect_publication_assets"
 
 
+def test_source_refresh_and_snapshot_rewrite_commands() -> None:
+    """来源拆分的两条命令要确定性命中，并且不能被配图启发式抢走。"""
+    assert parse_agent_command("刷新来源").name == "refresh_draft_source"
+    assert parse_agent_command("重新抓取来源｜draft=abc12345").name == "refresh_draft_source"
+    # “重新生成正文”也以“生成”开头且含“正文”，曾经会落到 generate_draft_illustration。
+    assert parse_agent_command("重新生成正文").name == "regenerate_draft_body"
+    assert parse_agent_command("按已保存证据重写").name == "regenerate_draft_body"
+    # 配图命令本身不受影响。
+    assert parse_agent_command("生成正文第 3 段插图").name == "generate_draft_illustration"
+    assert parse_agent_command("生成封面图").name == "generate_draft_illustration"
+
+
 def test_illustration_command_reads_purpose_and_paragraph() -> None:
     cover = parse_agent_command("生成封面图｜draft=abc12345")
     inline = parse_agent_command("生成正文第 3 段插图｜draft=abc12345")
@@ -62,6 +74,9 @@ def test_action_tools_are_registered_for_the_session() -> None:
         # 只审不改：用户要“先看看审核怎么说”时用这个。
         "review_draft",
         "rewrite_draft",
+        # 拆分出的两半：只刷新来源（不动正文）／只用已存证据重写正文。
+        "refresh_draft_source",
+        "regenerate_draft_body",
         # 只读零件：让 Agent 自己先看现状与历史意见，再决定动作。
         "read_current_draft",
         "read_latest_review",

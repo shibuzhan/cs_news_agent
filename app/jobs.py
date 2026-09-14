@@ -63,17 +63,25 @@ async def enqueue_draft_regeneration_job(
     draft_id: str,
     auto_review_requested: bool = False,
     auto_illustration_requested: bool = False,
+    source_mode: str = "auto",
 ) -> str:
-    """在既有生成记录内重生成同一草稿，绝不创建第二条聊天运行记录。"""
+    """在既有生成记录内重生成同一草稿，绝不创建第二条聊天运行记录。
+
+    `source_mode='snapshot'` 表示只用草稿已保存的来源证据重写（用户先刷新过来源时用），
+    worker 在这种模式下不联网重抓，也就不会拿到与用户看到的不同版本正文。
+    """
     pool = await create_pool(redis_settings(settings))
     try:
         job = await pool.enqueue_job(
             "process_draft_regeneration_job", run_id, session_id, response_message_id,
-            draft_id, auto_review_requested, auto_illustration_requested,
+            draft_id, auto_review_requested, auto_illustration_requested, source_mode,
         )
         if job is None:
             raise RuntimeError("原记录重生成任务未能入队")
-        logger.info("draft_regeneration_enqueue_finished run_id=%s draft_id=%s job_id=%s", run_id, draft_id, job.job_id)
+        logger.info(
+            "draft_regeneration_enqueue_finished run_id=%s draft_id=%s source_mode=%s job_id=%s",
+            run_id, draft_id, source_mode, job.job_id,
+        )
         return job.job_id
     finally:
         await pool.aclose()

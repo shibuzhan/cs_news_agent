@@ -75,6 +75,23 @@ class DraftSourceSnapshotStore:
         logger.info("draft_source_snapshot_restored draft_id=%s chars=%s", draft_id, len(content))
         return item.model_copy(update={"content": content, "metadata": metadata})
 
+    def replace_github_readme(self, draft_id: str, item: RawSourceItem) -> bool:
+        """重新抓取后覆盖草稿的 README 快照（刷新来源专用）。
+
+        `capture_github_readme` 见到已有快照会直接返回 False（防止采集链路重复上传）；
+        刷新场景要的正是“用新抓到的正文换掉旧的”：先删旧对象与旧记录，再存新的——
+        否则刷新后重生成仍会读到旧 README，看起来像“刷新没生效”。
+        """
+        previous = self.repository.get_active_draft_source_snapshot(draft_id)
+        if previous is not None:
+            try:
+                self.object_store.delete(previous.object_key or "")
+            except AttachmentError as exc:
+                raise SourceSnapshotError("旧的 README 私有快照删除失败，已保留旧证据") from exc
+            self.repository.delete_draft_source_snapshot(draft_id)
+            logger.info("draft_source_snapshot_replaced draft_id=%s", draft_id)
+        return self.capture_github_readme(draft_id, item)
+
     def delete_after_approval(self, draft_id: str) -> bool:
         snapshot = self.repository.get_active_draft_source_snapshot(draft_id)
         if snapshot is None:

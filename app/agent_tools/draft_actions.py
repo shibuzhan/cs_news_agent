@@ -9,12 +9,20 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from langchain_core.tools import tool
 
 from app.config import Settings, get_settings
-from app.domain.models import ConversationIntent, ConversationRunStatus, ReviewCommand, ReviewStatus
+from app.domain.models import (
+    ConversationIntent,
+    ConversationRunStatus,
+    RawSourceItem,
+    ReviewCommand,
+    ReviewStatus,
+    SourceKind,
+)
 from app.jobs import (
     enqueue_auto_review_job,
     enqueue_draft_regeneration_job,
@@ -122,11 +130,12 @@ async def start_auto_review(
 
 async def start_draft_rewrite(
     settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
-    origin_run: Any | None = None, chat_run_id: str | None = None,
+    origin_run: Any | None = None, chat_run_id: str | None = None, source_mode: str = "auto",
 ) -> dict[str, Any]:
-    """按已保存来源证据重写的公开入口。"""
+    """按已保存来源证据重写的公开入口（`source_mode='snapshot'` 表示不联网重抓）。"""
     return await _start_rewrite(
-        settings, repository, session_id, draft, origin_run=origin_run, chat_run_id=chat_run_id
+        settings, repository, session_id, draft,
+        origin_run=origin_run, chat_run_id=chat_run_id, source_mode=source_mode,
     )
 
 
@@ -207,14 +216,19 @@ async def _start_review(
 
 async def _start_rewrite(
     settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
-    origin_run: Any | None = None, chat_run_id: str | None = None,
+    origin_run: Any | None = None, chat_run_id: str | None = None, source_mode: str = "auto",
 ) -> dict[str, Any]:
     """按已保存的来源证据重写正文。
 
     只要求“有来源快照/证据”，**不再要求有原生成记录**：更早生成的草稿没有 collect_news 运行审计
     （`draft_ids` 是后加的字段），旧逻辑会因此拒绝（用户实测：点“重写文案”报“这篇缺少可回溯的
     原生成记录”）。没有原记录时，报告落在当前对话的受理运行上，用户看到的仍是同一张卡片。
+
+    `source_mode` 透传给后台任务：`snapshot` 只用已保存证据（用户先刷新过来源时用，避免重写时
+    又抓到不同版本的 README），`auto` 才在缺快照时联网重抓。
     """
+    mode = source_mode if source_mode in {"auto", "snapshot"} else "auto"
+    source_note = "已保存的来源正文" if mode == "snapshot" else "已保存的 README 与证据包"
     label = _draft_label(draft)
     if origin_run is None:
         origin_run = repository.find_generation_run_for_draft(draft.id)
@@ -225,11 +239,11 @@ async def _start_rewrite(
     )
     if chat_run is not None:
         anchor_message_id = _announce(
-            repository, session_id, chat_run, f"正在用已保存的 README 与证据包重写《{label}》…"
+            repository, session_id, chat_run, f"正在用{source_note}重写《{label}》…"
         )
     else:
         anchor_message_id = repository.create_chat_message(
-            session_id, "assistant", f"正在用已保存的 README 与证据包重写《{label}》…"
+            session_id, "assistant", f"正在用{source_note}重写《{label}》…"
         ).id
 
     if origin_run is not None:
@@ -261,13 +275,16 @@ async def _start_rewrite(
 
     repository.add_chat_agent_event(
         job_run_id, "重写文案",
-        f"使用已保存的 README 与证据包重写《{label}》正文，目标草稿版本 {draft.version}；不重新采集、不新建草稿。",
+        f"使用{source_note}重写《{label}》正文，目标草稿版本 {draft.version}；不重新采集、不新建草稿。",
         "running",
-        metadata={"phase": "text", "state": "running", "draft_ids": [draft.id], "regeneration": True, "rewrite": True},
+        metadata={
+            "phase": "text", "state": "running", "draft_ids": [draft.id],
+            "regeneration": True, "rewrite": True, "source_mode": mode,
+        },
     )
     job_id = await enqueue_draft_regeneration_job(
         settings, job_run_id, session_id, anchor_message_id, draft.id,
-        auto_review_requested, auto_illustration_requested,
+        auto_review_requested, auto_illustration_requested, mode,
     )
     repository.add_chat_agent_event(
         job_run_id, "正在重写文案", f"任务编号：{job_id}；完成后会覆盖为新的草稿版本。",
@@ -446,11 +463,127 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
             if draft is None:
                 return {"status": "rejected", "message": reason}
             result = await _start_rewrite(
-                settings, repository, session_id, draft, chat_run_id=chat_run_id
+                settings, repository, session_id, draft, chat_run_id=chat_run_id, source_mode="auto"
             )
             session.commit()
         logger.info("agent_tool_rewrite_draft session_id=%s draft_id=%s status=%s", session_id, draft_id or "-", result.get("status"))
         return result
+
+    async def _impl_rebuild_draft_body(draft_id: str = "") -> dict[str, Any]:
+        """只用已保存的来源正文重写正文：不联网重抓（拆分 rewrite_draft 后的“只重写”那一半）。"""
+        settings = get_settings()
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=EDITABLE_STATUSES)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            result = await _start_rewrite(
+                settings, repository, session_id, draft, chat_run_id=chat_run_id, source_mode="snapshot"
+            )
+            session.commit()
+        logger.info(
+            "agent_tool_regenerate_draft_body session_id=%s draft_id=%s status=%s",
+            session_id, draft_id or "-", result.get("status"),
+        )
+        return result
+
+    async def _impl_refresh_draft_source(draft_id: str = "") -> dict[str, Any]:
+        """重新联网抓取这篇的来源正文并存成新的证据（**不改正文、不调内容模型**）。
+
+        与 `rewrite_draft` 的分工：这一步只管“证据是不是最新的”，正文要不要跟着重写由
+        `regenerate_draft_body` 决定。抓取是几秒级的 HTTP 调用，因此同步返回结果；
+        抓不到时**旧快照原样保留**，不会把草稿的证据链弄丢。
+        """
+        from app.services.normalizer import normalize_item
+        from app.services.source_refresh import fetch_live_source
+        from app.services.source_snapshots import DraftSourceSnapshotStore, SourceSnapshotError
+
+        settings = get_settings()
+        with SessionLocal() as session:
+            repository = ContentRepository(session)
+            draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=EDITABLE_STATUSES)
+            if draft is None:
+                return {"status": "rejected", "message": reason}
+            source = draft.source_item
+            before_chars = len((source.content or "").strip())
+            raw = RawSourceItem(
+                source_kind=SourceKind(source.source_kind),
+                external_id=source.external_id,
+                title=source.title,
+                url=source.url,
+                author=source.author,
+                published_at=source.published_at or datetime.now(UTC),
+                summary=source.summary,
+                content=source.content,
+                source_name=source.source_name,
+                metrics=source.metrics_json or {},
+                metadata=source.metadata_json or {},
+            )
+            try:
+                refreshed = await fetch_live_source(settings, raw)
+            except Exception as exc:
+                logger.warning(
+                    "agent_tool_refresh_source_failed session_id=%s draft_id=%s error_type=%s",
+                    session_id, draft.id, type(exc).__name__,
+                )
+                return {
+                    "status": "failed",
+                    "draft_id": draft.id,
+                    "draft_title": _draft_label(draft),
+                    "message": f"重新获取来源失败：{exc}。旧来源与草稿都保持原样，没有改任何正文。",
+                }
+            fetched_chars = len((refreshed.content or "").strip())
+            # 图片链接必须在去标签前保留，否则刷新一次就把 README 里的图全丢了（normalizer 口径）。
+            item = normalize_item(refreshed)
+            repository.save_source(item)
+            stored = refreshed.model_copy(update={
+                "content": item.content,
+                "metadata": {
+                    **refreshed.metadata,
+                    "content_origin": "github_readme",
+                    "readme_fetch_status": "success",
+                    "readme_refreshed_at": datetime.now(UTC).isoformat(),
+                },
+            })
+            snapshots = DraftSourceSnapshotStore(settings, repository)
+            try:
+                snapshot_replaced = snapshots.replace_github_readme(draft.id, stored)
+            except SourceSnapshotError as exc:
+                session.rollback()
+                logger.warning(
+                    "agent_tool_refresh_source_snapshot_failed draft_id=%s error_type=%s",
+                    draft.id, type(exc).__name__,
+                )
+                return {"status": "failed", "draft_id": draft.id, "message": f"来源已取回但快照保存失败：{exc}"}
+            row, stale_delivery = repository.record_source_refresh(
+                draft.id, source_item_id=source.id, chars=fetched_chars,
+                reason=f"会话 Agent 刷新来源：{before_chars} → {fetched_chars} 字",
+            )
+            _task_run(repository, session_id, chat_run_id, ConversationIntent.REGENERATE_DRAFT)
+            session.commit()
+            label = _draft_label(row)
+            version = row.version
+        logger.info(
+            "agent_tool_refresh_draft_source session_id=%s draft_id=%s before=%s after=%s snapshot=%s",
+            session_id, draft_id or "-", before_chars, fetched_chars, snapshot_replaced,
+        )
+        return {
+            "status": "refreshed",
+            "status_text": "来源已刷新",
+            "draft_id": draft.id,
+            "draft_title": label,
+            "draft_version": version,
+            "source_chars_before": before_chars,
+            "source_chars_after": fetched_chars,
+            "snapshot_stored": snapshot_replaced,
+            "stale_delivery": stale_delivery,
+            "body_changed": False,
+            "message": (
+                f"已重新获取《{label}》的来源正文（{before_chars} → {fetched_chars} 字）并存成新的证据；"
+                "**正文没有改动**。要按新来源重写正文，请接着调用 regenerate_draft_body。"
+                + ("原先的公众号草稿已标记为过期，重新投递会覆盖远端内容。" if stale_delivery else "")
+            ),
+        }
 
     def _review_decision(draft_id: str, action: str, note: str, allowed: set[str]) -> dict[str, Any]:
         with SessionLocal() as session:
@@ -632,8 +765,30 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
 
     @tool("rewrite_draft")
     def rewrite_draft(draft_id: str = "") -> dict[str, Any]:
-        """用已保存的来源证据重写当前文案正文（不重新采集、不新建草稿），覆盖为新版本。"""
+        """用已保存的来源证据重写当前文案正文（不重新采集、不新建草稿），覆盖为新版本。
+
+        需要已保存快照时才能联网重抓；想“先刷新来源、再决定要不要重写”请用
+        refresh_draft_source + regenerate_draft_body。
+        """
         return run_coroutine_sync(_impl_rewrite_draft(draft_id=draft_id))
+
+    @tool("refresh_draft_source")
+    def refresh_draft_source(draft_id: str = "") -> dict[str, Any]:
+        """重新联网抓取当前文章的来源正文并把新证据存好，**不改正文、不重写文章**。
+
+        用户说“来源更新了”“重新抓一下 README”“先看看最新来源”时用这个；抓完再决定要不要
+        用 regenerate_draft_body 重写正文。抓不到会返回 failed，旧来源与草稿保持不变。
+        """
+        return run_coroutine_sync(_impl_refresh_draft_source(draft_id=draft_id))
+
+    @tool("regenerate_draft_body")
+    def regenerate_draft_body(draft_id: str = "") -> dict[str, Any]:
+        """**只用已保存的来源正文**重写当前文章正文，不联网重抓、不重新采集，覆盖为新版本。
+
+        这是刷过来源（refresh_draft_source）之后重写正文的正确工具：证据就是你刚刷新的那一份，
+        不会又抓到不同版本的 README。没有可用证据时会被拒绝，正文不会被改动。
+        """
+        return run_coroutine_sync(_impl_rebuild_draft_body(draft_id=draft_id))
 
     @tool("generate_draft_illustration")
     def generate_draft_illustration(
@@ -823,6 +978,8 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
         run_auto_review,
         review_draft,
         rewrite_draft,
+        refresh_draft_source,
+        regenerate_draft_body,
         read_current_draft,
         read_latest_review,
         apply_revision_issues,

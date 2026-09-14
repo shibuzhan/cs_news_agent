@@ -97,6 +97,8 @@ def test_deep_agent_receives_the_preference_and_material_tools(monkeypatch: pyte
     assert expected <= names, f"缺工具：{expected - names}"
     # 抽查两个最容易被漏掉的
     assert {"show_publication_preferences", "update_style_guide", "list_wechat_materials"} <= names
+    # 草稿动作拆分出的“零件”也必须挂上：写了没挂 = 用户说“先刷新来源别重写”时 Agent 无工具可用。
+    assert {"rewrite_draft", "refresh_draft_source", "regenerate_draft_body", "review_draft"} <= names
 
 
 def test_button_commands_resolve_preference_and_material_tools(monkeypatch: pytest.MonkeyPatch) -> None:
