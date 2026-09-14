@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from app.config import Settings
@@ -70,6 +71,32 @@ def read_pending_review(repository: ContentRepository, draft_id: str) -> dict[st
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def merge_pending_review(
+    repository: ContentRepository, draft_id: str, *, deliver: bool, revise: bool,
+    chat_run_id: str | None = None,
+) -> dict[str, Any]:
+    """把新的诉求并进**已经在跑的那次审核**（不新建审核、不丢用户的投递意图）。
+
+    真实场景：用户先说“仅运行审核”，紧接着说“审核如果通过就投递草稿箱”。第二次请求
+    带着 deliver=True 撞上正在跑的审核——旧实现只回一句“已在处理中”，投递意图被丢掉，
+    审核通过后也不会投递。这里把 deliver / revise 合并保存，由审核任务结束时读取执行。
+    """
+    current = read_pending_review(repository, draft_id) or {}
+    merged = {
+        "deliver": bool(current.get("deliver")) or bool(deliver),
+        "revise": bool(current.get("revise", True)) or bool(revise),
+        "chat_run_id": str(current.get("chat_run_id") or chat_run_id or ""),
+        "merged_at": datetime.now(UTC).isoformat(),
+    }
+    repository.set_app_setting(
+        pending_key(draft_id), json.dumps(merged, ensure_ascii=False), updated_by="agent"
+    )
+    logger.info(
+        "pending_review_merged draft_id=%s deliver=%s revise=%s", draft_id, merged["deliver"], merged["revise"]
+    )
+    return merged
 
 
 def pending_review_drafts(repository: ContentRepository, draft_ids: list[str]) -> list[str]:

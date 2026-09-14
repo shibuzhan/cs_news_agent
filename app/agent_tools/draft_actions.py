@@ -143,12 +143,40 @@ async def _start_review(
     settings: Settings, repository: ContentRepository, session_id: str, draft: Any, *,
     deliver: bool, chat_run_id: str | None = None, revise: bool = True,
 ) -> dict[str, Any]:
-    from app.services.pending_reviews import ACTIVE_IMAGE_STATUSES, mark_pending_review
+    from app.services.pending_reviews import (
+        ACTIVE_IMAGE_STATUSES,
+        mark_pending_review,
+        merge_pending_review,
+    )
 
     repository.expire_stale_auto_review_run(draft.id, settings.collection_job_timeout_seconds)
     existing = repository.find_active_auto_review_run(draft.id)
     if existing is not None:
-        return {"status": "already_running", "message": "这篇的自动审核已经在处理中。", "draft_id": draft.id}
+        # 已经有一个审核在处理中：**把本次的诉求并进去**，而不是回一句“已在处理中”就结束。
+        # 真实场景：用户先说“仅运行审核”，紧接着说“审核如果通过就投递草稿箱”——
+        # 第二次请求带着 deliver=True，若丢弃它，审核通过后也不会投递，用户还得再说一遍。
+        merged = merge_pending_review(
+            repository, draft.id, deliver=deliver, revise=revise,
+            chat_run_id=chat_run_id or existing.chat_agent_run_id or "",
+        )
+        logger.info(
+            "review_deliver_merged_into_active draft_id=%s review_id=%s deliver=%s revise=%s",
+            draft.id, existing.id, deliver, revise,
+        )
+        return {
+            "status": "already_running",
+            "status_text": "审核进行中",
+            "draft_id": draft.id,
+            "draft_title": _draft_label(draft),
+            "review_id": existing.id,
+            "merged_deliver": bool(merged.get("deliver")),
+            "merged_revise": bool(merged.get("revise", revise)),
+            "message": (
+                f"《{_draft_label(draft)}》的审核已经在处理中；"
+                + ("你要的投递已记下，审核**通过后会自动投递**草稿箱（不会发表），未通过则不会投递。"
+                   if deliver else "完成后我会把意见列给你。")
+            ),
+        }
     # 正文正在被重写时也不立刻审核：否则审核的是**马上要被替换掉的那一版**，
     # 真实后果（2026-09-14 09:53）：审核 v1 → 改稿写 v2 → 重写写 v3 → 两个写者抢版本号，
     # 最后一条以唯一冲突失败，用户看到“生成失败”而正文其实已经改了。
@@ -247,8 +275,30 @@ async def _start_review(
     }
 
 
-def _already_rewriting(
-    draft: Any, label: str, run_id: str, *, requested_by_another: bool,
+def _not_ready_for_delivery(repository: ContentRepository, draft: Any) -> str:
+    """投递前的状态说明：说清“为什么现在不能投”，而不是丢一句“当前状态不支持”。"""
+    label = _draft_label(draft)
+    active_review = repository.find_active_auto_review_run(draft.id)
+    if active_review is not None:
+        return (
+            f"《{label}》的审核还在处理中；审核**通过后**才能投递到公众号草稿箱（不会发表）。"
+            "要不要我在这次审核通过后自动投递？回复“通过就投递”即可。"
+        )
+    active_rewrite = repository.find_active_regeneration_run(
+        draft.id, within_seconds=900, exclude_run_id=""
+    )
+    if active_rewrite is not None:
+        return (
+            f"《{label}》的正文正在重写；等新版本生成、审核通过后才能投递到公众号草稿箱。"
+            "需要的话我会在重写完成后接着审核并投递。"
+        )
+    return (
+        f"《{label}》当前状态是 {draft.status}，只有**审核通过**的文章才能投递到公众号草稿箱；"
+        "我先帮你审核这篇？"
+    )
+
+
+def _already_rewriting(    draft: Any, label: str, run_id: str, *, requested_by_another: bool,
 ) -> dict[str, Any]:
     """去重命中时的统一返回：不再入队、不再记事件，让用户看到一句准确的状态。"""
     reason = "另一个请求" if requested_by_another else "同一条请求的另一条执行路径"
@@ -830,12 +880,16 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
         settings = get_settings()
         with SessionLocal() as session:
             repository = ContentRepository(session)
-            draft, reason = _resolve_draft(
-                repository, session_id, draft_id,
-                allowed={ReviewStatus.READY_TO_PUBLISH.value, ReviewStatus.DRAFTBOX_CREATED.value},
-            )
+            # 先取草稿本身（不限定状态），才能说清“为什么现在不能投递”。
+            draft, reason = _resolve_draft(repository, session_id, draft_id)
             if draft is None:
                 return {"status": "rejected", "message": reason}
+            if draft.status not in {ReviewStatus.READY_TO_PUBLISH.value, ReviewStatus.DRAFTBOX_CREATED.value}:
+                return {
+                    "status": "rejected",
+                    "draft_id": draft.id,
+                    "message": _not_ready_for_delivery(repository, draft),
+                }
             if not settings.auto_wechat_draft_enabled:
                 return {"status": "rejected", "message": "公众号草稿投递开关未启用（AUTO_WECHAT_DRAFT_ENABLED=false）。"}
             existing = repository.get_wechat_publication_for_draft(draft.id)

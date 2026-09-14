@@ -288,15 +288,41 @@ async def _step_rewrite(ctx: ChatDispatchContext) -> dict[str, Any]:
     )
 
 
-async def _step_deliver(ctx: ChatDispatchContext) -> dict[str, Any]:
+async def _step_deliver(ctx: ChatDispatchContext, *, after_review: bool = False) -> dict[str, Any]:
     from app.agent_tools.draft_actions import start_wechat_draft_delivery
 
     draft = current_editable_draft(ctx.repository, ctx.session_id)
     if draft is None:
         return {"status": "rejected", "message": "当前会话还没有可投递的文章。"}
+    allowed = {"ready_to_publish", "draftbox_created"}
+    if draft.status not in allowed:
+        # 「审核通过就投递」必须回头看状态：审核把结论已经落在草稿状态上，
+        # 没通过就明确说清“未投递 + 为什么”，而不是拿一句“当前状态不支持”糊过去。
+        if after_review:
+            return {
+                "status": "rejected",
+                "draft_id": draft.id,
+                "message": (
+                    f"审核没有通过（当前状态：{draft.status}），所以没有投递《{_draft_title(draft)}》。"
+                    "需要的话我可以按审核意见改稿，改完再审核通过后投递。"
+                ),
+            }
+        # 与 Agent 工具共用同一段解释（在跑审核 / 在跑重写 / 需要先审核）。
+        from app.agent_tools.draft_actions import _not_ready_for_delivery
+
+        return {
+            "status": "rejected",
+            "draft_id": draft.id,
+            "message": _not_ready_for_delivery(ctx.repository, draft),
+        }
     return await start_wechat_draft_delivery(
         ctx.settings, ctx.repository, ctx.session_id, draft, chat_run_id=ctx.run_id
     )
+
+
+def _draft_title(draft: Any) -> str:
+    titles = getattr(draft, "title_options_json", None) or []
+    return str(titles[0]) if titles else "当前文章"
 
 
 def _step_outcome(ctx: ChatDispatchContext, step: str, facts: dict[str, Any]) -> ChatDispatchOutcome:
@@ -306,9 +332,12 @@ def _step_outcome(ctx: ChatDispatchContext, step: str, facts: dict[str, Any]) ->
     被拒绝或已经有人在做的，则当场结束并给出短状态。
     """
     status = str(facts.get("status") or "")
-    # started / queued_after_images 之后由子任务收尾；already_running 没有任何人会结束这条运行，
-    # 所以它必须当场结束（否则对话里会永远挂着“处理中”）。
-    accepted = status in {"started", "queued_after_images"}
+    # started / queued_after_* 之后由子任务收尾；already_running 同样有人接管——
+    # 它的诉求要么被并进了那个在跑的任务（投递、改稿口径），要么由那条任务汇报，
+    # 因此绝不能再当“失败”处理：真实故障就是它让整条多步计划中断，卡片还挂着“处理中”。
+    accepted = status in {
+        "started", "queued_after_images", "queued_after_rewrite", "queued_after_review", "already_running",
+    }
     if accepted:
         return ChatDispatchOutcome(
             reply=None,
@@ -341,6 +370,11 @@ async def _dispatch_plan(ctx: ChatDispatchContext, plan: ChatPlan) -> ChatDispat
     replies: list[str] = []
     handoff = False
     review_folded = False
+    review_handoff = False
+    # 「审核（通过后）投递」是一条**有条件的两步**：投递必须等审核通过。
+    # 计划里同时出现审核与投递时，第一步就把 deliver=True 一起交给审核任务，
+    # 第二步只回头看结论——审核没过就明确说“未投递 + 为什么”，不再各自为政。
+    deliver_after_review = STEP_REVIEW in plan.steps and STEP_DELIVER in plan.steps
     for index, step in enumerate(plan.steps):
         if step == STEP_COLLECT:
             target = normalize_github_target(ctx.content) or ""
@@ -360,9 +394,19 @@ async def _dispatch_plan(ctx: ChatDispatchContext, plan: ChatPlan) -> ChatDispat
             if review_folded:
                 facts.append({"step": step, "status": "folded_into_collection"})
                 continue
-            result = await _step_review(ctx)
+            result = await _step_review(ctx, deliver=deliver_after_review)
+            review_handoff = str(result.get("status") or "") in {
+                "started", "already_running", "queued_after_images", "queued_after_rewrite",
+            }
         elif step == STEP_DELIVER:
-            result = await _step_deliver(ctx)
+            if deliver_after_review:
+                if review_handoff:
+                    # 投递意图已经在第一步随审核任务带上了：这里不再另起一个投递任务，
+                    # 也不结束运行——审核任务结束时会一并汇报“投递成功 / 未通过所以未投递”。
+                    continue
+                result = await _step_deliver(ctx, after_review=True)
+            else:
+                result = await _step_deliver(ctx)
         elif step == STEP_REWRITE:
             result = await _step_rewrite(ctx)
         else:  # pragma: no cover - 计划器只产生已知步骤
