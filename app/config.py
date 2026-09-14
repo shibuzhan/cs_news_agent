@@ -96,8 +96,9 @@ class Settings(BaseSettings):
     source_response_max_bytes: int = 1_000_000
     source_content_max_chars: int = 500_000
     llm_evidence_max_chars: int = 12_000
-    draft_body_min_chars: int = 1200
-    draft_body_max_chars: int = 3200
+    # 目标字数（不是硬区间）：硬区间由 article_length_band() 在目标上下各放宽 200 字推导。
+    draft_body_min_chars: int = 1600
+    draft_body_max_chars: int = 2200
     # 自动审核必须同时满足硬规则与此评分阈值；0-100 分由审核模型一次给出。
     auto_review_pass_score: int = Field(default=85, ge=0, le=100)
     redis_url: str = "redis://localhost:6379/0"

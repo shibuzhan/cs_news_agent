@@ -9,7 +9,14 @@ LOGICAL_SECTION_MIN_CHARS = (180, 240, 220, 180)
 LOGICAL_SECTION_NAMES = ("背景与切入", "技术与过程", "价值与边界", "后续观察")
 NATURAL_ARTICLE_MIN_PARAGRAPHS = 4
 NATURAL_ARTICLE_MAX_PARAGRAPHS = 8
-NATURAL_ARTICLE_MIN_CHARS = 1200
+# 配置页填的是**目标字数**：目标下限不得低于这个值（再短就不是公众号长文了）。
+NATURAL_ARTICLE_MIN_CHARS = 800
+# 目标上下限之外各放宽这么多字算“可接受范围”，超出硬区间才会被规则审核拦截。
+HARD_BAND_MARGIN = 200
+# 规则审核的绝对兜底：无论怎么配置，短于这个长度的正文一律不合格。
+MIN_HARD_BODY_CHARS = 400
+# 目标上限的上限：防止把配置填成一篇论文。
+MAX_TARGET_CHARS = 6000
 # 证据正文的挑选参数：开头概览预算，以及与“背景/能力/用法”相关或无关的信号词。
 _EVIDENCE_HEAD_CHARS = 1500
 # 单个证据块的上限：超过就按行再切，避免"一整篇当成一段"导致预算失效。
@@ -48,17 +55,16 @@ _NAME_STOPWORDS = frozenset(
 )
 
 
-def article_length_band(min_chars: int, max_chars: int) -> tuple[int, int, int, int]:
+def article_length_band(target_low: int, target_high: int) -> tuple[int, int, int, int]:
     """返回正文写作的字数区间：目标下限、目标上限、硬下限、硬上限。
 
-    目标带明显低于硬上限，避免模型每次都顶到上限附近（历史上出现过模型稳定写到 3860 字、
-    而规则上限 3200 导致审核永远不通过的循环）。
+    配置页填的是**目标值**：硬区间 = 目标上下限各放宽 `HARD_BAND_MARGIN` 字，
+    只有超出硬区间才会被规则审核拦下，目标带只是写作建议（历史实现把配置当成硬区间，
+    于是“目标”永远无法表达，只能靠下限反推）。
     """
-    minimum = max(min_chars, NATURAL_ARTICLE_MIN_CHARS)
-    maximum = max(max_chars, minimum)
-    target_low = min(maximum, minimum + 400)
-    target_high = min(maximum, minimum + 1000)
-    return target_low, target_high, minimum, maximum
+    low = max(int(target_low), NATURAL_ARTICLE_MIN_CHARS)
+    high = min(max(int(target_high), low), MAX_TARGET_CHARS)
+    return low, high, max(low - HARD_BAND_MARGIN, MIN_HARD_BODY_CHARS), high + HARD_BAND_MARGIN
 
 
 @dataclass(frozen=True)

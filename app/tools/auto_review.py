@@ -11,7 +11,8 @@ from app.agents.content_task_agents import RestrictedContentTaskAgent
 from app.config import Settings, api_key_for, model_for
 from app.services.model_errors import model_failure_message
 from app.services.plain_text import (
-    NATURAL_ARTICLE_MIN_CHARS,
+    MIN_HARD_BODY_CHARS,
+    article_length_band,
     is_source_footer_line,
     normalize_plain_text,
 )
@@ -64,10 +65,11 @@ def _blocking_issue_count(values: object) -> int:
     )
 
 
-def rule_review(draft, min_body_chars: int = 800, max_body_chars: int = 3200) -> dict:
+def rule_review(draft, min_body_chars: int = MIN_HARD_BODY_CHARS, max_body_chars: int = 2400) -> dict:
     # 这里不能先调用 normalize_plain_text：它会按设计去除段首空白，
     # 而段首两个全角空格正是本项目需要核验的格式规则。
-    min_body_chars = max(min_body_chars, NATURAL_ARTICLE_MIN_CHARS)
+    # 传入的应当是**硬区间**（目标带上下各放宽 HARD_BAND_MARGIN 字）；这里只兜一个绝对底线。
+    min_body_chars = max(min_body_chars, MIN_HARD_BODY_CHARS)
     body = draft.body.replace("\r\n", "\n").replace("\r", "\n")
     paragraphs = [item for item in body.split("\n\n") if item.strip()]
     failures: list[str] = []
@@ -157,10 +159,12 @@ class AutoReviewTool:
     def invoke(self, draft_id: str, draft=None) -> AutoReviewResult:
         """可接收调用方制作的只读快照，避免线程中的数据库 Session 访问。"""
         draft = draft or self.repository.get_draft(draft_id)
+        # 配置页填的是目标字数：规则审核只拦硬区间（目标上下各放宽 200 字）。
         rules = rule_review(
             draft,
-            self.settings.draft_body_min_chars,
-            self.settings.draft_body_max_chars,
+            *article_length_band(
+                self.settings.draft_body_min_chars, self.settings.draft_body_max_chars
+            )[2:],
         )
         logger.info(
             "auto_review_rules_checked draft_id=%s passed=%s body_chars=%s paragraph_count=%s failure_count=%s",

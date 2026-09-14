@@ -35,8 +35,9 @@ def _settings() -> SimpleNamespace:
         review_openai_base_url="https://review.example/v1",
         content_llm_timeout_seconds=600,
         content_llm_max_retries=0,
-        draft_body_min_chars=800,
-        draft_body_max_chars=4000,
+        # 配置页填的是目标字数；硬区间由 article_length_band 在目标上下各放宽 200 字。
+        draft_body_min_chars=1600,
+        draft_body_max_chars=2200,
         auto_review_pass_score=85,
         langsmith_tracing=False,
         langsmith_api_key=None,
@@ -113,9 +114,9 @@ def test_revision_prompt_states_length_floor_and_forbids_translationese(monkeypa
     )
 
     prompt = captured["prompt"]
-    assert "1200" in prompt and "4000" in prompt
+    # 目标 1600–2200，硬区间 1400–2400（目标上下各放宽 200 字）。
+    assert "1400" in prompt and "2400" in prompt
     assert "不得低于下限" in prompt
-    # 目标带明显低于硬上限，避免模型每次顶到上限附近。
     assert "1600 到 2200 个中文字符" in prompt
     assert "4 到 8 个自然段" in prompt
     # 明确禁止翻译腔，避免为了保守而写出生硬句子。
@@ -205,7 +206,7 @@ def test_revision_reports_specific_article_shape_failure(monkeypatch) -> None:
 
     # 失败原因必须指出具体约束，而不是笼统的“不符合结构”。
     assert "正文不符合要求" in str(caught.value)
-    assert "1200" in str(caught.value)
+    assert "1400" in str(caught.value)
 
 
 def test_revision_payload_accepts_string_tags_and_paragraph_array_body() -> None:
@@ -336,7 +337,8 @@ def test_review_prompt_bounds_what_counts_as_a_defect(monkeypatch) -> None:
 
 
 def test_generation_instruction_layers_structure_language_and_facts() -> None:
-    instruction = _natural_article_instruction(1200, 3200)
+    # 传的是**目标字数**：目标 1600–2200 → 硬区间 1400–2400。
+    instruction = _natural_article_instruction(1600, 2200)
 
     # 分层指令：结构、语言、取材重点、事实、输出都要在。
     for block in ("【结构】", "【语言】", "【取材与重点】", "【事实】", "【输出】"):
@@ -344,7 +346,7 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "4 到 8 个自然段" in instruction
     assert "语境里看" in instruction
     assert "不要用含糊措辞掩盖" in instruction
-    assert "不得少于 1200 个中文字符" in instruction
+    assert "不得少于 1400 个中文字符" in instruction
     # 正向语感锚点：自然开头、允许短段、数字的中文可读写法；不鼓励谈论来源自身的缺失。
     assert "万能开头" in instruction
     assert "短段" in instruction
@@ -363,7 +365,7 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "本地运行后，浏览器中会显示" in instruction
     # 长度给目标带而不是只给上下限，避免贴着下限写。
     assert "1600 到 2200 个中文字符" in instruction
-    assert "不得超过 3200 个中文字符" in instruction
+    assert "不得超过 2400 个中文字符" in instruction
     assert "不要贴着下限写" in instruction
     # 禁止每篇同一结构。
     assert "不要每篇都套同一个顺序" in instruction

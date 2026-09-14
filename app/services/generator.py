@@ -18,6 +18,7 @@ from app.paths import agent_skills_dir
 from app.services.model_errors import generation_failure_message, is_provider_error
 from app.services.evidence_selector import build_evidence
 from app.services.plain_text import (
+    MIN_HARD_BODY_CHARS,
     NATURAL_ARTICLE_MIN_CHARS,
     article_length_band,
     compose_natural_article,
@@ -63,14 +64,14 @@ def _run_coroutine(coro):
         return pool.submit(asyncio.run, coro).result()
 
 
-def _natural_article_instruction(min_chars: int, max_chars: int) -> str:
+def _natural_article_instruction(target_low: int, target_high: int) -> str:
     """写作指令按「人设 / 结构 / 语言 / 事实 / 输出」分层，避免一整段长约束被模型漏读。
 
     真实反馈：“现在的文案语气太过严谨和严肃了”。缺一句人设，模型就会退回训练语料里最稳的
     文体——百科词条 + 研报：定义式开头（“X 是……的一个……”）、否定式定义、元评论代替事实、
     段末概括收束句。所以这里**先给身份与口吻**，再给禁用句式与对照示例。
     """
-    target_low, target_high, minimum, maximum = article_length_band(min_chars, max_chars)
+    target_low, target_high, minimum, maximum = article_length_band(target_low, target_high)
     return (
         "\n【人设与语气】你是一个每天都在翻技术资讯的分享者，刚从 GitHub／Hacker News／论文里看到这件事，"
         "正讲给一个懂点技术、但还没听说过它的朋友。写作时保持这个视角：可以说“我看到的”“我觉得有意思的是”，"
@@ -128,13 +129,24 @@ def _natural_article_instruction(min_chars: int, max_chars: int) -> str:
     )
 
 
-def _apply_article_body(payload: dict, item: NormalizedItem, min_chars: int = NATURAL_ARTICLE_MIN_CHARS) -> dict[str, int]:
+def _hard_body_minimum(settings) -> int:  # noqa: ANN001 - Settings 的测试替身同形
+    """成形与规则审核使用**硬下限**：目标下限再放宽 HARD_BAND_MARGIN 字。
+
+    正文短于目标带是写作问题（提示词负责），短于硬下限才是硬性不合格。
+    """
+    return article_length_band(
+        getattr(settings, "draft_body_min_chars", NATURAL_ARTICLE_MIN_CHARS),
+        getattr(settings, "draft_body_max_chars", NATURAL_ARTICLE_MIN_CHARS + 600),
+    )[2]
+
+
+def _apply_article_body(payload: dict, item: NormalizedItem, min_chars: int = MIN_HARD_BODY_CHARS) -> dict[str, int]:
     """接受自然正文；兼容历史模型仍返回的 body_sections。"""
     raw_body = payload.pop("body", None)
     legacy_sections = payload.pop("body_sections", None)
     if not isinstance(raw_body, str) and isinstance(legacy_sections, list):
         raw_body = "\n\n".join(str(section) for section in legacy_sections if isinstance(section, str))
-    body, shape = compose_natural_article(raw_body, min_chars=max(min_chars, NATURAL_ARTICLE_MIN_CHARS))
+    body, shape = compose_natural_article(raw_body, min_chars=max(min_chars, MIN_HARD_BODY_CHARS))
     payload["body"] = format_source_body(body, item.title, item.source_kind.value)
     return shape
 
@@ -368,7 +380,7 @@ class OpenAICompatibleDraftGenerator:
                 "article_shape": _apply_article_body(
                     payload,
                     item,
-                    self.settings.draft_body_min_chars,
+                    _hard_body_minimum(self.settings),
                 )
             }
             payload["evidence_pack"] = self._evidence_pack(item)
@@ -527,7 +539,7 @@ class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
             plan["article_shape"] = _apply_article_body(
                 payload,
                 item,
-                self.settings.draft_body_min_chars,
+                _hard_body_minimum(self.settings),
             )
             payload.update({"source_name": item.source_name, "source_url": str(item.url), "content_plan": plan, "quality_report": quality, "claim_citations": citations, "evidence_pack": facts["evidence"], "generation_mode": "enhanced"})
             payload["summary_cn"] = normalize_wechat_description(str(payload.get("summary_cn", "")))

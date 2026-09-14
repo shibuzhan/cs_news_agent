@@ -15,7 +15,7 @@ from app.config import Settings, api_key_for, base_url_for, model_for
 from app.observability import langsmith_enabled
 from app.services.model_errors import model_failure_message
 from app.services.plain_text import (
-    NATURAL_ARTICLE_MIN_CHARS,
+    MIN_HARD_BODY_CHARS,
     NaturalArticleError,
     article_length_band,
     compose_natural_article,
@@ -188,7 +188,12 @@ class AutoRevisionTool:
             payload = RevisionPayload.model_validate(json.loads(response.choices[0].message.content or "{}"))
             body, article_shape = compose_natural_article(
                 payload.body,
-                min_chars=max(self.settings.draft_body_min_chars, NATURAL_ARTICLE_MIN_CHARS),
+                min_chars=max(
+                    article_length_band(
+                        self.settings.draft_body_min_chars, self.settings.draft_body_max_chars
+                    )[2],
+                    MIN_HARD_BODY_CHARS,
+                ),
             )
             logger.info(
                 "auto_revision_article_validated draft_id=%s paragraph_count=%s",

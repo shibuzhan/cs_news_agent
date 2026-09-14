@@ -12,6 +12,7 @@ from typing import Literal
 from cryptography.fernet import Fernet, InvalidToken
 
 from app.config import Settings
+from app.services.plain_text import MAX_TARGET_CHARS, NATURAL_ARTICLE_MIN_CHARS
 
 
 logger = logging.getLogger("news_agent.runtime_settings")
@@ -199,9 +200,17 @@ def validate_runtime_options(values: dict[str, object]) -> dict[str, str]:
                 raise RuntimeSettingsError(f"{field} 必须为布尔值")
             accepted[field] = "true" if values[field] else "false"
     min_chars = int(accepted.get("draft_body_min_chars", "0") or 0)
-    max_chars = int(accepted.get("draft_body_max_chars", "999999") or 999999)
+    max_chars = int(accepted.get("draft_body_max_chars", "0") or 0)
+    # 配置页填的是**目标字数**（硬区间由代码在目标上下各放宽 200 字推导），
+    # 所以这里校验的是目标值：不能再靠“下限反推目标”，也不能静默抬高低到没意义的配置。
     if min_chars and max_chars and min_chars > max_chars:
-        raise RuntimeSettingsError("正文最小字数不能大于最大字数")
+        raise RuntimeSettingsError("目标最少字数不能大于目标最多字数")
+    if min_chars and min_chars < NATURAL_ARTICLE_MIN_CHARS:
+        raise RuntimeSettingsError(
+            f"目标最少字数不得低于 {NATURAL_ARTICLE_MIN_CHARS} 字（再短就不是公众号长文）"
+        )
+    if max_chars and max_chars > MAX_TARGET_CHARS:
+        raise RuntimeSettingsError(f"目标最多字数不得超过 {MAX_TARGET_CHARS} 字")
     if "auto_review_pass_score" in accepted and not 0 <= int(accepted["auto_review_pass_score"]) <= 100:
         raise RuntimeSettingsError("审核通过分数必须在 0 到 100 之间")
     if "image_generation_size" in accepted and accepted["image_generation_size"] not in ALLOWED_IMAGE_SIZES:
