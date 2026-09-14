@@ -3477,4 +3477,15 @@
 - 未提交 git：`99f8ffa` 已提交（4 文件，+366/−14）。
 - 授权状态：已确认并完成
 
+### 2026-09-14｜变更 330
+
+- 用户指令：“现在做”（做方案 C：真正的跨消息 todo 清单）。
+- 影响范围：新增 `migrations/versions/0030_session_tasks.py`、`app/services/session_tasks.py`、`app/agent_tools/session_task_tools.py`、`tests/test_session_tasks.py`；`app/storage/tables.py`（`SessionTaskRow`）、`app/storage/repositories.py`（清单 CRUD 与依赖查询）、`app/services/chat_dispatch.py`（计划登记、命令登记、按结果收尾）、`app/agents/content_deep_agent.py`（挂工具 + 系统提示词写明“先列清单再动手”）、`app/worker.py`（`_advance_session_tasks` 在审核/投递/重写汇报里收尾）、`app/api/routes.py`（`tasks` 字段 + 回执附清单）、前端 `App.tsx`/`types.ts`/`styles.css`（对话页“任务清单”面板）。
+- 结论（能力落地）：清单落库在 `session_tasks`（会话级、跨消息、带依赖），四个工具 `list_tasks`/`add_task`/`update_task`/`clear_task` 已挂到会话 DeepAgent；状态机 pending（等待前置）→ ready（待执行）→ running（进行中）→ completed/failed/skipped；`depends_on_json` 连线（投递依赖审核、审核依赖重写），前置完成自动放行、前置失败自动跳过；同标题未完成任务**不会排两遍**。派发链自动登记：多步计划逐步登记并连线、界面按钮命令也登记、后台任务结束收尾。可见性：`GET /chat/sessions/{id}` 返回 `tasks`，回执末尾附一行积压（“清单：投递公众号草稿（待执行）”），对话页右栏新增清单面板。
+- 实测（容器内，真实接口 + 真实派发、入队打桩，**不调用模型**）：一条“审核如果通过就投递草稿箱”登记两条——自动审核（交接后完成）、投递公众号草稿（依赖审核、等待前置）；第二条消息“重写文案”登记第三条，且它的回执带上“清单：投递公众号草稿（待执行）”；跨消息累积正确、无重复登记；临时会话已删除，`session_tasks` 残留 0 行。
+- 排错记录（探针自身的坑，非产品 bug）：假清单一度出现 4 行，原因是探针只替换了 `app.jobs` 里的入队函数，而 `routes.py` 在导入时就绑定了 `enqueue_general_chat_job`，于是 POST 真把任务投进 ARQ，常驻 worker 又派发一次——把 `routes` 模块的引用也替换后行为恢复正常。教训：**打桩要按“谁在导入时绑定了这个名字”逐个替换**，否则会得到两倍的假象。
+- 验证：后端 **471 项通过、0 失败**（新增 10 项）；前端 `tsc` 0 错误；app/worker/frontend 已重建，迁移 `0030_session_tasks (head)`，`session_tasks` 表已建。
+- 未提交 git：`6e998e8`（14 文件，+1019/−3）、`4b78cbf`（前端 2 文件，+52/−2；App.tsx 只暂存本轮 3 个 hunk，并行会话改动未纳入）。
+- 授权状态：已确认并完成
+
 -->
