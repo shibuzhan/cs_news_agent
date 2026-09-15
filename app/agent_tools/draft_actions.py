@@ -782,36 +782,32 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
         }
 
     async def _impl_search_web_evidence(
-        draft_id: str = "", queries: list[str] | None = None,
+        draft_id: str = "", plans: list[dict[str, str]] | None = None, queries: list[str] | None = None,
     ) -> dict[str, Any]:
-        """联网检索并把结果存成这篇草稿的**联网证据**（真的调用外部检索服务）。
-
-        什么时候用：正文里有不解释就读不懂的外部名称、或用户明确要求“查一下再改”。
-        结果会落进草稿证据（带联网标记），审核与改稿都能看到，因此不会把新事实判成“来源未出现”。
-        """
+        """执行结构化检索计划，并把结果存成这篇草稿的联网证据。"""
         from app.services.evidence_search import search_and_store_evidence
 
         settings = get_settings()
-        cleaned = [" ".join(str(item).split())[:300] for item in (queries or []) if str(item).strip()]
-        if not cleaned:
-            return {"status": "rejected", "message": "请给出要检索的关键词（最多 2 个）。"}
+        if plans is None and not queries:
+            return {"status": "rejected", "message": "请给出检索计划（主体、缺失信息、理由和来源偏好）。"}
         with SessionLocal() as session:
             repository = ContentRepository(session)
             draft, reason = _resolve_draft(repository, session_id, draft_id, allowed=REVIEWABLE_STATUSES)
             if draft is None:
                 return {"status": "rejected", "message": reason}
-            result = await search_and_store_evidence(settings, repository, draft, cleaned)
+            result = await search_and_store_evidence(settings, repository, draft, plans=plans, queries=queries)
             session.commit()
             label = _draft_label(draft)
+        actual_queries = [str(item) for item in result.get("queries") or []]
         return {
             **result,
             "draft_id": draft.id,
             "draft_title": label,
             "message": (
-                f"已为《{label}》联网检索「{'、'.join(cleaned)}」，带回 {result.get('entries', 0)} 条补充资料，"
+                f"已为《{label}》联网检索「{'、'.join(actual_queries)}」，带回 {result.get('entries', 0)} 条补充资料，"
                 "已存成这篇的联网证据；审核与改稿都会看到。"
                 if result.get("entries")
-                else f"《{label}》这次联网检索没有取回可用资料。"
+                else f"《{label}》这次未执行或没有取回可用的联网资料。"
             ),
         }
 
@@ -986,14 +982,21 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
         return run_coroutine_sync(_impl_list_active_tasks(draft_id=draft_id))
 
     @tool("search_web_evidence")
-    def search_web_evidence(draft_id: str = "", queries: list[str] | None = None) -> dict[str, Any]:
-        """联网检索最多 2 个关键词，并把结果存成当前文章的**联网证据**（真调用外部检索服务）。
+    def search_web_evidence(
+        draft_id: str = "", plans: list[dict[str, str]] | None = None, queries: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """按最多两条**结构化检索计划**补充当前文章的联网证据（会真实调用外部搜索）。
 
-        用于正文里“不解释就读不懂”的外部名称，或用户明确说“先查一下再改”。
-        结果会带联网标记落库，审核与改稿都能看到；只补证据，不改正文、不投递。
+        调用前必须先阅读本文的来源证据。只有现有材料无法支撑准确写作/改稿，或用户明确要求查证时才用；
+        不得为凑字数、标题出现名称、泛化科普或已被材料说明的事实调用。新参数 `plans` 每项必须包含
+        `subject`（材料中明确出现的具体项目/仓库/技术主体）、`need`（缺失的具体事实或方法）、`reason`、
+        `preferred_source`（official_docs / repository / authoritative_web）。禁止 Web、API、插件、OpenAI 等泛主体，
+        也禁止“是什么、背景、用途”等空需求。模型只提出计划，后端校验并组装最终检索词。
+
+        结果带联网标记落库，审核与改稿都能看到；只补证据，不改正文、不审核、不投递。旧 `queries` 仅兼容历史调用。
         """
         return run_coroutine_sync(
-            _impl_search_web_evidence(draft_id=draft_id, queries=queries)
+            _impl_search_web_evidence(draft_id=draft_id, plans=plans, queries=queries)
         )
 
     # 会话 Agent 以同步方式执行工具：异步实现必须配同步外壳，否则 LangChain 抛

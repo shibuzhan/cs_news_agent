@@ -56,7 +56,7 @@ KIND_ORDER = {
 STATUS_LABELS = {
     STATUS_PENDING: "等待前置",
     STATUS_READY: "待执行",
-    STATUS_RUNNING: "进行中",
+    STATUS_RUNNING: "正在处理",
     STATUS_COMPLETED: "已完成",
     STATUS_FAILED: "失败",
     STATUS_SKIPPED: "已跳过",

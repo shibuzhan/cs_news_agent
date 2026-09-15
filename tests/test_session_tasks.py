@@ -70,6 +70,10 @@ def test_task_without_dependency_is_ready_immediately() -> None:
     assert tasks.describe_task(task)["kind_label"] == "自动审核"
 
 
+def test_running_task_uses_processing_label() -> None:
+    assert tasks.status_label(tasks.STATUS_RUNNING) == "正在处理"
+
+
 def test_dependent_task_waits_and_is_released_on_completion() -> None:
     repository = FakeRepository()
     review = tasks.add_task(repository, "session-1", "自动审核", "review")
@@ -130,6 +134,28 @@ def test_plan_registers_each_step_with_dependencies() -> None:
     assert "_TASK_DEPENDENCIES" in source
     assert chat_dispatch._TASK_DEPENDENCIES["deliver"] == ("review",)
     assert chat_dispatch._TASK_DEPENDENCIES["review"] == ("rewrite",)
+
+
+def test_single_step_never_creates_a_todo_item() -> None:
+    """单项命令的状态应留在对话运行记录，不能占用右侧多步清单。"""
+    from app.services import chat_dispatch
+
+    repository = FakeRepository()
+    context = SimpleNamespace(repository=repository, session_id="session-1")
+
+    recorded = chat_dispatch._record_plan_tasks(context, ("review",), deliver_after_review=False)
+
+    assert recorded == {}
+    assert repository.rows == []
+
+
+def test_direct_commands_do_not_create_a_todo_item() -> None:
+    """页面上的单项按钮不应绕过多步计划规则自行登记 Todo。"""
+    from app.services import chat_dispatch
+
+    source = inspect.getsource(chat_dispatch._dispatch_command)
+
+    assert "_record_command_task" not in source
 
 
 def test_worker_finalizes_tasks_after_background_jobs() -> None:

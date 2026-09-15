@@ -82,7 +82,14 @@ def _install_fake_client(monkeypatch, content: str, captured: dict) -> None:
     monkeypatch.setattr(auto_revision_module, "OpenAI", lambda **_kwargs: _FakeClient(content, captured))
 
 
-def _review_agent_stub(captured: dict, *, score: int, issues: list[dict], search_queries: list[str] | None = None):
+def _review_agent_stub(
+    captured: dict,
+    *,
+    score: int,
+    issues: list[dict],
+    search_queries: list[str] | None = None,
+    search_plan: list[dict] | None = None,
+):
     """替身审核子 Agent：记录提示词并按给定结论返回。"""
 
     class FakeReviewAgent:
@@ -95,6 +102,7 @@ def _review_agent_stub(captured: dict, *, score: int, issues: list[dict], search
                 score=score,
                 issues=[ReviewIssue(**item) for item in issues],
                 summary="通过" if not issues else "需修改",
+                search_plan=search_plan or [],
                 search_queries=search_queries or [],
             )
 
@@ -239,6 +247,41 @@ def test_review_response_normalizes_search_queries() -> None:
     assert ReviewResponse.model_validate({"score": 90, "search_queries": None}).search_queries == []
 
 
+def test_review_response_normalizes_structured_search_plan() -> None:
+    response = ReviewResponse.model_validate(
+        {
+            "score": 88,
+            "search_plan": [
+                {"subject": " Codex ", "need": " 插件开发方式 ", "reason": "正文未说明", "preferred_source": "official_docs"},
+                {"subject": "Codex", "need": "插件开发方式", "preferred_source": "repository"},
+                {"subject": "", "need": "无效"},
+            ],
+        }
+    )
+
+    assert len(response.search_plan) == 1
+    assert response.search_plan[0].subject == "Codex"
+    assert response.search_plan[0].preferred_source == "official_docs"
+
+
+def test_initial_search_planning_response_uses_the_shared_plan_contract() -> None:
+    from app.agents.content_task_agents import SearchPlanningResponse
+
+    response = SearchPlanningResponse.model_validate(
+        {
+            "need_search": True,
+            "plans": [
+                {"subject": " openai/plugins ", "need": " 插件配置方式 ", "preferred_source": "repository"},
+                {"subject": "openai/plugins", "need": "插件配置方式", "preferred_source": "official_docs"},
+            ],
+        }
+    )
+
+    assert len(response.plans) == 1
+    assert response.plans[0].subject == "openai/plugins"
+    assert response.plans[0].preferred_source == "repository"
+
+
 def test_review_prompt_asks_for_names_that_need_explaining(monkeypatch) -> None:
     captured: dict = {}
     monkeypatch.setattr(
@@ -248,11 +291,12 @@ def test_review_prompt_asks_for_names_that_need_explaining(monkeypatch) -> None:
     AutoReviewTool(_settings(), SimpleNamespace()).invoke("draft-1", draft=_draft_snapshot(_paragraphs()))
 
     prompt = captured["prompt"]
-    assert "search_queries" in prompt
+    assert "search_plan" in prompt
     # 只让审核模型挑“不解释就读不懂文章主体”的名称，避免把支持列表里的工具也拿去检索。
     assert "不解释就读不懂本文主体" in prompt
     assert "不要填" in prompt
     assert "最多 1 到 2 条" in prompt
+    assert "preferred_source" in prompt
 
 
 def test_revision_reports_specific_article_shape_failure(monkeypatch) -> None:

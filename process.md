@@ -3568,4 +3568,51 @@
 - 未提交 git：`62c1438` 已提交（6 文件，+228/−12）。
 - 授权状态：已确认
 
+### 2026-09-15｜变更 339
+
+- 用户指令：确认 Todo 仅在同条消息包含多步骤时生成，全部成功后应清除右侧清单；同时修复窗口尺寸变化导致的页面严重挤压。
+- 影响范围：`app/services/chat_dispatch.py`（Todo 登记门槛）、`frontend/src/App.tsx`（Todo 收尾展示）、`frontend/src/styles.css`（对话/发布区断点）、`tests/test_session_tasks.py`；并追加计划、发现、进度和变更记录。
+- 处理结论：单项命令不再创建 Todo；仅多步骤计划会登记任务并保留依赖。右侧只展示开放任务与失败项，全部完成或跳过后自动收起；后端任务记录不物理删除，失败仍保留为“需要处理”。布局调整为宽屏三栏、中等窗口“会话列表上移 + 对话/任务并排”、窄窗口单列；发布区也提前在中等窗口折叠，避免最小列宽溢出。
+- 验证：前端 `npm --prefix frontend run build`、`git diff --check` 通过；项目运行镜像未安装 `pytest`，系统 Python 也不具备项目包环境，因此未将该环境错误视为测试失败。已在刚构建的应用镜像中执行运行时断言：单步骤 `_record_plan_tasks` 返回空且确定性按钮派发不再调用 `_record_command_task`，通过；未调用模型、审核或投递。
+- 部署：复核生成、审核、投递任务均为 0 后，仅替换 app 与 frontend 容器；`/api/health`、`/api/chat/sessions` 与 `http://127.0.0.1:5173` 均返回 HTTP 200，未重启 worker 或数据服务。
+- 授权状态：已确认
+
+### 2026-09-15｜变更 340
+
+- 用户指令：确认实施“由大模型决定检索什么内容”的方案。
+- 影响范围：`app/agents/content_task_agents.py`（审核结构化输出）、`app/tools/auto_review.py`（审核提示词与记录）、`app/services/plain_text.py`（检索计划校验及仓库标识提取）、`app/services/auto_delivery.py`（计划执行与旧记录兼容）、`app/services/generator.py`（生成补充校验）及相关测试、规划记录。
+- 处理边界：复用既有审核模型调用，不新增检索规划模型调用；初次生成仍使用确定性来源主体；检索、模型、审核和投递均不会在实施期间实际执行；公众号流程不变。
+- 实施结果：审核模型输出 `search_plan`，服务端按主体、缺失信息与来源偏好校验和构造最终查询；空泛主体/意图直接拒绝，完整仓库标识保留，旧 `search_queries` 仍可回退执行。
+- 验证：编译与差异检查通过；使用运行镜像依赖环境只读挂载当前源码的运行时断言通过。正式 pytest 不在运行镜像，本机解释器缺少 `deepagents`；均为验证环境限制而非代码失败。
+- 部署状态：应用镜像构建在 PEP 517 获取 `setuptools` 时遭遇 PyPI TLS EOF，未产生新镜像，故 app/worker 尚未替换。
+- 用户后续确认：优化网页搜索工具描述，使其与材料驱动的结构化检索规划一致。
+- 追加实施：会话搜索工具新增 `plans`（主体、缺失信息、理由、来源偏好）并保留旧 `queries` 兼容；普通/增强生成使用同一计划格式；新审核记录的空计划不再触发正文名称兜底搜索。
+- 追加验证：编译、差异检查，以及运行镜像依赖环境下的结构化计划与普通生成模拟断言通过；未调用模型、外部检索、审核或投递。镜像构建阻塞仍未解除，未部署。
+- 补充修正：检查增强生成链路时发现审计字段仍引用已移除的裸 `queries`；改为记录服务端接受的结构化计划查询，未部署。
+- 用户确认：允许将 Dockerfile 的项目安装改为 `--no-build-isolation`，以绕过构建隔离阶段访问 PyPI 下载 `setuptools` 的 TLS EOF；仅改变构建依赖解析，不改变应用逻辑或运行依赖。
+- 构建结果：未访问 PyPI，但基础镜像没有 `setuptools`，`pip install --no-build-isolation --no-deps .` 报 `Cannot import setuptools.build_meta`；未生成或替换 app/worker 镜像。已核验容器启动从工作目录 `/app` 直接以 `uvicorn app.main:app` 和 `arq app.worker.WorkerSettings` 导入源码，待确认后可移除该非必需安装步骤。
+- 用户确认：移除 Dockerfile 中非必需的本地项目安装命令；保留 requirements 依赖安装，准备重新构建 app 与 worker。
+- 构建与部署：app/worker 镜像构建成功，新镜像离线断言通过；复核生成、审核、投递活动任务均为 0 后，仅替换 app 与 worker。`/api/health`、`/api/chat/sessions` 返回 HTTP 200，worker 正常注册 8 类任务；未重启数据库、Redis、前端或公众号服务。
+- 用户确认：生成记录标题与文案动作同列常驻页面上方；发布页审核动作移到审核记录前；审核记录默认只显示评分、分差、critical 结论和摘要，具体问题折叠。
+- 处理边界：仅调整 `frontend/src/App.tsx` 与 `frontend/src/styles.css` 的结构/样式；不改审核规则、评分、接口、改稿或公众号草稿箱投递逻辑。
+- 授权状态：已确认
+
+### 2026-09-15｜变更 341
+
+- 用户确认：优化生成记录与发布情况的高频操作位置，并将审核记录改为结论默认可见、具体问题折叠。
+- 处理边界：仅修改前端展示和类型兼容，不修改审核规则、评分、改稿流程、接口请求或“审核通过投递草稿箱”的业务逻辑。
+- 验证与部署：前端生产构建、差异检查通过；确认 ARQ 队列为 0 后仅替换前端容器，前端 HTTP 200、API 健康正常，app/worker 未重启。
+
+### 2026-09-15｜变更 342
+
+- 用户指令：检查发布页「1. Agent 决定并上传素材」「2. 创建公众号草稿箱」的绑定逻辑，问为什么它们不像其他按钮那样"触发发送消息并运行对应业务"；随后确认：按钮 1 不需要（删掉），按钮 2 的功能保留但改成发命令，并与「重新投递草稿箱」合并。
+- 核查结论（只读）：①这两个按钮是全站**仅剩的直连 REST** 按钮：`api.prepareWechatPublication` → `POST /wechat/publications/{draft_id}/prepare`（`app/api/routes.py:2036`）与 `api.createWechatDraft` → `.../create-draft`（同文件 2058），在**同步 HTTP 请求**里跑完素材选择（`ensure_agent_selected_wechat_assets` 内含一次视觉模型调用）与上传/建稿；②同页其他按钮（仅运行审核、仅根据意见改稿、审核并投递草稿箱、重新选择配图）都走 `onAgentCommand` → `POST /chat/sessions/{id}/messages` → 入队 ARQ → worker 执行 → 写对话事件与汇报（`app/services/chat_dispatch.py:533`，命令表 `app/services/agent_commands.py`）；③代价：对话里没有消息/汇报、生成记录里没有条目、失败只有页面一行红字、长任务顶住 HTTP 连接；④队列版 `process_wechat_delivery_job`（`app/worker.py:801`）其实已覆盖这两步（`deliver=False` 只备素材、`deliver=True` 备素材+建稿/覆盖），工具 `plan_publication_assets` 与 `publish_to_wechat_draft` 都已存在，只是没有按钮命令指向它们；⑤「重新投递草稿箱」按钮是条件渲染：仅当"审核已通过且投递失败"时出现，出现时会顶掉那排审核按钮（`App.tsx` `canRetryDraftboxDelivery`）。
+- 影响范围：`app/services/agent_commands.py`（新增「创建/更新公众号草稿箱」→ `publish_to_wechat_draft`；「准备投递素材」→ `plan_publication_assets` 作为对话里的隐藏能力）、`frontend/src/App.tsx`（两个按钮合成一个「创建 / 更新公众号草稿箱」；删除 `prepare()`/`createDraft()`/`retryDraftboxDelivery()` 三处直连；发布页轮询条件扩展）、`frontend/src/api.ts`（三个投递接口标注为界面不再调用，后端路由保留）、`tests/test_agent_commands.py`、`tests/test_footer_illustration_and_review_flow.py`。
+- 处理结论：①发布页只留**一个**投递按钮：未投递时是「创建公众号草稿箱」，已有远端草稿时是「更新公众号草稿箱」，二者都发对话命令、由后台任务完成"准备素材 + 建稿/原地覆盖"并在对话里汇报；②按钮 1 删除（它的作用已被投递链路覆盖，且"换一套图"另有「重新选择配图」、预览也已显示选了哪几张）；③投递失败不再顶掉审核按钮，改为一行提示 + 同一个按钮重投；④发布页轮询从"只有审核在跑"扩展到"有后台任务在跑"（`listGenerationChatAgentRuns`），并在进入本页时先问一次，避免中途返回看不到进度；⑤「准备投递素材」保留为对话里的隐藏能力，界面不放按钮。
+- 排错记录：①`git diff` 的 hunk 里混有并行会话未提交的改动，用「按 hunk 拆分 + 只 `git apply --cached` 自己的 hunk」的方式暂存；补丁一开始 `git apply` 报 `patch does not apply`，原因是 Windows 上 `Path.write_text` 把 `\n` 转成了 `\r\n` 而索引里是 LF（改 `newline="\n"` 后通过），另有一次报 `corrupt patch` 是文件末尾缺换行；②同一个 hunk 尾部含并行会话新增的一行 `type ModelTestState`，已从补丁中剔除并修正 hunk 行数；③正文名称提取现在保留完整仓库标识（`affaan-m/ECC`），我的兜底检索词断言改为不硬编码该形式。
+- 已知问题（非本次引入）：`dc7aa39` 与本次提交的 `App.tsx` 单独做类型检查都有 **2 个既有错误**（`MessageBubble` 需要 `draftTitles`/`tick` 但调用点未传、`elapsedLabel` 未定义）——修复在并行会话尚未提交的工作区里，因此提交历史里这一段 App.tsx 不自洽；我对照过提交前后错误数相同（2 → 2），本次提交没有新增错误。
+- 验证：`npx tsc -p tsconfig.app.json`（工作区，含并行会话改动）通过、`npm run build` 通过；`tests/test_agent_commands.py` 12 项与 `tests/test_footer_illustration_and_review_flow.py` 21 项通过；全量套件另有 2 项失败属并行会话在飞的改动（`test_enhanced_generation`、`test_supplemental_search`，后者是"材料不足联网补充"改成依赖检索规划模型调用后测试环境 401 导致静默跳过），未由本次改动引起。前端容器已重建并替换（替换前在跑任务 0/0），`http://127.0.0.1:5173/src/App.tsx` 已含 `taskInProgress`/`commandFromPage`/`listGenerationChatAgentRuns`，旧按钮已消失。**app/worker 尚未重建**：命令前缀要在后端生效，但重建会把并行会话未提交的后端改动一起部署（其中 2 项测试是红的），等用户确认。
+- 未提交 git：`7817826` 已提交（5 文件，+130/−48）；本条目暂留工作区，等并行会话提交它们的 339–341 条目后再单独提交。
+- 授权状态：已确认
+
 -->

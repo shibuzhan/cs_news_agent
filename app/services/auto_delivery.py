@@ -16,6 +16,7 @@ from app.services.plain_text import (
     normalize_wechat_description,
     query_has_no_subject,
 )
+from app.services.search_planning import compile_search_plan_queries
 from app.services.publication_preferences import load_publication_preferences
 from app.services.source_snapshots import DraftSourceSnapshotStore
 from app.services.runtime_settings import load_runtime_settings
@@ -32,6 +33,12 @@ logger = logging.getLogger("news_agent.auto_delivery")
 MAX_AUTO_REVIEW_REVISIONS = 1
 
 
+def _planned_search_queries(model_report: dict) -> tuple[list[str], list[dict]]:
+    """校验审核模型的检索计划，返回可执行查询与供审计展示的判定结果。"""
+    raw_plans = model_report.get("search_plan") if isinstance(model_report, dict) else None
+    return compile_search_plan_queries(raw_plans)
+
+
 async def _revision_search_evidence(
     settings: Settings,
     repository: ContentRepository,
@@ -41,36 +48,45 @@ async def _revision_search_evidence(
 ) -> tuple[list[dict], dict]:
     """为这次改稿取一次联网补充资料；任何失败都只记日志，不阻断改稿。
 
-    检索词优先用审核模型给出的 `search_queries`；没有时用正文里的外部名称做确定性兜底。
+    检索优先执行审核模型给出的结构化 `search_plan`；旧 `search_queries` 与正文名称只作兼容兜底。
     返回（证据条目, 本次检索事实）：事实要一路带到**汇报文案**里，否则用户看不到
     “到底搜没搜、搜了什么”（真实反馈：感觉搜索没被使用）。
     """
-    facts: dict = {"searched": False, "queries": [], "entries": 0}
+    facts: dict = {"searched": False, "queries": [], "entries": 0, "search_plan": []}
     if not (settings.revision_search_enabled and settings.exa_mcp_enabled):
         return [], facts
     draft = repository.get_draft(draft_id)
     subject = " ".join(str(getattr(draft, "source_name", "") or "").split())[:80] or " ".join(
         str((draft.title_options_json or [""])[0]).split()
     )[:80]
+    has_structured_plan = "search_plan" in model_report
+    queries, decisions = _planned_search_queries(model_report)
+    facts["search_plan"] = decisions
     raw_queries = [str(item) for item in (model_report.get("search_queries") or []) if str(item).strip()][:2]
-    if not raw_queries:
+    # 新审核记录明确给出空计划时，尊重模型“不需要联网”的结论；只有历史记录才走旧兜底。
+    if not has_structured_plan and not queries and not raw_queries:
         # 兜底只取一个名字：它按出现次数取，多取的那条往往是顺手提到的别的工具
         # （该草稿取到 README 标题里的 `SwiftUI`）——联网补充宁少勿杂（同“变更 337”的结论）。
-        raw_queries = extract_name_queries(draft.body, limit=1)
+        raw_queries = extract_name_queries(draft.body, limit=3)
     # `Web`、`OpenAI` 这类没有检索主体的词补后缀也搜不到可用材料，直接丢掉（真实反馈 2026-09-15）。
     raw_queries = [item for item in raw_queries if not query_has_no_subject(item)]
-    if not raw_queries:
+    if not queries and (has_structured_plan or not raw_queries):
         return [], facts
     # 笼统检索词（`Codex`、`Web`）只会命中官网首页或百科词条：补成具体检索对象
     # （`Codex 用法 开发 扩展 文档`），否则补充证据是噪声（真实反馈 2026-09-15）。
-    queries = [enrich_search_query(item, subject=subject) for item in raw_queries]
-    queries = [item for item in dict.fromkeys(queries) if item]
+    if not queries and not has_structured_plan:
+        # 旧报告兼容：最多两条；正文兜底只采用筛选后的第一条有效主体。
+        legacy_limit = 2 if model_report.get("search_queries") else 1
+        queries = [enrich_search_query(item, subject=subject) for item in raw_queries[:legacy_limit]]
+        queries = [item for item in dict.fromkeys(queries) if item]
+    if not queries:
+        return [], facts
     try:
         evidence = await ExaMcpSearchTool(settings).search(queries)
     except ExaMcpSearchError as exc:
         logger.warning("revision_search_failed draft_id=%s error_type=%s", draft_id, type(exc).__name__)
         return [], {**facts, "queries": queries, "failed": True}
-    facts = {"searched": True, "queries": queries, "entries": len(evidence)}
+    facts = {"searched": True, "queries": queries, "entries": len(evidence), "search_plan": decisions}
     if evidence:
         # 让审核也看得到这次补充：否则联网写入的事实会被判成“来源证据中未出现”。
         try:

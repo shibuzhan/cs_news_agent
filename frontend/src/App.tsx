@@ -85,11 +85,16 @@ function AutoReviewFeedback({ item }: { item: AutoReviewRun }) {
   const summary = reviewFeedbackText(item.model_report.summary);
   const feedback = reviewFeedbackItems(item);
   const versionNote = reviewVersionNote(item);
+  const criticalCount = (Array.isArray(item.model_report.issues) ? item.model_report.issues : []).filter((issue) => {
+    if (!issue || typeof issue !== "object") return false;
+    return (issue as Record<string, unknown>).severity === "critical";
+  }).length;
+  const criticalVerdict = criticalCount ? `存在 ${criticalCount} 项 critical` : "无 critical";
   return <>
-    {typeof item.model_report.score === "number" && <p>审核评分：{item.model_report.score}/{item.model_report.threshold || 100}{item.model_report.blocking_issue_count ? "；存在必须修复的问题" : ""}</p>}
-    {versionNote && <p className="muted">{versionNote}</p>}
-    {summary && <p>{summary}</p>}
-    {feedback.length > 0 && <ul>{feedback.map((issue, index) => <li key={`${item.id}-${index}`}>{issue}</li>)}</ul>}
+    {typeof item.model_report.score === "number" && <p className="review-score">审核评分：{item.model_report.score}/{item.model_report.threshold || 100}</p>}
+    {versionNote && <p className="review-version-note">{versionNote}</p>}
+    <p className="review-summary"><b>{criticalVerdict}</b>{summary ? `；${summary}` : item.model_report.blocking_issue_count ? "；存在必须修复的问题。" : "；审核未返回摘要。"}</p>
+    {feedback.length > 0 && <details className="review-issues"><summary>查看具体问题（{feedback.length}）</summary><ul>{feedback.map((issue, index) => <li key={`${item.id}-${index}`}>{issue}</li>)}</ul></details>}
   </>;
 }
 
@@ -188,37 +193,49 @@ function AppShell({ view, setView, children }: { view: View; setView: (view: Vie
   </main>;
 }
 
+const SESSION_TASK_STATUS_LABELS: Record<SessionTask["status"], string> = {
+  pending: "等待前置",
+  ready: "待处理",
+  running: "正在处理",
+  completed: "已完成",
+  failed: "处理失败",
+  skipped: "已跳过",
+};
+
+function SessionTaskState({ task, iconOnly = false }: { task: SessionTask; iconOnly?: boolean }) {
+  const label = SESSION_TASK_STATUS_LABELS[task.status];
+  if (iconOnly) return <span className="task-state icon-only" data-status={task.status} aria-hidden="true"><span className="task-state-icon" /></span>;
+  return <span className="task-state" data-status={task.status} aria-label={label}>
+    <span className="task-state-icon" aria-hidden="true" />
+    <span className="task-state-label" aria-live={task.status === "running" ? "polite" : undefined}>{label}</span>
+  </span>;
+}
+
+function SessionTaskItem({ task }: { task: SessionTask }) {
+  const label = SESSION_TASK_STATUS_LABELS[task.status];
+  const dependencyHint = task.depends_on.length ? `等待 ${task.depends_on.length} 个前置任务` : "";
+  return <li className="task-item" data-status={task.status}>
+    <SessionTaskState task={task} iconOnly />
+    <div className="task-item-content">
+      <b>{task.title}</b>
+      <div className="task-item-meta"><span className="task-state-label" data-status={task.status} aria-live={task.status === "running" ? "polite" : undefined}>{label}</span>{dependencyHint && <small className="task-dependency">{dependencyHint}</small>}</div>
+      {task.note && <small className="task-note" title={task.note}>{task.note}</small>}
+    </div>
+  </li>;
+}
+
 function SessionTaskList({ tasks }: { tasks?: SessionTask[] }) {
   const items = Array.isArray(tasks) ? tasks : [];
   const open = items.filter((task) => ["pending", "ready", "running"].includes(task.status));
-  const done = items.filter((task) => !["pending", "ready", "running"].includes(task.status));
-  // 清单跨消息保留：先列未完成的（还等谁、在做哪一步），已完成/跳过的收进折叠区。
+  const failed = items.filter((task) => task.status === "failed");
+  const running = open.filter((task) => task.status === "running");
+  // Todo 是当前多步流程的工作台：成功/跳过即收起，失败保留到用户看到处理结果。
+  if (!open.length && !failed.length) return null;
   return (
-    <section className="task-panel">
-      <div className="panel-heading"><h2>任务清单</h2><span>{open.length ? `${open.length} 项待办` : "无待办"}</span></div>
-      {open.length
-        ? <ol className="task-list">{open.map((task) => (
-          <li className="task-item" data-status={task.status} key={task.task_id}>
-            <span className="task-dot" data-status={task.status} />
-            <div>
-              <b>{task.title}</b>
-              <small>
-                {task.status_label}
-                {task.depends_on.length ? ` · 等 ${task.depends_on.length} 个前置` : ""}
-                {task.note ? ` · ${task.note.slice(0, 40)}` : ""}
-              </small>
-            </div>
-          </li>
-        ))}</ol>
-        : <p className="muted">还没有待办。多步指令（“先重写，再审核，通过后投递”）会自动登记到这里。</p>}
-      {done.length > 0 && (
-        <details className="task-history">
-          <summary>已完成 {done.length} 项</summary>
-          <ul>{done.map((task) => (
-            <li key={task.task_id}><span>{task.title}</span><small>{task.status_label}{task.note ? ` · ${task.note.slice(0, 40)}` : ""}</small></li>
-          ))}</ul>
-        </details>
-      )}
+    <section className="task-panel" data-has-attention={failed.length > 0 || undefined}>
+      <div className="panel-heading"><h2>任务清单</h2><span>{running.length ? `${running.length} 项正在处理` : open.length ? `${open.length} 项待处理` : `${failed.length} 项需处理`}</span></div>
+      {open.length > 0 && <ol className="task-list">{open.map((task) => <SessionTaskItem task={task} key={task.task_id} />)}</ol>}
+      {failed.length > 0 && <div className="task-attention"><b>需要处理</b><ol className="task-list">{failed.map((task) => <SessionTaskItem task={task} key={task.task_id} />)}</ol></div>}
     </section>
   );
 }
@@ -298,6 +315,9 @@ function ChatPage() {
   const activeRun = conversation?.agent_runs?.some((run) => run.status === "running") ?? false;
   const activeSessionId = conversation?.session.id;
   const streamingRunId = conversation?.agent_runs?.find((run) => run.status === "running")?.id;
+  // 正文重写要跑 9–12 分钟：卡片在转圈时补一个“已进行 N 分钟”，
+  // 用户才能分辨这是哪一个任务、跑了多久（真实反馈：看到转圈不知道卡住了还是真在跑）。
+  const elapsedTick = useElapsedTick(Boolean(streamingRunId));
   // 按类别分开累积：draft＝正在写的正文，chat/report＝对话回复与任务汇报。
   const [streams, setStreams] = useState<Record<string, string>>({});
   useEffect(() => {
@@ -340,6 +360,34 @@ function ChatPage() {
   }, [streamingRunId, activeSessionId, reload]);
   const replyStream = streams.chat || streams.report || "";
   const draftStream = streams.draft || "";
+  // 界面命令里带的是 draft id：这里按需取一次标题，气泡里显示“重写文案：《标题》”而不是一串 uuid。
+  const [draftTitles, setDraftTitles] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const missing = [
+      ...new Set(
+        (conversation?.messages || [])
+          .map((message) => (message.role === "user" ? commandDraftId(message.content) : null))
+          .filter((id): id is string => Boolean(id) && !draftTitles[id as string]),
+      ),
+    ];
+    if (!missing.length) return;
+    let cancelled = false;
+    void Promise.all(
+      missing.map(async (id) => {
+        try {
+          const draft = await api.getDraft(id);
+          return [id, draft.title_options[0] || ""] as const;
+        } catch {
+          return [id, ""] as const;
+        }
+      }),
+    ).then((pairs) => {
+      if (cancelled) return;
+      const resolved = Object.fromEntries(pairs.filter(([, title]) => title));
+      if (Object.keys(resolved).length) setDraftTitles((current) => ({ ...current, ...resolved }));
+    });
+    return () => { cancelled = true; };
+  }, [conversation?.messages, draftTitles]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -426,7 +474,7 @@ function ChatPage() {
       <section className="chat-panel">
         <div className="messages" ref={messageListRef}>
           {!conversation && <div className="empty"><LoaderCircle className="spin" /> 正在创建对话…</div>}
-          {conversation?.messages?.map((message) => <MessageBubble key={message.id} message={message} execution={conversation.agent_runs?.find((run) => (run.response_message_id || run.request_message_id) === message.id)} onConfirmPlan={async (tool, planId) => { setBusy(true); setNotice(""); try { await (tool === "create_schedule_plan" ? api.confirmSchedulePlan(planId) : api.confirmPublishPlan(planId)); await reload(conversation.session.id); setNotice("计划已确认。当前版本只记录确认，不会真正执行定时任务或发布内容。"); } catch (error) { setNotice(error instanceof Error ? error.message : "确认失败"); } finally { setBusy(false); } }} />)}
+          {conversation?.messages?.map((message) => <MessageBubble key={message.id} message={message} draftTitles={draftTitles} tick={elapsedTick} execution={conversation.agent_runs?.find((run) => (run.response_message_id || run.request_message_id) === message.id)} onConfirmPlan={async (tool, planId) => { setBusy(true); setNotice(""); try { await (tool === "create_schedule_plan" ? api.confirmSchedulePlan(planId) : api.confirmPublishPlan(planId)); await reload(conversation.session.id); setNotice("计划已确认。当前版本只记录确认，不会真正执行定时任务或发布内容。"); } catch (error) { setNotice(error instanceof Error ? error.message : "确认失败"); } finally { setBusy(false); } }} />)}
           {/* 流式回复：内容逐字出现；持久化消息一到（下一轮轮询）这块临时气泡就被清掉。 */}
           {replyStream && activeRun && <article className="message assistant"><span className="avatar">A</span><div><p className="streaming-text">{replyStream}<span className="stream-caret">▍</span></p><small>正在生成…</small></div></article>}
           {/* 正文生成中：一次调用要写几分钟，边写边显示，避免长时间黑箱等待。 */}
@@ -458,8 +506,32 @@ const RUN_INTENT_LABELS: Record<string, string> = {
 };
 const RUN_STATUS_MAX_CHARS = 18;
 
+// 运行中卡片要显示“已经跑了多久”：长任务（正文重写 9–12 分钟）只转圈会让用户以为卡死。
+function useElapsedTick(active: boolean): number {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => setTick((value) => value + 1), 30000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+  return tick;
+}
+
+function elapsedLabel(run: AgentRun | undefined, now: number = Date.now()): string {
+  if (!run || run.status !== "running") return "";
+  const startedAt = new Date(run.attempt_started_at || run.created_at).getTime();
+  if (!Number.isFinite(startedAt)) return "";
+  const minutes = Math.floor((now - startedAt) / 60000);
+  if (minutes < 1) return "刚刚开始";
+  return `已进行 ${minutes} 分钟`;
+}
+
 function shortRunStatus(run: AgentRun | undefined): string {
   if (!run) return "";
+  // “被驳回”不是“已完成”：界面必须说清这次操作没执行（真实反馈：生成失败却显示重写成功）。
+  const rejected = Array.isArray(run.tool_results)
+    && run.tool_results.some((item) => (item as { status?: string }).status === "rejected");
+  if (rejected) return "未执行";
   const summary = (run.summary || "").trim();
   if (summary && summary.length <= RUN_STATUS_MAX_CHARS) return summary;
   if (run.status === "running") return "正在处理中";
@@ -1035,6 +1107,8 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
   </>;
 }
 
+type ModelTestState = { state: "running" | "success" | "failed"; message: string };
+
 function SettingsPage() {
   const apiKeyMask = "••••••••••••";
   const [snapshot, setSnapshot] = useState<RuntimeSettingsSnapshot | null>(null);
@@ -1045,6 +1119,9 @@ function SettingsPage() {
   const [profileDialogOpen, setProfileDialogOpen] = useState(false);
   const [editingApiKey, setEditingApiKey] = useState(false);
   const [profile, setProfile] = useState({ model_name: "", base_url: "", api_key: "", has_api_key: false });
+  const [modelTests, setModelTests] = useState<Record<string, ModelTestState>>({});
+  const [testingAll, setTestingAll] = useState(false);
+  const [testAllProgress, setTestAllProgress] = useState({ completed: 0, total: 0 });
 
   const reload = useCallback(async () => {
     const next = await api.getRuntimeSettings();
@@ -1098,6 +1175,28 @@ function SettingsPage() {
     }, updating ? "模型档案已更新" : "模型档案已创建");
   }
 
+  async function testProfile(item: ModelProfile) {
+    setModelTests((current) => ({ ...current, [item.id]: { state: "running", message: "正在测试连接" } }));
+    try {
+      const result = await api.testModelProfile(item.id);
+      setModelTests((current) => ({ ...current, [item.id]: { state: "success", message: result.message || "模型连通性正常" } }));
+    } catch (error) {
+      setModelTests((current) => ({ ...current, [item.id]: { state: "failed", message: error instanceof Error ? error.message : "模型连通性检测失败" } }));
+    }
+  }
+
+  async function testAllProfiles() {
+    const profiles = snapshot?.model_profiles || [];
+    if (!profiles.length) return;
+    setTestingAll(true);
+    setTestAllProgress({ completed: 0, total: profiles.length });
+    for (const [index, item] of profiles.entries()) {
+      await testProfile(item);
+      setTestAllProgress({ completed: index + 1, total: profiles.length });
+    }
+    setTestingAll(false);
+  }
+
   if (!snapshot) return <section className="settings-page"><h1>系统设置</h1><p className="muted">正在读取本地设置…</p>{notice && <p className="notice">{notice}</p>}</section>;
   const updateRuntime = (key: string, value: string | number | boolean) => setRuntime((current) => ({ ...current, [key]: value }));
   const tasks: Array<[string, string]> = [["conversation", "日常对话"], ["content", "文案生成"], ["review", "自动审核"], ["illustration_planner", "配图规划"], ["evidence_selector", "证据筛选"]];
@@ -1106,9 +1205,9 @@ function SettingsPage() {
     <header className="page-heading"><div><p className="eyebrow">本地运行配置</p><h1>系统设置</h1><p>修改只影响之后新建的任务；运行中的采集、生成、审核和投递不会被中断。</p></div><button className="ghost-button" disabled={busy} onClick={() => void run(reload, "设置已刷新")}><RefreshCw size={16} /> 刷新设置</button></header>
     {notice && <p className="notice">{notice}</p>}
     <section className="settings-grid">
-      <article className="settings-card wide"><div className="panel-heading"><div><b>模型档案与任务分配</b><small>密钥只可写入或覆盖，不会回显。未选择档案的任务继续使用 .env 中的原有配置。</small></div><button className="primary-button compact-action" disabled={busy} onClick={openCreateProfile}><Plus size={16} /> 新增模型</button></div>
+      <article className="settings-card wide"><div className="panel-heading"><div><b>模型档案与任务分配</b><small>密钥只可写入或覆盖，不会回显。未选择档案的任务继续使用 .env 中的原有配置。</small></div><div className="model-profile-toolbar"><button className="ghost-button compact-action" disabled={busy || testingAll || !snapshot.model_profiles.length} onClick={() => void testAllProfiles()}>{testingAll ? <><LoaderCircle className="spin" size={16} /> 测试 {testAllProgress.completed}/{testAllProgress.total}</> : <><RefreshCw size={16} /> 测试全部模型</>}</button><button className="primary-button compact-action" disabled={busy || testingAll} onClick={openCreateProfile}><Plus size={16} /> 新增模型</button></div></div>
         {!snapshot.security.model_profile_encryption_ready && <p className="notice">需先在私有 .env 中填写 MODEL_PROFILE_ENCRYPTION_KEY，才可保存新的模型 API Key。</p>}
-        <div className="profile-list">{snapshot.model_profiles.length ? snapshot.model_profiles.map((item) => <article className="settings-row model-profile-row" key={item.id}><div><b>{item.model_name}</b><small>{item.base_url}</small></div><div className="profile-key-state" title={item.has_api_key ? "API Key 已保存" : "尚未填写 API Key"}><span>API Key</span><strong>{item.has_api_key ? apiKeyMask : "未填写"}</strong></div><div className="inline-actions"><button className="text-button" disabled={busy} onClick={() => editProfile(item)}>编辑</button><button className="text-button" disabled={busy} onClick={() => void run(() => api.testModelProfile(item.id), "模型连通性正常")}>测试连通性</button><button className="danger-link" disabled={busy} onClick={() => { if (window.confirm("删除该模型档案不会影响环境变量配置，确定继续吗？")) void run(() => api.deleteModelProfile(item.id), "模型档案已删除"); }}>删除</button></div></article>) : <p className="muted">尚未创建模型档案，可继续使用 .env 中按任务设置的模型。</p>}</div>
+        <div className="profile-list">{snapshot.model_profiles.length ? snapshot.model_profiles.map((item) => { const test = modelTests[item.id]; return <article className="settings-row model-profile-row" key={item.id}><div className="model-profile-identity"><b>{item.model_name}</b><small>{item.base_url}</small>{test && <span className="model-test-state" data-state={test.state} aria-live="polite">{test.state === "running" ? <LoaderCircle className="spin" size={14} /> : test.state === "success" ? <CircleCheck size={14} /> : <CircleAlert size={14} />}{test.message}</span>}</div><div className="profile-key-state" title={item.has_api_key ? "API Key 已保存" : "尚未填写 API Key"}><span>API Key</span><strong>{item.has_api_key ? apiKeyMask : "未填写"}</strong></div><div className="inline-actions"><button className="text-button" disabled={busy || testingAll} onClick={() => editProfile(item)}>编辑</button><button className="text-button" disabled={busy || testingAll || test?.state === "running"} onClick={() => void testProfile(item)}>{test?.state === "running" ? "测试中" : "测试连通性"}</button><button className="danger-link" disabled={busy || testingAll} onClick={() => { if (window.confirm("删除该模型档案不会影响环境变量配置，确定继续吗？")) void run(() => api.deleteModelProfile(item.id), "模型档案已删除"); }}>删除</button></div></article>; }) : <p className="muted">尚未创建模型档案，可继续使用 .env 中按任务设置的模型。</p>}</div>
         <div className="task-routing">{tasks.map(([task, label]) => <label key={task}><span>{label}</span><select value={snapshot.task_assignments[task] || ""} disabled={busy} onChange={(event) => void run(() => api.assignModelTask(task, event.target.value || null), `${label} 路由已保存`)}><option value="">环境变量默认</option>{snapshot.model_profiles.map((item) => <option key={item.id} value={item.id}>{item.model_name}</option>)}</select></label>)}</div>
       </article>
       <article className="settings-card"><div className="panel-heading"><div><b>图片与微信草稿箱</b><small>{snapshot.image_options.reference_note}</small></div></div><label>插图尺寸<select value={String(runtime.image_generation_size || "")} onChange={(event) => updateRuntime("image_generation_size", event.target.value)}>{snapshot.image_options.sizes.map((value) => <option key={value}>{value}</option>)}</select></label><label>插图比例<select value={String(runtime.image_generation_ratio || "")} onChange={(event) => updateRuntime("image_generation_ratio", event.target.value)}>{snapshot.image_options.ratios.map((value) => <option key={value}>{value}</option>)}</select></label><label>图片最长等待秒数<input type="number" min="60" value={String(runtime.image_generation_timeout_seconds || "")} onChange={(event) => updateRuntime("image_generation_timeout_seconds", Number(event.target.value))} /></label><label className="setting-check"><input type="checkbox" checked={Boolean(runtime.wechat_open_comment)} onChange={(event) => updateRuntime("wechat_open_comment", event.target.checked)} /> 上传草稿箱时开启留言</label><label className="setting-check"><input type="checkbox" checked={Boolean(runtime.wechat_only_fans_can_comment)} disabled={!runtime.wechat_open_comment} onChange={(event) => updateRuntime("wechat_only_fans_can_comment", event.target.checked)} /> 仅关注后可留言</label><label className="setting-check"><input type="checkbox" checked={Boolean(runtime.publication_vision_selection_enabled)} onChange={(event) => updateRuntime("publication_vision_selection_enabled", event.target.checked)} /> 投递前启用图片视觉选择</label></article>

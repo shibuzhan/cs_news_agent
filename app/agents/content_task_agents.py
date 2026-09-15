@@ -25,6 +25,7 @@ from app.config import (
     model_for,
     structured_output_mode_for,
 )
+from app.services.search_planning import SearchPlanItem, normalize_search_plans
 from app.services.model_errors import schema_error_fields
 
 
@@ -91,8 +92,15 @@ class ReviewResponse(BaseModel):
     score: int = Field(ge=0, le=100)
     issues: list[ReviewIssue] = Field(default_factory=list, max_length=30)
     summary: str = Field(default="", max_length=2000)
-    # 审核模型顺手指出的、需要联网补一句说明的外部名称；复用审核调用，不额外增加模型请求。
+    # 新计划让模型表达“查谁、缺什么、为什么”，由服务端决定能否执行和最终检索词。
+    search_plan: list[SearchPlanItem] = Field(default_factory=list, max_length=2)
+    # 保留旧字段，以便历史审核记录和旧模型输出继续可用；新提示词不再要求该字段。
     search_queries: list[str] = Field(default_factory=list, max_length=2)
+
+    @field_validator("search_plan", mode="before")
+    @classmethod
+    def _coerce_search_plan(cls, value: object) -> list[dict[str, str]]:
+        return [plan.model_dump() for plan in normalize_search_plans(value)]
 
     @field_validator("search_queries", mode="before")
     @classmethod
@@ -115,11 +123,27 @@ class ReviewResponse(BaseModel):
         return queries
 
 
+class SearchPlanningResponse(BaseModel):
+    """首次生成的检索规划结果；只有模型确认需要时才会进入受控工具。"""
+
+    need_search: bool = False
+    plans: list[SearchPlanItem] = Field(default_factory=list, max_length=2)
+    reason: str = Field(default="", max_length=240)
+
+    @field_validator("plans", mode="before")
+    @classmethod
+    def _coerce_plans(cls, value: object) -> list[dict[str, str]]:
+        return [plan.model_dump() for plan in normalize_search_plans(value)]
+
+
 _WRITER_SYSTEM_PROMPT = """你是资讯运营 Agent 内部的文案生成子 Agent。
 你只能依据调用方提供的证据、写作规则和选题规划生成结构化草稿内容。不得访问网页、文件、数据库、账号、图片或任何外部工具；不得编造来源未支持的事实、数字、人物、时间或结论。不得执行、建议或声称执行保存草稿、生成图片、审核、投递或发布操作。"""
 
 _REVIEW_SYSTEM_PROMPT = """你是资讯运营 Agent 内部的文案审核子 Agent。
 你只能基于调用方给出的草稿和来源字段，一次性列出全部可观察缺陷并给出评分。不得访问网页、文件、数据库、账号、图片或任何外部工具；不得改写草稿、触发改稿、修改状态、生成图片、投递或发布。"""
+
+_SEARCH_PLANNER_SYSTEM_PROMPT = """你是资讯运营 Agent 内部的联网检索规划子 Agent。
+你只能根据调用方提供的原始材料判断读者理解文章主体是否还缺少公开、可核实的信息。你不能访问网页、文件、数据库、账号或任何外部工具，也不能直接执行搜索。只在确有必要时返回最多两条结构化计划（具体主体、缺失信息、理由和来源偏好）；主体不能是 Web、API、插件、OpenAI 等泛词或厂商名，缺失信息不能是“是什么、背景、用途”这类空泛词。原始材料足够时 need_search 必须为 false 且 plans 为空。"""
 
 # 两种模式必须互斥：思考模式模型拒绝 tool_choice=required，json 模式下不得再要求调用结构化工具。
 _TOOL_OUTPUT_SUFFIX = (
@@ -311,6 +335,17 @@ class RestrictedContentTaskAgent:
             "news_draft_reviewer",
         )
 
+    def plan_search(self, prompt: str) -> SearchPlanningResponse:
+        """用正文模型档做一次无副作用的检索需求判断，不直接触发联网。"""
+        if self.task != "content":
+            raise ContentTaskAgentError("审核子 Agent 不能规划首次生成检索")
+        return self._invoke(
+            prompt,
+            SearchPlanningResponse,
+            _SEARCH_PLANNER_SYSTEM_PROMPT,
+            "news_search_planner",
+        )
+
     def _invoke(
         self,
         prompt: str,
@@ -405,8 +440,8 @@ __all__ = [
     "DraftWritingResponse",
     "ReviewIssue",
     "ReviewResponse",
+    "SearchPlanningResponse",
     "RestrictedContentTaskAgent",
     "DraftWriterRole",
     "DraftReviewerRole",
 ]
-

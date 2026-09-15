@@ -259,15 +259,17 @@ class AutoReviewTool:
             # 用户口径（2026-09-15）：字数以配置页为准，但**不因为字数重写**（一次 9–12 分钟）。
             "**长度只作提示、不作为缺陷**：正文比配置区间短或长时，用一条 minor 说清“偏短/偏长、建议补事实或删重复”，"
             "并注明“可改可不改”；**不得因为长度给出 major/critical，也不得要求重写整篇**。"
-            "返回 JSON：score（0-100 整数）、issues（数组，每项有 type、severity、description）、summary、search_queries。"
+            "返回 JSON：score（0-100 整数）、issues（数组，每项有 type、severity、description）、summary、search_plan。"
             "severity 只能是 critical、major、minor；critical 仅用于缺失来源、无证据事实或可能误导读者的重大问题。"
-            "search_queries 供改稿环节联网补充使用：只有当某个外部名称**不解释就读不懂本文主体**时才填，"
-            "例如文章核心讲的那个项目、方法或平台；"
+            "search_plan 供改稿环节联网补充使用：只有当某个外部名称**不解释就读不懂本文主体**时才填，"
+            "每项必须包含 subject（具体主体）、need（文章缺失的事实或方法）、reason（为何需要补）、"
+            "preferred_source（official_docs / repository / authoritative_web）；例如"
+            '{"subject":"openai/plugins","need":"插件开发与配置方式","reason":"正文提到开发入口但未解释","preferred_source":"repository"}。'
+            "subject 必须是文章核心项目、仓库或平台标识；"
             "仅仅出现在“支持/兼容/也可用于”这类列举里的工具名不要填，读者不需要靠它理解文章。"
             # 真实反馈（2026-09-15）：审核给出的 `Codex`、`Web` 这种裸词只会搜到官网首页或维基百科。
-            "**检索词必须是具体检索对象，不能只写一个名字**：写成「名称 + 想了解的方面」，"
-            "例如「Codex 插件 用法」「Figma 插件 开发 文档」；"
-            "**禁止**把通用词（Web、API、插件、示例这类）单独作为检索词，也不要写“是什么”这类空问句。"
+            "**禁止**把通用词（Web、API、插件、示例这类）或厂商名（OpenAI、Google）作为 subject，"
+            "need 也不能写“是什么／背景／用途”这类空泛词；"
             "最多 1 到 2 条；没有这类名称时返回空数组。"
             f"评分达到 {self.settings.auto_review_pass_score} 分且没有 critical 才能通过。每一项扣分必须对应 issues 中的明确缺陷；"
             "不要保留下一轮再指出的缺陷，不要输出推理过程。"
@@ -359,6 +361,7 @@ class AutoReviewTool:
                     "issues": issues,
                     "summary": review_feedback_text(model.summary) or "",
                     # 交给改稿环节联网补充；不改写草稿、不额外增加模型请求。
+                    "search_plan": [item.model_dump() for item in model.search_plan],
                     "search_queries": list(model.search_queries),
                     # 记录这次审的是第几版、这一版是怎么来的：记录页与下一次审核据此给出可比的说明。
                     "reviewed_version": int(getattr(draft, "version", 0) or 0),

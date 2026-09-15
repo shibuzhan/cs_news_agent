@@ -10,7 +10,7 @@ from langsmith.wrappers import wrap_openai
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
-from app.agents.content_task_agents import RestrictedContentTaskAgent
+from app.agents.content_task_agents import RestrictedContentTaskAgent, SearchPlanningResponse
 from app.config import Settings, api_key_for, base_url_for, model_for
 from app.domain.models import DraftContent, NormalizedItem, SourceKind
 from app.observability import langsmith_enabled
@@ -23,12 +23,12 @@ from app.services.plain_text import (
     NaturalArticleError,
     article_length_band,
     compose_natural_article,
-    enrich_search_query,
     format_source_body,
     normalize_wechat_description,
     select_evidence_text,
 )
 from app.services.search_evidence import format_search_evidence_section
+from app.services.search_planning import compile_search_plan_queries
 from app.services.term_policy import terminology_guidance
 from app.tools.search_tools import ExaMcpSearchError, ExaMcpSearchTool
 
@@ -237,14 +237,6 @@ def _is_recoverable_provider_error(exc: Exception) -> bool:
     return is_provider_error(exc)
 
 
-class SearchDecision(BaseModel):
-    """模型只描述检索需求；是否访问网络由受控 Tool 决定。"""
-
-    need_search: bool = False
-    queries: list[str] = Field(default_factory=list, max_length=2)
-    reason: str = ""
-
-
 class DeterministicDraftGenerator:
     """无密钥环境的可测试降级实现，不冒充真实 LLM 翻译。"""
 
@@ -384,36 +376,46 @@ class OpenAICompatibleDraftGenerator:
             return ""
 
     def _supplemental_search(self, item: NormalizedItem, evidence_text: str) -> list[dict]:
-        """材料不足时联网补一次背景与用途——**不允许再用重复凑字数**。
-
-        真实链条（2026-09-15）：只给了 1277 字 README、要写 1600–2200 字，模型没有外部材料，
-        只能靠“先列举、再用『这个/这些』总结一遍”填充，审核连着两轮报重复（50 分 → 60 分）。
-        用户口径：“材料不足时调用搜索工具补充啊，搜索背景、应用什么的”。
-
-        触发条件（确定性、不额外调用模型）：可用材料明显短于目标字数。检索词用项目名，
-        与改稿路径的兜底词口径一致（`extract_name_queries`）。
-        """
+        """材料不足时先让模型根据原始材料规划检索；它不能直接执行搜索。"""
         if not (self.settings.exa_mcp_enabled and getattr(self.settings, "revision_search_enabled", True)):
             return []
         # 目标中段（不是上限）：材料只要接近“写够所需的量”就不必打扰外部服务。
         target_mid = (self.settings.draft_body_min_chars + self.settings.draft_body_max_chars) // 2
         if len(evidence_text) >= target_mid * SEARCH_TRIGGER_RATIO:
             return []
-        queries: list[str] = []
-        name = " ".join(str(item.title or "").split())[:80]
-        if name:
-            # 具体检索对象，而不是裸名称：搜“Codex”只会命中官网首页（用户反馈 2026-09-15）。
-            queries.append(enrich_search_query(item.title, subject=name))
+        try:
+            decision = self.writer.plan_search(
+                "只根据这份原始材料规划是否需要联网补充。材料不足不等于一定要搜索："
+                "若来源已经说清文章主体、关键变更和读者理解所需语境，need_search=false。"
+                "若需要搜索，plans 的 subject 必须来自材料中明确出现的具体项目、仓库或技术主体，"
+                "need 写明缺失的具体事实或方法；不要从标题单独猜主体。"
+                "输出 JSON：need_search、plans、reason。\n原始材料："
+                + json.dumps(
+                    {
+                        "title": item.title,
+                        "summary": item.summary,
+                        "content": evidence_text,
+                        "source_name": item.source_name,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as exc:  # 规划是补充能力，不能因它阻断正文生成。
+            logger.warning("draft_generation_search_planning_skipped error_type=%s", type(exc).__name__)
+            return []
+        if not decision.need_search:
+            return []
+        queries, decisions = compile_search_plan_queries(decision.plans)
         if not queries:
             return []
         try:
-            found = self.search_tool.search(queries[:2])
+            found = _run_coroutine(self.search_tool.search(queries))
         except ExaMcpSearchError as exc:
             logger.warning("draft_generation_supplemental_search_skipped error_type=%s", type(exc).__name__)
             return []
         logger.info(
-            "draft_generation_supplemental_search source=%s external_id=%s evidence_chars=%s target_mid=%s entries=%s",
-            item.source_kind.value, item.external_id, len(evidence_text), target_mid, len(found),
+            "draft_generation_supplemental_search source=%s external_id=%s evidence_chars=%s target_mid=%s plans=%s entries=%s",
+            item.source_kind.value, item.external_id, len(evidence_text), target_mid, len(decisions), len(found),
         )
         return found
 
@@ -561,27 +563,27 @@ class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
         evidence = self._evidence(item)
         fast_model = self.settings.llm_fast_model or self.model
         reasoning_model = self.settings.llm_reasoning_model or self.model
-        search_decision = SearchDecision()
+        search_decision = SearchPlanningResponse()
+        search_queries: list[str] = []
         search_evidence: list[dict] = []
         try:
-            if self.search_tool.enabled:
+            evidence_text = "\n".join(str(entry.get("content") or "") for entry in evidence)
+            target_mid = (self.settings.draft_body_min_chars + self.settings.draft_body_max_chars) // 2
+            if self.search_tool.enabled and len(evidence_text) < target_mid * SEARCH_TRIGGER_RATIO:
                 decision_payload = self._json(
                     fast_model,
-                    "你是科技资讯检索规划器。只根据来源证据判断：是否需要补充读者理解所需的背景、技术优点、使用或部署语境，"
-                    "或来源未解释的专有名词。"
-                    "**正文会提到来源里的外部产品、工具、平台与组织名**（编码工具、编辑器、厂商、服务等）："
-                    "只有当某个名称不解释就读不懂文章主体时才需要检索（例如文章核心讲的项目、方法或平台）；"
-                    "仅仅出现在“支持/兼容/也可用于”这类列举里的工具名不必检索。"
-                    "需要安装或使用方式时也可检索，但优先补齐与主体相关的名称与背景，而不是补充命令细节。"
-                    "只有确有必要补充且可获得公开可靠资料时才设置 need_search=true；"
-                    "最多给出 2 条自然语言检索词（优先把最关键的 1 到 2 个名称放进检索词），"
-                    "不得检索个人隐私、凭据或与选题无关的信息。"
-                    "输出 JSON：need_search、queries、reason。\n证据包："
+                    "只根据来源证据判断是否需要联网补充。材料不足不等于一定要搜索；来源已足够时"
+                    "need_search=false。需要时 plans 最多两项，每项为 subject、need、reason、preferred_source；"
+                    "subject 必须来自材料中明确出现的具体项目、仓库或技术主体，不能从标题单独猜，"
+                    "也不能是 Web、API、插件、OpenAI 等泛词或厂商名；need 不能是“是什么、背景、用途”。"
+                    "模型只规划，不执行搜索。输出 JSON：need_search、plans、reason。\n证据包："
                     + json.dumps({"evidence": evidence}, ensure_ascii=False),
                 )
-                search_decision = SearchDecision.model_validate(decision_payload)
+                search_decision = SearchPlanningResponse.model_validate(decision_payload)
                 if search_decision.need_search:
-                    search_evidence = self._search_evidence(search_decision.queries)
+                    search_queries, _ = compile_search_plan_queries(search_decision.plans)
+                    if search_queries:
+                        search_evidence = self._search_evidence(search_queries)
             facts = {"category": item.category.value, "source_name": item.source_name, "published_at": item.published_at.isoformat() if item.published_at else None, "evidence": [*evidence, *search_evidence]}
             plan = self._json(fast_model, "你是科技资讯选题编辑。只能使用证据包，输出 JSON：audience、angle、outline(数组)、risks(数组)。不得写未被证据支持的事实。\n证据包：" + json.dumps(facts, ensure_ascii=False))
             writer_prompt = (
@@ -625,7 +627,7 @@ class EnhancedDraftGenerator(OpenAICompatibleDraftGenerator):
                 payload["card_script"] = [payload["card_script"]]
             if isinstance(payload.get("tags"), str):
                 payload["tags"] = [tag.strip("# ") for tag in payload["tags"].split() if tag]
-            plan["search"] = {"requested": search_decision.need_search, "query_count": len(search_decision.queries), "evidence_count": len(search_evidence), "reason": search_decision.reason}
+            plan["search"] = {"requested": search_decision.need_search, "query_count": len(search_queries), "evidence_count": len(search_evidence), "reason": search_decision.reason}
             _ensure_source_title_options(payload, item)
             plan["article_shape"] = _apply_article_body(
                 payload,

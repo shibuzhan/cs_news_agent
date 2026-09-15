@@ -19,6 +19,7 @@ import pytest
 
 from app.services.plain_text import (
     USAGE_QUERY_SUFFIX,
+    build_search_plan_query,
     enrich_search_query,
     extract_name_queries,
     is_generic_query,
@@ -31,6 +32,18 @@ def test_bare_name_becomes_a_specific_query() -> None:
 
     assert query == f"Codex {USAGE_QUERY_SUFFIX}"
     assert "用法" in query and "开发" in query
+
+
+def test_empty_question_is_rewritten_to_a_specific_query() -> None:
+    assert enrich_search_query("Codex 是什么", subject="openai/plugins") == f"Codex {USAGE_QUERY_SUFFIX}"
+
+
+def test_structured_plan_requires_subject_and_specific_need() -> None:
+    assert build_search_plan_query("openai/plugins", "插件开发与配置方式", "repository") == (
+        "openai/plugins 插件开发与配置方式 README"
+    )
+    assert build_search_plan_query("Codex", "是什么", "official_docs") == ""
+    assert build_search_plan_query("OpenAI", "插件开发方式", "official_docs") == ""
 
 
 def test_review_queries_are_also_completed() -> None:
@@ -61,6 +74,12 @@ def test_body_scan_no_longer_offers_generic_words() -> None:
 
     assert "Web" not in names
     assert "Codex" in names or "openai/plugins" in names
+
+
+def test_repository_identifier_is_kept_intact() -> None:
+    names = extract_name_queries("　　affaan-m/ECC 支持 Claude Code 与 OpenCode。", limit=3)
+
+    assert names[0] == "affaan-m/ECC"
 
 
 def test_background_suffix_is_gone() -> None:
@@ -96,7 +115,8 @@ def test_revision_search_completes_the_queries() -> None:
 
     source = inspect.getsource(auto_delivery._revision_search_evidence)
 
-    assert "enrich_search_query" in source
+    assert "_planned_search_queries" in source
+    assert "has_structured_plan" in source
     assert "query_has_no_subject" in source
     assert "只写名称本身" not in source
 
@@ -106,13 +126,59 @@ def test_review_prompt_demands_specific_queries() -> None:
 
     source = inspect.getsource(auto_review.AutoReviewTool.invoke)
 
-    assert "检索词必须是具体检索对象" in source
+    assert "search_plan" in source
+    assert "subject" in source and "need" in source
     assert "禁止" in source and "Web" in source
 
 
-def test_generation_search_uses_the_same_enrichment() -> None:
+def test_generation_search_uses_structured_planning_instead_of_title_enrichment() -> None:
     from app.services.generator import OpenAICompatibleDraftGenerator
 
     source = inspect.getsource(OpenAICompatibleDraftGenerator._supplemental_search)
 
-    assert "enrich_search_query" in source
+    assert "plan_search" in source
+    assert "compile_search_plan_queries" in source
+    assert "build_search_plan_query" not in source
+    assert '"content": evidence_text' in source
+
+
+def test_structured_plan_is_preferred_and_invalid_item_falls_back() -> None:
+    from app.services.auto_delivery import _planned_search_queries
+
+    queries, decisions = _planned_search_queries(
+        {
+            "search_plan": [
+                {"subject": "Web", "need": "插件开发方式", "preferred_source": "official_docs"},
+                {"subject": "Codex", "need": "插件开发方式", "preferred_source": "official_docs"},
+            ]
+        }
+    )
+
+    assert queries == ["Codex 插件开发方式 官方文档"]
+    assert decisions[0]["accepted"] is False
+    assert decisions[1]["accepted"] is True
+
+
+def test_search_plan_contract_compiles_only_valid_material_subjects() -> None:
+    from app.services.search_planning import compile_search_plan_queries
+
+    queries, decisions = compile_search_plan_queries(
+        [
+            {"subject": "openai/plugins", "need": "插件配置方式", "preferred_source": "repository"},
+            {"subject": "OpenAI", "need": "插件配置方式", "preferred_source": "official_docs"},
+        ]
+    )
+
+    assert queries == ["openai/plugins 插件配置方式 README"]
+    assert decisions[0]["accepted"] is True
+    assert decisions[1]["accepted"] is False
+
+
+def test_conversation_search_tool_describes_structured_plan_contract() -> None:
+    from app.agent_tools import draft_actions
+
+    source = inspect.getsource(draft_actions.build_draft_action_tools)
+
+    assert "结构化检索计划" in source
+    assert "preferred_source" in source
+    assert "只补证据，不改正文、不审核、不投递" in source

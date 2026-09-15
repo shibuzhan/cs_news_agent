@@ -15,7 +15,6 @@ COPY app ./app
 COPY agent_skills ./agent_skills
 COPY migrations ./migrations
 COPY scripts ./scripts
-RUN pip install --no-deps .
 
 RUN useradd --create-home --uid 10001 appuser \
     && chmod +x /app/scripts/container-entrypoint.sh

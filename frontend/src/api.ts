@@ -69,6 +69,7 @@ export const api = {
     const suffix = query.size ? `?${query.toString()}` : "";
     return request<Draft[]>(`/drafts${suffix}`);
   },
+  getDraft: (id: string) => request<Draft>(`/drafts/${id}`),
   deleteDraft: (id: string) => request<{ deleted_id: string }>(`/drafts/${id}`, { method: "DELETE" }),
   editDraft: (id: string, patch: Partial<Pick<Draft, "title_options" | "summary_cn" | "body" | "tags" | "card_script">>) =>
     request<Draft>(`/drafts/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),

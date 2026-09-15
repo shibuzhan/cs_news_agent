@@ -117,7 +117,7 @@ export type AutoReviewRun = {
   draft_id: string;
   status: string;
   rule_report: { passed?: boolean; failures?: string[]; body_chars?: number; paragraph_count?: number };
-  model_report: { passed?: boolean; score?: number; threshold?: number; blocking_issue_count?: number; issues?: string[]; summary?: string; skipped?: string };
+  model_report: { passed?: boolean; score?: number; threshold?: number; blocking_issue_count?: number; issues?: Array<string | { type?: string; category?: string; severity?: string; description?: string; message?: string; detail?: string }>; summary?: string; skipped?: string };
   // 审的是哪一版、这一版怎么来的、与上次相比分数差多少（后端 annotate_auto_reviews 补上的）。
   reviewed_version?: number | null;
   version_origin?: string | null;

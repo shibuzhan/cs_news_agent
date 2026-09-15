@@ -9,6 +9,8 @@ import logging
 from typing import Any
 
 from app.config import Settings
+from app.services.plain_text import enrich_search_query, query_has_no_subject
+from app.services.search_planning import compile_search_plan_queries
 from app.tools.search_tools import ExaMcpSearchError, ExaMcpSearchTool
 
 logger = logging.getLogger("news_agent.evidence_search")
@@ -20,7 +22,8 @@ def _clean_queries(queries: list[str]) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for query in queries:
-        value = " ".join(str(query).split()).strip()[:300]
+        raw = " ".join(str(query).split()).strip()[:300]
+        value = enrich_search_query(raw) if raw and not query_has_no_subject(raw) else ""
         if not value or value in seen:
             continue
         seen.add(value)
@@ -31,14 +34,23 @@ def _clean_queries(queries: list[str]) -> list[str]:
 
 
 async def search_and_store_evidence(
-    settings: Settings, repository, draft: Any, queries: list[str],
+    settings: Settings,
+    repository,
+    draft: Any,
+    plans: list[dict[str, str]] | None = None,
+    queries: list[str] | None = None,
 ) -> dict[str, Any]:
-    """检索 → 并入草稿证据（带联网标记）→ 返回本次检索事实。
+    """执行已校验的检索计划 → 并入草稿证据（带联网标记）→ 返回本次事实。
 
-    失败只返回 `status="failed"`，不抛异常：检索是补充手段，不该让整条流程失败。
+    `plans` 是新契约：模型只提出主体与信息缺口，服务端编译最终检索词；
+    `queries` 仅兼容历史会话调用。失败只返回 `status="failed"`，不阻断主流程。
     """
-    cleaned = _clean_queries(queries)
-    facts: dict[str, Any] = {"status": "ok", "queries": cleaned, "entries": 0, "titles": []}
+    plan_queries, decisions = compile_search_plan_queries(plans)
+    # 传入 plans（包括空列表）代表模型已经作出决定，不能再回退到旧裸字符串。
+    cleaned = plan_queries if plans is not None else _clean_queries(queries or [])
+    facts: dict[str, Any] = {
+        "status": "ok", "queries": cleaned, "entries": 0, "titles": [], "search_plan": decisions,
+    }
     if not cleaned:
         return {**facts, "status": "rejected"}
     if not (settings.exa_mcp_enabled and getattr(settings, "revision_search_enabled", True)):

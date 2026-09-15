@@ -41,6 +41,8 @@ SOURCE_FOOTER_PREFIXES = ("原文标题：", "原文链接：", "来源链接：
 _SOURCE_FOOTER_PREFIXES = SOURCE_FOOTER_PREFIXES
 # 外部名称候选：1 到 3 个拉丁字母词，首词大写（Claude Code、OpenCode、AgentShield…）。
 _NAME_PATTERN = re.compile(r"\b[A-Z][A-Za-z0-9]*(?:[.+#-][A-Za-z0-9]+)*(?:\s+[A-Z][A-Za-z0-9]*(?:[.+#-][A-Za-z0-9]+)*){0,2}\b")
+# GitHub 仓库标识必须整体保留；否则 `affaan-m/ECC` 会退化成毫无上下文的 `ECC`。
+_REPOSITORY_ID_PATTERN = re.compile(r"\b[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\b")
 # 常见英文虚词与目标读者已知的通用技术语汇，不作为需要联网说明的名称。
 _NAME_STOPWORDS = frozenset(
     {
@@ -68,8 +70,14 @@ USAGE_QUERY_SUFFIX = "用法 开发 扩展 文档"
 # 检索词里出现这些词，说明已经指向“想了解什么方面”，不必再补后缀。
 _QUERY_ASPECT_HINTS = (
     "用法", "开发", "文档", "教程", "扩展", "方法", "入门", "指南", "原理", "实践", "对比",
-    "是什么", "背景", "用途", "怎么", "如何", "为什么",
+    "怎么", "如何",
 )
+_EMPTY_SEARCH_INTENTS = ("是什么", "背景", "用途", "为什么")
+_SEARCH_SOURCE_SUFFIXES = {
+    "official_docs": "官方文档",
+    "repository": "README",
+    "authoritative_web": "",
+}
 # 中文通用词：单独成检索词时同样没有检索主体（`插件`、`接口` 搜回来全是泛泛的科普页）。
 _GENERIC_QUERY_WORDS = frozenset(
     {
@@ -268,6 +276,9 @@ def extract_name_queries(text: str, limit: int = 2) -> list[str]:
     if not text:
         return []
     candidates: dict[str, int] = {}
+    for match in _REPOSITORY_ID_PATTERN.finditer(text):
+        repository_id = " ".join(match.group(0).split())
+        candidates[repository_id] = candidates.get(repository_id, 0) + 1
     for match in _NAME_PATTERN.finditer(text):
         phrase = " ".join(match.group(0).split())
         if len(phrase) < 3 or phrase.casefold() in _NAME_STOPWORDS:
@@ -304,13 +315,35 @@ def enrich_search_query(query: str, *, suffix: str = USAGE_QUERY_SUFFIX, subject
     正文拿不到任何可用的背景与方法；补上“用法/开发/扩展/文档”才可能命中官方文档与教程。
     `subject`（通常是项目名）只在检索词为空时用来兜底，避免把来源名重复拼进去。
     """
-    value = " ".join(str(query or "").split())[:200]
-    subject_text = " ".join(str(subject or "").split())[:80]
+    value = _strip_empty_search_intent(query)[:200]
+    subject_text = _strip_empty_search_intent(subject)[:80]
     if not value:
         return f"{subject_text} {suffix}".strip() if subject_text else ""
     if is_generic_query(value):
         return f"{value} {suffix}".strip()
     return value
+
+
+def _strip_empty_search_intent(value: object) -> str:
+    """移除“是什么/背景/用途”式空意图，防止它阻止具体查询的构造。"""
+    text = " ".join(str(value or "").split())
+    for intent in _EMPTY_SEARCH_INTENTS:
+        text = text.replace(intent, " ")
+    return " ".join(text.split())
+
+
+def build_search_plan_query(subject: object, need: object, preferred_source: object = "official_docs") -> str:
+    """把模型的结构化计划校验并组装成实际检索词；空泛计划返回空。"""
+    clean_subject = _strip_empty_search_intent(subject)[:120]
+    clean_need = _strip_empty_search_intent(need)[:120]
+    if not clean_subject or not clean_need or query_has_no_subject(clean_subject):
+        return ""
+    source_kind = str(preferred_source or "official_docs")
+    source_suffix = _SEARCH_SOURCE_SUFFIXES.get(source_kind, _SEARCH_SOURCE_SUFFIXES["official_docs"])
+    parts = [clean_subject, clean_need]
+    if source_suffix and source_suffix.casefold() not in clean_need.casefold():
+        parts.append(source_suffix)
+    return " ".join(parts)
 
 
 def query_has_no_subject(query: str) -> bool:
@@ -320,7 +353,7 @@ def query_has_no_subject(query: str) -> bool:
     这个判“补了也没用”（`Web 用法 开发 扩展 文档`、`OpenAI 用法 开发 扩展 文档` 只会搜到
     百科词条与公司官网）。带任何一个具体名称的检索词都不算无主体。
     """
-    tokens = [item.strip("，,、/（）()·") for item in str(query or "").casefold().split()]
+    tokens = [item.strip("，,、/（）()·") for item in _strip_empty_search_intent(query).casefold().split()]
     tokens = [item for item in tokens if item]
     return bool(tokens) and all(
         item in _NAME_STOPWORDS or item in _GENERIC_QUERY_WORDS for item in tokens
