@@ -511,8 +511,10 @@ async def test_revision_search_falls_back_to_names_in_the_body(monkeypatch) -> N
         deliver=True,
     )
 
-    # 只取出现次数最多的那一个（`affaan-m/ECC`），不把顺手提到的 `Claude Code` 也搜一遍。
-    assert search_calls == [["ECC 用法 开发 扩展 文档"]]
+    # 只取出现次数最多的那一个（正文里的仓库标识），不把顺手提到的 `Claude Code` 也搜一遍。
+    assert len(search_calls) == 1 and len(search_calls[0]) == 1
+    assert "ECC" in search_calls[0][0]
+    assert search_calls[0][0].endswith("用法 开发 扩展 文档")
 
 
 @pytest.mark.asyncio

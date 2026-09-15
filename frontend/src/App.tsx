@@ -813,10 +813,12 @@ function publishingStateLabel(state: string) {
   } as Record<string, string>)[state] || state;
 }
 
-function AgentWechatDraftPreparation({ draft }: { draft: Draft }) {
+function AgentWechatDraftPreparation({ draft, onAgentCommand }: { draft: Draft; onAgentCommand: (content: string) => Promise<void> }) {
   const [jobs, setJobs] = useState<WechatPublicationJob[]>([]);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  // 命令交给后台后，本卡片自己轮询到状态落地为止；否则点完按钮页面一直停在旧状态。
+  const [awaiting, setAwaiting] = useState(false);
   const selectedJob = jobs.find((job) => job.draft_id === draft.id) || null;
 
   const reload = useCallback(async () => {
@@ -826,35 +828,51 @@ function AgentWechatDraftPreparation({ draft }: { draft: Draft }) {
 
   useEffect(() => { void reload(); }, [reload]);
 
-  async function prepare() {
-    if (!window.confirm("将由 Agent 从当前文章已生成图片中决定封面和正文插图，并上传至公众号。不会发表，继续吗？")) return;
-    setBusy(true); setNotice("");
-    try {
-      await api.prepareWechatPublication(draft.id);
-      await reload();
-      setNotice("Agent 已决定并上传投递素材。请创建公众号草稿箱。 ");
-    } catch (error) { setNotice(error instanceof Error ? error.message : "Agent 未能准备投递素材"); }
-    finally { setBusy(false); }
-  }
+  useEffect(() => {
+    if (!awaiting) return;
+    let ticks = 0;
+    const timer = window.setInterval(() => {
+      ticks += 1;
+      // 兜底停止：最长 10 分钟，避免任务在别处结束后本页一直空转。
+      if (ticks > 300) { setAwaiting(false); return; }
+      void api.listWechatPublications().then((next) => {
+        setJobs(next);
+        const job = next.find((item) => item.draft_id === draft.id) || null;
+        if (job?.wechat_draft_media_id) {
+          setAwaiting(false);
+          setNotice("公众号草稿已创建（或原地更新），文章已进入去重记录。 ");
+        } else if (job?.state === "draft_failed") {
+          setAwaiting(false);
+          setNotice(job.error_message || "投递失败：详见对话里的汇报。");
+        }
+      }).catch(() => { /* 轮询失败不打断页面，下一次继续。 */ });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [awaiting, draft.id]);
 
-  async function createDraft() {
-    if (!selectedJob || !window.confirm("将当前文章创建到微信公众号草稿箱。草稿箱创建成功即为本账号流程终点，并写入去重记录。继续吗？")) return;
+  async function requestDraftbox() {
+    const updating = Boolean(selectedJob?.wechat_draft_media_id);
+    const question = updating
+      ? "将按当前正文与配图原地更新公众号草稿箱里的这篇草稿（不会新建重复草稿、不会发表）。继续吗？"
+      : "将由 Agent 决定封面与正文插图、上传素材并创建微信公众号草稿箱。创建成功即为本账号流程终点，不会发表。继续吗？";
+    if (!window.confirm(question)) return;
     setBusy(true); setNotice("");
     try {
-      await api.createWechatDraft(selectedJob.id);
-      await reload();
-      setNotice("公众号草稿已创建，文章已进入去重记录。 ");
-    } catch (error) { setNotice(error instanceof Error ? error.message : "公众号草稿创建失败"); }
+      // 与其它按钮一致：发一条对话命令，由后台执行并在对话/生成记录里汇报，界面不再直连专用接口。
+      await onAgentCommand(`${updating ? "更新公众号草稿箱" : "创建公众号草稿箱"}｜draft=${draft.id}`);
+      setAwaiting(true);
+      setNotice("已交给 Agent 执行，进度可在对话与生成记录里看到；本页会自动刷新。");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "命令未能发出"); }
     finally { setBusy(false); }
   }
 
   if (draft.status === "draftbox_created") {
-    return <section className="illustration-record"><div className="panel-heading"><b>公众号草稿箱</b><span>已完成</span></div><p className="muted">Agent 已完成素材选择，草稿已进入公众号草稿箱并写入来源去重记录。</p></section>;
+    return <section className="illustration-record draftbox-preparation"><div className="panel-heading"><b>公众号草稿箱</b><span>已完成</span></div><p className="muted">Agent 已完成素材选择，草稿已进入公众号草稿箱并写入来源去重记录。</p></section>;
   }
   if (draft.status !== "ready_to_publish") {
-    return <section className="illustration-record"><div className="panel-heading"><b>公众号草稿箱</b><span>等待审核</span></div><p className="muted">审核通过后，Agent 会决定封面和正文插图，再创建公众号草稿箱。</p></section>;
+    return <section className="illustration-record draftbox-preparation"><div className="panel-heading"><b>公众号草稿箱</b><span>等待审核</span></div><p className="muted">审核通过后，Agent 会决定封面和正文插图，再创建公众号草稿箱。</p></section>;
   }
-  return <section className="illustration-record"><div className="panel-heading"><b>准备公众号草稿</b><span>{selectedJob ? publishingStateLabel(selectedJob.state) : "等待 Agent 决定素材"}</span></div><p className="muted">封面和正文插图由 Agent 根据文章与已生成图片决定，无需逐张勾选。草稿箱创建成功即为本账号流程终点。</p>{selectedJob && <p className="muted">已选 1 张封面图、{selectedJob.inline_asset_ids.length} 张正文插图。</p>}<div className="publish-actions publish-flow"><button className="ghost-button" disabled={busy || Boolean(selectedJob?.cover_media_id)} onClick={() => void prepare()}>1. Agent 决定并上传素材</button><button className="primary-button" disabled={busy || !selectedJob || Boolean(selectedJob.wechat_draft_media_id)} onClick={() => void createDraft()}>2. 创建公众号草稿箱</button></div>{notice && <p className="notice">{notice}</p>}</section>;
+  return <section className="illustration-record draftbox-preparation"><div className="panel-heading"><b>准备公众号草稿</b><span>{awaiting ? "Agent 处理中" : selectedJob ? publishingStateLabel(selectedJob.state) : "等待 Agent 决定素材"}</span></div><p className="muted">封面和正文插图由 Agent 根据文章与已生成图片自动决定并上传，无需逐张勾选；草稿箱创建成功即为本账号流程终点，远端已有草稿时原地更新、不会留下重复草稿。</p>{selectedJob && <p className="muted">已选 1 张封面图、{selectedJob.inline_asset_ids.length} 张正文插图{selectedJob.wechat_draft_media_id ? "；远端草稿已创建。" : "。"}</p>}{selectedJob?.state === "draft_failed" && selectedJob.error_message && <p className="notice">上次投递失败：{selectedJob.error_message}；再点一次按钮即可重投。</p>}<div className="publish-actions"><button className="primary-button" disabled={busy || awaiting} onClick={() => void requestDraftbox()}>{awaiting ? <><LoaderCircle className="spin" size={16} /> 处理中</> : selectedJob?.wechat_draft_media_id ? <><RefreshCw size={16} /> 更新公众号草稿箱</> : <><Send size={16} /> 创建公众号草稿箱</>}</button></div>{notice && <p className="notice">{notice}</p>}</section>;
 }
 
 const WechatDraftPreparation = AgentWechatDraftPreparation;
@@ -919,8 +937,10 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
   const [remoteDraftTotal, setRemoteDraftTotal] = useState(0);
   const [busy, setBusy] = useState(false);
   const [reviewNotice, setReviewNotice] = useState("");
-  const [deliveryNotice, setDeliveryNotice] = useState("");
   const [remoteDraftsNotice, setRemoteDraftsNotice] = useState("");
+  // 界面按钮现在都走对话命令：只有"有任务在跑"这个信号才能让本页自己刷新，
+  // 否则点完按钮页面会一直停在旧状态（真实反馈：按钮像没反应）。
+  const [activeRuns, setActiveRuns] = useState(0);
   const selectedDraft = drafts.find((draft) => draft.id === selectedDraftId) || null;
   const selectedJob = jobs.find((job) => job.draft_id === selectedDraftId) || null;
   const canRetryDraftboxDelivery = Boolean(
@@ -928,6 +948,7 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
     && (selectedJob?.state === "draft_failed" || autoReviews.some((item) => item.status === "delivery_failed")),
   );
   const reviewInProgress = autoReviews.some((item) => ["queued", "running"].includes(item.status));
+  const taskInProgress = reviewInProgress || activeRuns > 0;
 
   const reload = useCallback(async () => {
     try {
@@ -936,7 +957,7 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
       ]);
       setDrafts(nextDrafts); setJobs(nextJobs); setPreferences(preferences);
       if (!selectedDraftId) setSelectedDraftId(nextJobs[0]?.draft_id || nextDrafts[0]?.id || "");
-    } catch (error) { setDeliveryNotice(error instanceof Error ? error.message : "加载草稿箱投递记录失败"); }
+    } catch (error) { setReviewNotice(error instanceof Error ? error.message : "加载草稿箱投递记录失败"); }
   }, [selectedDraftId]);
 
   useEffect(() => { void reload(); }, [reload]);
@@ -946,24 +967,40 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
       .then(([nextReviews, nextIllustrations]) => { setAutoReviews(nextReviews); setIllustrations(nextIllustrations); })
       .catch((error: Error) => setReviewNotice(error.message));
   }, [selectedDraftId]);
+  // 回到本页时先问一次"有没有后台任务在跑"：按钮发完命令会跳到对话页，中途返回本页时
+  // 只有先发现这个信号，下面的轮询才会启动（否则页面停在旧状态）。
   useEffect(() => {
-    if (!selectedDraftId || !reviewInProgress) return;
+    void api.listGenerationChatAgentRuns()
+      .then((runs) => setActiveRuns(runs.filter((run) => run.status === "running").length))
+      .catch(() => { /* 取不到就当作没有在跑，不影响手动刷新。 */ });
+  }, [selectedDraftId]);
+
+  useEffect(() => {
+    if (!selectedDraftId || !taskInProgress) return;
     const timer = window.setInterval(() => {
       void Promise.all([
-        api.listDrafts(), api.listWechatPublications(), api.listAutoReviews(selectedDraftId), api.listDraftIllustrations(selectedDraftId),
-      ]).then(([nextDrafts, nextJobs, nextReviews, nextIllustrations]) => {
+        api.listDrafts(), api.listWechatPublications(), api.listAutoReviews(selectedDraftId),
+        api.listDraftIllustrations(selectedDraftId), api.listGenerationChatAgentRuns(),
+      ]).then(([nextDrafts, nextJobs, nextReviews, nextIllustrations, nextRuns]) => {
         setDrafts(nextDrafts); setJobs(nextJobs); setAutoReviews(nextReviews); setIllustrations(nextIllustrations);
+        setActiveRuns(nextRuns.filter((run) => run.status === "running").length);
       }).catch((error: Error) => setReviewNotice(error.message));
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [reviewInProgress, selectedDraftId]);
+  }, [taskInProgress, selectedDraftId]);
+
+  // 本页按钮发出的命令：发完立刻开始轮询，不必等下一次刷新才发现有任务在跑。
+  async function commandFromPage(content: string) {
+    await onAgentCommand(content);
+    setActiveRuns((count) => Math.max(count, 1));
+  }
 
   async function runReview(deliver: boolean) {
     if (!selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)) return;
-    setReviewNotice(""); setDeliveryNotice("");
+    setReviewNotice("");
     // 审核同样作为命令交给 Agent：对话里出现命令消息，执行进度在生成记录可见。
     // “仅运行审核”发的是**不改稿**命令（review_draft）：文字模型只出意见，正文一个字不动。
-    await onAgentCommand(
+    await commandFromPage(
       deliver ? `运行自动审核并创建公众号草稿｜draft=${selectedDraft.id}` : `仅运行审核｜draft=${selectedDraft.id}`
     );
   }
@@ -972,8 +1009,8 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
     if (!selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)) return;
     // 与“仅运行审核”配套：不重新审核，直接按已有的审核意见改一稿（没有审核记录时 Agent 会说明）。
     if (!window.confirm("将按最近一次审核的意见改写正文并覆盖为新版本（不重新审核、不投递）。继续吗？")) return;
-    setReviewNotice(""); setDeliveryNotice("");
-    await onAgentCommand(`按审核意见改稿｜draft=${selectedDraft.id}`);
+    setReviewNotice("");
+    await commandFromPage(`按审核意见改稿｜draft=${selectedDraft.id}`);
   }
 
   async function syncRemoteDrafts() {
@@ -986,27 +1023,14 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
     finally { setBusy(false); }
   }
 
-  async function retryDraftboxDelivery() {
-    if (!selectedDraft || !canRetryDraftboxDelivery) return;
-    if (!window.confirm("将复用当前已审核正文和现有图片重新投递公众号草稿箱，不会重新生成图片或再次审核。继续吗？")) return;
-    setBusy(true); setDeliveryNotice("");
-    try {
-      await api.retryWechatDraftDelivery(selectedDraft.id);
-      await reload();
-      setDeliveryNotice("草稿箱已重新投递成功，文章已进入去重记录。");
-    } catch (error) {
-      setDeliveryNotice(error instanceof Error ? error.message : "公众号草稿重新投递失败");
-    } finally { setBusy(false); }
-  }
-
   return <>
     <header className="page-header"><div><p className="eyebrow">微信公众号</p><h1>草稿箱投递</h1><p>个人账号以公众号草稿箱创建成功为最终节点；成功后来源会进入去重记录。</p></div><button className="ghost-button" disabled={busy} onClick={() => void reload()}><RefreshCw size={16} /> 刷新本地状态</button></header>
     <div className="publish-layout">
       <aside className="publish-list"><div className="panel-heading"><h2>文章投递</h2><span>{drafts.length}</span></div>{drafts.map((draft) => { const deliveryJob = jobs.find((job) => job.draft_id === draft.id); const deliveryFailed = deliveryJob?.state === "draft_failed"; return <button className={selectedDraftId === draft.id ? "draft-item selected" : "draft-item"} key={draft.id} onClick={() => setSelectedDraftId(draft.id)}><span className="status-dot" data-status={deliveryFailed ? "failed" : draft.status} /><div><b>{draft.title_options[0]}</b><small>{deliveryFailed ? `投递失败 · ${new Date(deliveryJob.updated_at).toLocaleString()}` : statusLabel(draft.status)}</small></div></button>; })}</aside>
-      <section className="publish-editor"><h2>自动审核</h2><p className="muted">审核会一次列出完整问题并给出评分。“仅运行审核”只出意见、不改稿，也绝不创建公众号草稿；“审核并投递草稿箱”才会在有可执行意见时先按意见改稿一轮再复审。</p><section className="illustration-record"><div className="panel-heading"><b>审核记录</b><span>{autoReviews.length}</span></div>{autoReviews.length ? autoReviews.map((item, index) => <article className="review-result" key={item.id}><b>{index === 0 ? "最近结果 · " : "历史记录 · "}{autoReviewStatusLabel(item.status)}</b><AutoReviewFeedback item={item} />{item.error_message && <p>{item.error_message}</p>}<small>{new Date(item.created_at).toLocaleString()}</small></article>) : <p className="muted">尚未运行自动审核。</p>}{canRetryDraftboxDelivery ? <button className="primary-button" disabled={busy} onClick={() => void retryDraftboxDelivery()}><RefreshCw size={16} /> 重新投递草稿箱</button> : <div className="publish-actions publish-flow"><button className="ghost-button" disabled={busy || reviewInProgress || !selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)} onClick={() => void runReview(false)}>{reviewInProgress ? <><LoaderCircle className="spin" size={16} /> 审核进行中</> : "仅运行审核（只出意见，不改稿）"}</button><button className="primary-button" disabled={busy || reviewInProgress || !selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)} onClick={() => void runReview(true)}>审核并投递草稿箱</button></div>}{(selectedDraft?.status === "ready_to_publish" || selectedDraft?.status === "draftbox_created") && <div className="publish-actions"><button className="ghost-button" disabled={busy} onClick={() => { if (window.confirm("将作废当前投递配图选择，按“真实截图优先”重新选择；已投递的公众号草稿会原地覆盖。继续吗？")) void onAgentCommand(`重新选择配图｜draft=${selectedDraft.id}`); }}><RefreshCw size={16} /> 重新选择配图</button></div>}</section>{selectedDraft && <WechatDraftPreparation key={selectedDraft.id} draft={selectedDraft} />}{reviewNotice && <p className="notice">{reviewNotice}</p>}</section>
+      <section className="publish-editor"><h2>自动审核</h2><p className="muted">审核会一次列出完整问题并给出评分。“仅运行审核”只出意见、不改稿，也绝不创建公众号草稿；“审核并投递草稿箱”才会在有可执行意见时先按意见改稿一轮再复审。</p><section className="illustration-record"><div className="panel-heading"><b>审核记录</b><span>{autoReviews.length}</span></div>{autoReviews.length ? autoReviews.map((item, index) => <article className="review-result" key={item.id}><b>{index === 0 ? "最近结果 · " : "历史记录 · "}{autoReviewStatusLabel(item.status)}</b><AutoReviewFeedback item={item} />{item.error_message && <p>{item.error_message}</p>}<small>{new Date(item.created_at).toLocaleString()}</small></article>) : <p className="muted">尚未运行自动审核。</p>}{canRetryDraftboxDelivery && <p className="notice">上次投递失败（正文与配图都已保留）：在下方“准备公众号草稿”再点一次按钮即可重投，不会重新审核或重新生成图片。</p>}<div className="publish-actions publish-flow"><button className="ghost-button" disabled={busy || reviewInProgress || !selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)} onClick={() => void runReview(false)}>{reviewInProgress ? <><LoaderCircle className="spin" size={16} /> 审核进行中</> : "仅运行审核（只出意见，不改稿）"}</button><button className="ghost-button" disabled={busy || reviewInProgress || !selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)} onClick={() => void reviseFromReview()}>仅根据意见改稿</button><button className="primary-button" disabled={busy || reviewInProgress || !selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)} onClick={() => void runReview(true)}>审核并投递草稿箱</button></div>{(selectedDraft?.status === "ready_to_publish" || selectedDraft?.status === "draftbox_created") && <div className="publish-actions"><button className="ghost-button" disabled={busy} onClick={() => { if (window.confirm("将作废当前投递配图选择，按“真实截图优先”重新选择；已投递的公众号草稿会原地覆盖。继续吗？")) void commandFromPage(`重新选择配图｜draft=${selectedDraft.id}`); }}><RefreshCw size={16} /> 重新选择配图</button></div>}</section>{selectedDraft && <WechatDraftPreparation key={selectedDraft.id} draft={selectedDraft} onAgentCommand={commandFromPage} />}{reviewNotice && <p className="notice">{reviewNotice}</p>}</section>
       <section className="publication-preview"><div className="panel-heading"><h2>草稿预览</h2><span>{selectedJob ? publishingStateLabel(selectedJob.state) : selectedDraft ? statusLabel(selectedDraft.status) : "未选择"}</span></div>{selectedDraft ? <PublicationArticlePreview draft={selectedDraft} job={selectedJob} illustrations={illustrations} preferences={preferences} /> : <div className="empty compact">请选择文章</div>}</section>
     </div>
-    {(selectedJob || canRetryDraftboxDelivery || deliveryNotice) && <section className="remote-status-panel draftbox-status-panel"><div className="panel-heading"><h2>当前草稿箱投递</h2><span>{selectedJob ? publishingStateLabel(selectedJob.state) : "投递失败"}</span></div>{selectedJob && <p className="muted">投递：{new Date(selectedJob.created_at).toLocaleString()}；更新：{new Date(selectedJob.updated_at).toLocaleString()}</p>}{selectedJob?.wechat_draft_media_id && <p className="muted">公众号草稿已创建，流程已完成并进入去重记录。</p>}{selectedJob?.error_message && <p className="notice">{selectedJob.error_message}</p>}{deliveryNotice && <p className="notice">{deliveryNotice}</p>}{canRetryDraftboxDelivery && <p className="muted">审核已通过，但草稿箱投递失败；可在上方点击“重新投递草稿箱”。该操作会复用审核前已确定的图片，不会重新选择、审核、生成文案或生成图片。</p>} {!canRetryDraftboxDelivery && <p className="muted">重新投递会复用审核前已确定的图片，不会重新审核、生成文案或生成图片。</p>}</section>}
+    {(selectedJob || canRetryDraftboxDelivery) && <section className="remote-status-panel draftbox-status-panel"><div className="panel-heading"><h2>当前草稿箱投递</h2><span>{selectedJob ? publishingStateLabel(selectedJob.state) : "投递失败"}</span></div>{selectedJob && <p className="muted">投递：{new Date(selectedJob.created_at).toLocaleString()}；更新：{new Date(selectedJob.updated_at).toLocaleString()}</p>}{selectedJob?.wechat_draft_media_id && <p className="muted">公众号草稿已创建，流程已完成并进入去重记录。</p>}{selectedJob?.error_message && <p className="notice">{selectedJob.error_message}</p>}{canRetryDraftboxDelivery && <p className="muted">审核已通过，但草稿箱投递失败；在“准备公众号草稿”再点一次按钮即可重投。该操作会复用已确定的图片，不会重新选择、审核、生成文案或生成图片。</p>} {!canRetryDraftboxDelivery && <p className="muted">重投会复用已确定的图片，不会重新审核、生成文案或生成图片。</p>}</section>}
     <section className="remote-status-panel"><div className="panel-heading"><h2>公众号草稿箱</h2><span>只读同步</span></div><p className="muted">同步只读取草稿箱，不会创建、修改或发表文章。</p><button className="ghost-button" disabled={busy} onClick={() => void syncRemoteDrafts()}><RefreshCw size={15} /> 同步草稿箱</button>{remoteDraftsNotice && <p className="notice">{remoteDraftsNotice}</p>}{remoteDrafts !== null && <div className="remote-status-grid"><article><b>草稿箱（{remoteDraftTotal}）</b>{remoteDrafts.length ? remoteDrafts.map((item) => <div className="remote-item" key={item.media_id}><strong>{item.title}</strong><span>状态：草稿箱中</span><small>创建：{item.created_at}；更新：{item.updated_at}</small></div>) : <p className="muted">草稿箱为空</p>}</article></div>}</section>
   </>;
 }

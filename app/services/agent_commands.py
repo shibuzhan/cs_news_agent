@@ -64,6 +64,15 @@ _PREFIXES: tuple[tuple[str, str, str], ...] = (
     ("素材库盘点", "list_wechat_materials", "盘点素材库可清理项"),
     ("重新选择配图", "reselect_publication_assets", "重新选择投递配图"),
     ("重选配图", "reselect_publication_assets", "重新选择投递配图"),
+    # 发布页「创建 / 更新公众号草稿箱」按钮：素材准备 + 创建（或原地覆盖）远端草稿由同一个后台任务完成，
+    # 因此不再需要界面上分两步、也不再直连专用接口（真实反馈：点按钮对话里什么都没发生）。
+    ("创建公众号草稿箱", "publish_to_wechat_draft", "创建公众号草稿箱"),
+    ("创建公众号草稿", "publish_to_wechat_draft", "创建公众号草稿箱"),
+    ("更新公众号草稿箱", "publish_to_wechat_draft", "更新公众号草稿箱"),
+    # 只准备/上传素材、**不**创建远端草稿：界面不放按钮，保留为对话里的隐藏能力
+    # （想先看看选了哪几张图时用得上）。
+    ("准备投递素材", "plan_publication_assets", "准备投递素材"),
+    ("上传投递素材", "plan_publication_assets", "准备投递素材"),
     ("投递到公众号草稿", "publish_to_wechat_draft", "投递到公众号草稿箱"),
     ("更新公众号草稿", "publish_to_wechat_draft", "更新公众号草稿"),
     ("重新投递", "publish_to_wechat_draft", "重新投递到公众号草稿箱"),

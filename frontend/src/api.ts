@@ -108,6 +108,8 @@ export const api = {
   listWechatPublications: () => request<WechatPublicationJob[]>("/wechat/publications"),
   getPublicationPreferences: () => request<PublicationPreferences>("/wechat/publication-preferences"),
   listRemoteWechatDrafts: () => request<WechatRemoteList<WechatRemoteDraft>>("/wechat/remote-drafts"),
+  // 下面三个投递接口界面**不再调用**：发布页按钮已统一改走对话命令（创建/更新公众号草稿箱），
+  // 由后台任务完成“准备素材 + 创建或原地覆盖远端草稿”并在对话里汇报。保留给脚本与运维排障使用。
   prepareWechatPublication: (id: string) =>
     request<WechatPublicationJob>(`/wechat/publications/${id}/prepare`, { method: "POST" }),
   createWechatDraft: (jobId: string) =>

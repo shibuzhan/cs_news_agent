@@ -112,6 +112,51 @@ def test_action_tools_are_registered_for_the_session() -> None:
     }
 
 
+def test_draftbox_buttons_send_commands_instead_of_calling_rest() -> None:
+    """发布页「创建 / 更新公众号草稿箱」必须是对话命令，而不是直连专用接口。
+
+    真实问题：这两个按钮（旧文案“1. Agent 决定并上传素材”“2. 创建公众号草稿箱”）直接 POST
+    专用接口，同步跑完选图（含视觉模型调用）与上传；对话里没有消息、没有汇报，失败只有一行红字。
+    现在合成一个按钮：素材准备与远端草稿创建由同一个后台任务完成并在对话里汇报。
+    """
+    created = parse_agent_command("创建公众号草稿箱｜draft=6713431f-fc24-4161-9bda-37faa0083f9e")
+
+    assert created is not None
+    assert created.name == "publish_to_wechat_draft"
+    assert created.draft_id == "6713431f-fc24-4161-9bda-37faa0083f9e"
+    # 已投递过的文章再点就是“更新”，命令不同但落到同一个工具（原地覆盖、不产生重复草稿）。
+    assert parse_agent_command("更新公众号草稿箱｜draft=abc12345").name == "publish_to_wechat_draft"
+    assert parse_agent_command("创建公众号草稿").name == "publish_to_wechat_draft"
+
+
+def test_prepare_materials_stays_a_hidden_capability() -> None:
+    """只准备/上传素材、不创建远端草稿：界面不放按钮，但对话里说了要能命中。"""
+    parsed = parse_agent_command("准备投递素材｜draft=abc12345")
+
+    assert parsed is not None
+    assert parsed.name == "plan_publication_assets"
+    assert parse_agent_command("上传投递素材").name == "plan_publication_assets"
+
+
+def test_publishing_page_no_longer_calls_the_wechat_rest_endpoints() -> None:
+    """防回退：发布页按钮只能发命令，不能再直连投递专用接口。
+
+    直连会同时丢掉“对话可见”和“后台执行”：请求同步跑完选图与上传，失败只在页面上一行红字，
+    用户在对话与生成记录里什么都看不到（这正是这次改动的起因）。
+    """
+    from pathlib import Path
+
+    source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    for retired in ("api.prepareWechatPublication", "api.createWechatDraft", "api.retryWechatDraftDelivery"):
+        assert retired not in source, retired
+    # 新按钮：合成一个命令入口，创建与更新共用同一个工具。
+    assert '"创建公众号草稿箱"' in source and '"更新公众号草稿箱"' in source
+    assert "｜draft=${draft.id}" in source
+    # 点了按钮页面要自己刷新：轮询条件必须包含“有后台任务在跑”，而不能只看审核队列。
+    assert "taskInProgress" in source and "listGenerationChatAgentRuns" in source
+
+
 def test_action_tools_reject_foreign_draft(monkeypatch: pytest.MonkeyPatch) -> None:
     """只能操作本会话正在使用的草稿：从未被本会话碰过的草稿仍然拒绝。"""
     from app.agent_tools import draft_actions
