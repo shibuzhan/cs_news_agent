@@ -85,26 +85,10 @@ def revision_issues(rule_report: dict, model_report: dict) -> list[str]:
 
 
 def _search_evidence_section(search_evidence: list[dict] | None) -> str:
-    """改稿提示词里的联网补充段落；没有资料时返回空串，保持原提示词不变。"""
-    if not search_evidence:
-        return ""
-    lines: list[str] = []
-    for entry in search_evidence[:2]:
-        if not isinstance(entry, dict):
-            continue
-        title = " ".join(str(entry.get("title") or "").split())[:120]
-        content = " ".join(str(entry.get("content") or "").split())[:1200]
-        if not content:
-            continue
-        lines.append(f"- {title}：{content}" if title else f"- {content}")
-    if not lines:
-        return ""
-    return (
-        "联网补充资料（只能用于为正文里的外部名称与背景补一句准确说明，不得用于编造项目事实、"
-        "不得据此改写来源事实，也不要把正文写成安装教程）：\n"
-        + "\n".join(lines)
-        + "\n"
-    )
+    """改稿提示词里的联网补充段落（与生成路径共用同一份规则文本）。"""
+    from app.services.search_evidence import format_search_evidence_section
+
+    return format_search_evidence_section(search_evidence)
 
 
 class AutoRevisionTool:
@@ -185,6 +169,14 @@ class AutoRevisionTool:
             "但**不许换个说法重复已说过的内容**凑字数。写出来偏短或偏长都不会触发重写，服务端照常保存。"
             "**同一件事全文只许说一次**：审核点名的重复句要真的删掉（不是改写一遍留着），"
             "自己也要检查有没有“先说 A、后又说 A 的另一种说法”这种绕圈。"
+            # 实测（2026-09-15）：改稿只删被点名的句子，同一模板在别处继续存在，复审又报 5 条重复。
+            # 因此这里点名“指代式复述”，并明确允许删句与段内改写。
+            "**逐句清掉“指代式复述”**：凡是以“这个路径/这个目录/这个样例/这类做法/它/这些方向”开头、"
+            "内容只是把上一句已经列举过的东西再说一遍的句子，**直接删掉**（这是最常见的重复形态）；"
+            "同一段里先说 A 再用另一句话解释 A，也删掉后一句。"
+            "发现同类问题的**未点名句子**时一并处理，不要只改被点名的那些。"
+            "**允许删句、允许在同一段内改写、允许合并句子**——只要事实、来源字段与段落结构不变；"
+            "不要把段落数目改掉，也不要顺手把整篇重写一遍。"
             "应自然覆盖背景、技术或过程、价值与边界、后续观察，"
             "但不要在正文写出这些名称、显式段落标题、编号、原文标题或链接。"
             "body 必须为纯文本，不用 Markdown、HTML。每段段首缩进和原文标题尾注由服务端处理。"

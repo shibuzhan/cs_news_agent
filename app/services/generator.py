@@ -27,6 +27,7 @@ from app.services.plain_text import (
     normalize_wechat_description,
     select_evidence_text,
 )
+from app.services.search_evidence import format_search_evidence_section
 from app.services.term_policy import terminology_guidance
 from app.tools.search_tools import ExaMcpSearchError, ExaMcpSearchTool
 
@@ -39,6 +40,10 @@ _SOURCE_WRITING_SKILLS = {
     SourceKind.HACKER_NEWS: "hacker-news-content-writing",
     SourceKind.RSS: "rss-content-writing",
 }
+
+# 材料明显短于目标字数时触发一次联网补充（软阈值，NATURAL_ARTICLE_MIN_CHARS）。
+# 0.9 的含义：差不多能写够就不打扰外部服务；差得明显才补。
+SEARCH_TRIGGER_RATIO = 0.9
 
 
 class DraftGenerator(Protocol):
@@ -120,6 +125,13 @@ def _natural_article_instruction(target_low: int, target_high: int) -> str:
         "（“这些示例共同说明……”“这也说明……”“这些插件包让仓库的示例类型更完整”）；"
         "**同一件事全文只许说一次**：换一个说法把同一层意思再说一遍（例如先说“这两个市场文件放在同一层目录”，"
         "后又说“它们都服务于插件查找、只是登录场景不同”）同样算重复，写第二遍时必须删掉其中一句。"
+        # 实测（2026-09-15，50 → 60 分那两轮）：模型学会了更隐蔽的重复——**先用清单句列举，
+        # 再补一句以“这个/这些/它”开头的句子把同一批内容复述一遍**。审核每轮都按 major 扣分，
+        # 而模型不认为这是重复，因为它换了句式和主语。这里点名这个句式。
+        "**特别注意“指代式复述”**：用“这个路径/这个目录/这个样例/这类做法/它/这些方向”开头的句子，"
+        "如果它的内容就是上一句（或本段前面）已经说过的列举，**一律删掉**——"
+        "例如“入口文件在 .codex-plugin/ 下、插件目录在 plugins/ 下”之后**不要再**写"
+        "“这个路径把插件入口收进 .codex-plugin 目录”；列举完直接进入下一件事，不要回头总结。"
         "每个要点只讲一次：列举之后直接给判断或结论，不要回头复述；段落结尾不要写只为收尾而存在的句子，"
         "如果一段的最后一句能删掉而信息不减，就删掉它。"
         "**写完自己过一遍**：逐段问“这一段有没有哪句是前面已经说过的？”——有就删掉，不要换个说法留着。"
@@ -343,7 +355,7 @@ class ResilientDraftGenerator:
 
 
 class OpenAICompatibleDraftGenerator:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, search_tool: ExaMcpSearchTool | None = None):
         selected_model = model_for(settings, "content")
         selected_api_key = api_key_for(settings, "content")
         if not selected_api_key or not selected_model:
@@ -351,6 +363,8 @@ class OpenAICompatibleDraftGenerator:
         self.model = selected_model
         self.settings = settings
         self.writer = RestrictedContentTaskAgent(settings, "content")
+        # 材料不足时用它补一次背景与用途（与改稿路径同一个工具）。
+        self.search_tool = search_tool or ExaMcpSearchTool(settings)
         # 由 ContentPipeline 在持有数据库会话后注入；直接离线调用仍可读取 style.md。
         self.repository = None
 
@@ -368,6 +382,40 @@ class OpenAICompatibleDraftGenerator:
             )
             return ""
 
+    def _supplemental_search(self, item: NormalizedItem, evidence_text: str) -> list[dict]:
+        """材料不足时联网补一次背景与用途——**不允许再用重复凑字数**。
+
+        真实链条（2026-09-15）：只给了 1277 字 README、要写 1600–2200 字，模型没有外部材料，
+        只能靠“先列举、再用『这个/这些』总结一遍”填充，审核连着两轮报重复（50 分 → 60 分）。
+        用户口径：“材料不足时调用搜索工具补充啊，搜索背景、应用什么的”。
+
+        触发条件（确定性、不额外调用模型）：可用材料明显短于目标字数。检索词用项目名，
+        与改稿路径的兜底词口径一致（`extract_name_queries`）。
+        """
+        if not (self.settings.exa_mcp_enabled and getattr(self.settings, "revision_search_enabled", True)):
+            return []
+        # 目标中段（不是上限）：材料只要接近“写够所需的量”就不必打扰外部服务。
+        target_mid = (self.settings.draft_body_min_chars + self.settings.draft_body_max_chars) // 2
+        if len(evidence_text) >= target_mid * SEARCH_TRIGGER_RATIO:
+            return []
+        queries: list[str] = []
+        name = " ".join(str(item.title or "").split())[:80]
+        if name:
+            # 项目名 + 用途：一次检索就能拿到“这是什么/用来干什么”的背景材料。
+            queries.append(f"{name} 是什么 背景 用途")
+        if not queries:
+            return []
+        try:
+            found = self.search_tool.search(queries[:2])
+        except ExaMcpSearchError as exc:
+            logger.warning("draft_generation_supplemental_search_skipped error_type=%s", type(exc).__name__)
+            return []
+        logger.info(
+            "draft_generation_supplemental_search source=%s external_id=%s evidence_chars=%s target_mid=%s entries=%s",
+            item.source_kind.value, item.external_id, len(evidence_text), target_mid, len(found),
+        )
+        return found
+
     def generate(self, item: NormalizedItem) -> DraftContent:
         logger.info(
             "draft_generation_started source=%s external_id=%s mode=baseline model_category=content model=%s",
@@ -375,12 +423,14 @@ class OpenAICompatibleDraftGenerator:
             item.external_id,
             self.model,
         )
+        evidence_text = build_evidence(
+            self.settings, item.content, self.settings.llm_evidence_max_chars, item.external_id
+        )
+        supplemental = self._supplemental_search(item, evidence_text)
         facts = {
             "title": item.title,
             "summary": item.summary,
-            "content": build_evidence(
-                self.settings, item.content, self.settings.llm_evidence_max_chars, item.external_id
-            ),
+            "content": evidence_text,
             "category": item.category.value,
             "source_name": item.source_name,
             "source_url": str(item.url),
@@ -397,7 +447,9 @@ class OpenAICompatibleDraftGenerator:
             + "来源专用写作规则：\n"
             + _source_writing_skill(item)
             + "\n"
-            "body 中只能是纯文本：不得使用 Markdown、HTML、列表符号、图片链接、原文标题或原文链接；来源标题由服务端统一添加，链接由公众号“阅读原文”承载。"
+            # 材料不足时补来的联网资料：允许用来交代“这是什么、为什么值得看”，但不得改写来源事实。
+            + format_search_evidence_section(supplemental)
+            + "body 中只能是纯文本：不得使用 Markdown、HTML、列表符号、图片链接、原文标题或原文链接；来源标题由服务端统一添加，链接由公众号“阅读原文”承载。"
             "summary_cn 是供公众号 description 使用的一句话导语，30 到 60 个中文字符、不得换行、不得夸大或虚构；"
             "用分享者的口吻说清“这是什么、为什么值得点开”，不要写成新闻通稿式的一句话概括。"
             "title_options 同样用分享者口吻（可以有判断或悬念），但每一项都必须完整包含项目名或研究主体名。"
