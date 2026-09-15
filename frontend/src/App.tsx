@@ -64,11 +64,30 @@ function reviewFeedbackItems(item: AutoReviewRun) {
     .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index);
 }
 
+function reviewVersionNote(item: AutoReviewRun) {
+  // “审的是哪一版、这一版怎么来的、比上次高还是低”——没有这句话，分数跳变会被误读成“越改越差”。
+  const parts: string[] = [];
+  if (item.reviewed_version) {
+    parts.push(`审的是第 ${item.reviewed_version} 版${item.version_origin_label ? `（${item.version_origin_label}）` : ""}`);
+  }
+  if (item.reviewed_version && item.reviewed_current_version === false) {
+    parts.push("当前正文已不是这一版");
+  }
+  if (typeof item.score_delta === "number" && typeof item.previous_score === "number") {
+    parts.push(`比上次${item.score_delta >= 0 ? "高" : "低"} ${Math.abs(item.score_delta)} 分（上次 ${item.previous_score}）`);
+  } else if (typeof item.previous_score !== "number") {
+    parts.push("这是这篇的第一次审核");
+  }
+  return parts.join(" · ");
+}
+
 function AutoReviewFeedback({ item }: { item: AutoReviewRun }) {
   const summary = reviewFeedbackText(item.model_report.summary);
   const feedback = reviewFeedbackItems(item);
+  const versionNote = reviewVersionNote(item);
   return <>
     {typeof item.model_report.score === "number" && <p>审核评分：{item.model_report.score}/{item.model_report.threshold || 100}{item.model_report.blocking_issue_count ? "；存在必须修复的问题" : ""}</p>}
+    {versionNote && <p className="muted">{versionNote}</p>}
     {summary && <p>{summary}</p>}
     {feedback.length > 0 && <ul>{feedback.map((issue, index) => <li key={`${item.id}-${index}`}>{issue}</li>)}</ul>}
   </>;
@@ -449,16 +468,34 @@ function shortRunStatus(run: AgentRun | undefined): string {
   return RUN_INTENT_LABELS[run.intent] || "已完成处理";
 }
 
-function MessageBubble({ message, execution, onConfirmPlan }: { message: ChatMessage; execution?: AgentRun; onConfirmPlan: (tool: string, planId: string) => Promise<void> }) {
+// 界面按钮发送的是协议命令（带 draft id，Agent 才能确定性地定位稿件），
+// 但**用户看到的应该是稿件标题**：这里把 id 换成标题，取不到标题时退化成“这篇文章”。
+const AGENT_COMMAND_PATTERN = /^(.+?)｜draft=([0-9a-fA-F-]{8,})$/;
+
+function commandDraftId(content: string): string | null {
+  const matched = AGENT_COMMAND_PATTERN.exec(content.trim());
+  return matched ? matched[2] : null;
+}
+
+function commandDisplayText(content: string, titles: Record<string, string>): string {
+  const matched = AGENT_COMMAND_PATTERN.exec(content.trim());
+  if (!matched) return content;
+  const title = titles[matched[2]];
+  return title ? `${matched[1]}：《${title}》` : `${matched[1]}（这篇文章）`;
+}
+
+function MessageBubble({ message, execution, draftTitles, tick, onConfirmPlan }: { message: ChatMessage; execution?: AgentRun; draftTitles: Record<string, string>; tick: number; onConfirmPlan: (tool: string, planId: string) => Promise<void> }) {
   const toolResults = Array.isArray(execution?.tool_results) ? execution.tool_results : [];
   const planTool = toolResults.find((item) => item.plan_id && item.tool);
   const pendingPlan = planTool?.status !== "confirmed";
   const failed = execution?.status === "failed";
   const running = execution?.status === "running";
+  // 每 30 秒刷新一次“已进行 N 分钟”（父组件 tick 变化即重算），长任务不再是无信息的转圈。
   const statusText = shortRunStatus(execution);
+  const runningLabel = running ? [statusText, elapsedLabel(execution)].filter(Boolean).join(" · ") : statusText;
   // 完整摘要不丢：需要细节时展开即可看到。
   const fullSummary = (execution?.summary || "").trim();
-  return <article className={message.role === "user" ? "message user" : "message assistant"}><span className="avatar">{message.role === "user" ? "你" : "A"}</span><div><p>{message.content}</p>{message.delivery_state === "sending" && <small>正在发送…</small>}{message.delivery_state === "failed" && <small className="failed">发送失败：{message.delivery_error || "请重试"}</small>}{execution && <details className="execution-summary"><summary className={failed ? "failed" : undefined}>{failed ? <CircleAlert size={15} /> : running ? <LoaderCircle className="spin" size={15} /> : <CircleCheck size={15} />} {statusText}<ChevronDown size={15} /></summary><ol>{fullSummary && fullSummary !== statusText && <li><b>处理结果</b><span>{fullSummary}</span></li>}{[...execution.events].reverse().map((event) => <li key={event.id}><b>{event.title}</b><span>{event.detail}</span></li>)}</ol>{execution.status === "waiting_confirmation" && pendingPlan && planTool?.plan_id && <button className="confirm-plan" onClick={() => void onConfirmPlan(planTool.tool!, planTool.plan_id!)}>确认计划（不执行）</button>}</details>}<small>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small></div></article>;
+  return <article className={message.role === "user" ? "message user" : "message assistant"} data-tick={tick}><span className="avatar">{message.role === "user" ? "你" : "A"}</span><div><p>{message.role === "user" ? commandDisplayText(message.content, draftTitles) : message.content}</p>{message.delivery_state === "sending" && <small>正在发送…</small>}{message.delivery_state === "failed" && <small className="failed">发送失败：{message.delivery_error || "请重试"}</small>}{execution && <details className="execution-summary"><summary className={failed ? "failed" : undefined}>{failed ? <CircleAlert size={15} /> : running ? <LoaderCircle className="spin" size={15} /> : <CircleCheck size={15} />} {runningLabel}<ChevronDown size={15} /></summary><ol>{fullSummary && fullSummary !== statusText && <li><b>处理结果</b><span>{fullSummary}</span></li>}{[...execution.events].reverse().map((event) => <li key={event.id}><b>{event.title}</b><span>{event.detail}</span></li>)}</ol>{execution.status === "waiting_confirmation" && pendingPlan && planTool?.plan_id && <button className="confirm-plan" onClick={() => void onConfirmPlan(planTool.tool!, planTool.plan_id!)}>确认计划（不执行）</button>}</details>}<small>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small></div></article>;
 }
 
 function autoReviewStatusLabel(status: string) {
@@ -512,6 +549,41 @@ function DraftEvidenceList({ evidence }: { evidence: Draft["evidence"] }) {
           </small>
         </article>
       ))}
+    </section>
+  );
+}
+
+function DraftVersionHistory({ revisions, currentVersion }: { revisions: DraftRevision[]; currentVersion: number }) {
+  // 只读：把每一版正文的时间、来源与字数摊开，方便对照“分数为什么变了”。
+  if (!revisions.length) return null;
+  const sourceLabel = (reason: DraftRevision["revision_reason"]) => {
+    if (reason?.kind === "source_regeneration") return "按来源重写";
+    if (reason?.issues?.length) return `按审核意见改稿（第 ${reason.revision_count || 1} 次）`;
+    if (reason?.kind === "source_refresh") return "只刷新来源";
+    return "生成";
+  };
+  const charCount = (value: string) => (value || "").replace(/\s/g, "").length;
+  const ordered = [...revisions].sort((left, right) => right.version - left.version);
+  return (
+    <section className="illustration-record">
+      <div className="panel-heading"><b>历史版本</b><span>{ordered.length + 1}</span></div>
+      <p className="muted">当前是第 {currentVersion} 版；下面是此前保存过的版本快照（只读，不会修改当前正文）。</p>
+      <ol className="version-list">
+        <li className="version-item current" key="current">
+          <b>第 {currentVersion} 版 · 当前正文</b>
+          <small>正在编辑/审核的就是这一版</small>
+        </li>
+        {ordered.map((revision) => (
+          <li className="version-item" key={revision.id}>
+            <b>第 {revision.version} 版 · {sourceLabel(revision.revision_reason)}</b>
+            <small>{charCount(revision.body)} 字 · {new Date(revision.created_at).toLocaleString()}</small>
+            {revision.revision_reason?.issues?.length ? (
+              <details><summary>当时的 {revision.revision_reason.issues.length} 条改稿意见</summary><ul>{revision.revision_reason.issues.map((issue, index) => <li key={`${revision.id}-${index}`}>{issue}</li>)}</ul></details>
+            ) : null}
+            <details><summary>查看这一版正文</summary><pre className="version-body">{revision.body}</pre></details>
+          </li>
+        ))}
+      </ol>
     </section>
   );
 }
@@ -720,7 +792,7 @@ function GenerationRecordPage({ onAgentCommand }: { onAgentCommand: (content: st
       <aside className="draft-list"><div className="panel-heading"><h2>生成队列</h2><span>{recordEntries.length + runningRuns.length}</span></div><div className="date-filters"><select value={dateRange} onChange={(event) => setDateRange(event.target.value as typeof dateRange)}><option value="all">全部日期</option><option value="today">今天</option><option value="seven_days">最近 7 天</option><option value="month">本月</option><option value="custom">自定义日期</option></select>{dateRange === "custom" && <><input type="date" value={createdFrom} aria-label="开始日期" onChange={(event) => setCreatedFrom(event.target.value)} /><input type="date" value={createdTo} aria-label="结束日期" onChange={(event) => setCreatedTo(event.target.value)} /></>}</div>
       {runningRuns.length > 0 && <div className="draft-day-group"><p>正在生成</p>{runningRuns.map((run) => <button key={run.id} onClick={() => { setSelectedRunId(run.id); setSelectedDraftId(null); }} className={selectedRunId === run.id ? "draft-item selected" : "draft-item"}><span className="status-dot" data-status="running" /><div><b>{run.request_text || "生成资讯草稿"}</b><small>{activePhaseLabel(run)}</small></div></button>)}</div>}
       {recordEntries.length ? Object.entries(groupedRecords).map(([day, entries]) => <div className="draft-day-group" key={day}><p>{day}</p>{entries.map((entry) => entry.kind === "draft" ? <div className="queue-list-item" key={entry.item.id}><button onClick={() => { setSelectedDraftId(entry.item.id); setSelectedRunId(null); }} className={selectedDraftId === entry.item.id ? "draft-item selected" : "draft-item"}><span className="status-dot" data-status={entry.item.status} /><div><b>{entry.item.title_options[0]}</b><small>{entry.item.category} · {draftActivity.get(entry.item.id) || statusLabel(entry.item.status)}</small></div></button><button className="queue-delete-button" aria-label={`删除生成记录：${entry.item.title_options[0]}`} disabled={busy} onClick={() => void removeDraft(entry.item)}><Trash2 size={16} /></button></div> : <div className="queue-list-item" key={entry.item.id}><button onClick={() => { setSelectedRunId(entry.item.id); setSelectedDraftId(null); }} className={selectedRunId === entry.item.id ? "draft-item selected" : "draft-item"}><span className="status-dot" data-status="failed" /><div><b>{entry.item.request_text || "生成资讯草稿"}</b><small>生成失败</small></div></button><button className="queue-delete-button" aria-label="删除生成任务记录" disabled={busy} onClick={() => void removeRun(entry.item)}><Trash2 size={16} /></button></div>)}</div>) : !runningRuns.length && <div className="empty compact">当前日期范围暂无生成记录</div>}</aside>
-      {selectedRun ? <section className="review-editor generation-detail"><div className="draft-meta"><span className="pill">{selectedRun.status === "running" ? selectedRunTextLabel || "正在生成" : "生成失败"}</span><span className="pill subdued">{selectedRun.session_title || "当前会话"}</span></div><h2>{selectedRun.request_text || "生成资讯草稿"}</h2><p className="muted">阶段信息来自后台运行审计，不包含模型原始思维链。</p>{selectedRun.status === "failed" && <p className="notice">失败原因：{(selectedRun.summary || selectedRun.error_message || "任务未完成，请查看执行记录。").replace(/^生成失败：/, "")}</p>}<GenerationStageCards stages={selectedRunStages} /><section className="illustration-record"><div className="panel-heading"><b>图片任务</b><span>{selectedRun.image_jobs?.length || 0}</span></div>{selectedRun.image_jobs?.length ? selectedRun.image_jobs.map((job) => <article className="run-event" key={job.id}><b>{job.purpose === "cover" ? "封面图" : `正文插图（第 ${job.placement_after_paragraph} 段后）`} · {job.status}</b><p>任务 ID：{job.id}{job.error_message ? `；${job.error_message}` : ""}</p><small>{job.status === "running" ? "后台生成中，最长 20 分钟。" : `创建：${new Date(job.created_at).toLocaleString()}`}</small></article>) : <p className="muted">尚未创建图片任务。</p>}</section><section className="illustration-record"><div className="panel-heading"><b>执行记录</b><span>{selectedRun.events.length}</span></div>{selectedRun.events.length ? [...selectedRun.events].reverse().map((event) => <article className="run-event" key={event.id}><b>{event.title}</b><p>{event.detail}</p><small>{new Date(event.created_at).toLocaleString()}</small></article>) : <p className="muted">暂无执行记录。</p>}</section></section> : selectedDraft ? <section className="review-editor"><div className="draft-meta"><span className="pill">{selectedDraft.category}</span><span className="pill subdued">版本 {selectedDraft.version}</span><a href={selectedDraft.source_url} target="_blank" rel="noreferrer">查看信息来源 ↗</a></div><h2>{selectedDraft.title_options[0]}</h2>{cover && <img className="record-cover" src={cover.asset.download_url} alt="生成的封面图" />}<label>中文摘要<textarea value={summary} disabled={!canReview} onChange={(event) => setSummary(event.target.value)} /></label><label>正文<textarea className="body-input" disabled={!canReview} value={body} onChange={(event) => setBody(event.target.value)} /></label><div className="tags">{selectedDraft.tags.map((tag) => <span key={tag}>#{tag}</span>)}</div><GeneratedIllustrationList illustrations={illustrations} busy={busy} paragraphCount={body.split(/\n\s*\n/).filter(Boolean).length} onMove={(item, placement) => void moveIllustration(item, placement)} onRemove={(item) => void removeIllustration(item)} /><section className="illustration-record"><div className="panel-heading"><b>自动审核</b><span>{autoReviews.length}</span></div>{!hasCurrentVersionAutoReview && autoReviews.length > 0 && <p className="muted">当前版本尚未自动审核；以下为版本更新前的历史审核记录。</p>}{autoReviews.length ? autoReviews.map((item, index) => <article className="review-result" key={item.id}><b>{index === 0 && hasCurrentVersionAutoReview ? "当前版本 · " : "历史记录 · "}{autoReviewStatusLabel(item.status)}</b><AutoReviewFeedback item={item} />{item.error_message && <p>{item.error_message}</p>}<small>{new Date(item.created_at).toLocaleString()}</small></article>) : <p className="muted">当前版本尚未自动审核。</p>}</section>{sourceRegenerations.length > 0 && <section className="illustration-record"><div className="panel-heading"><b>来源重新生成版本</b><span>{sourceRegenerations.length}</span></div>{sourceRegenerations.map((revision) => <article className="review-result" key={revision.id}><b>版本 {revision.version} · 按来源重新生成</b><small>{new Date(revision.created_at).toLocaleString()}</small></article>)}</section>}{autoRevisions.length > 0 && <section className="illustration-record"><div className="panel-heading"><b>自动改稿版本</b><span>{autoRevisions.length}</span></div>{autoRevisions.map((revision) => <article className="review-result" key={revision.id}><b>版本 {revision.version} · 第 {revision.revision_reason.revision_count || "?"} 次自动改稿</b>{revision.revision_reason.issues?.length ? <ul>{revision.revision_reason.issues.map((issue, index) => <li key={`${revision.id}-${index}`}>{issue}</li>)}</ul> : null}<small>{new Date(revision.created_at).toLocaleString()}</small></article>)}</section>}<DraftEvidenceList evidence={selectedDraft.evidence} /><div className="review-actions">{canReview && <><button className="ghost-button" disabled={busy} onClick={() => void save()}>保存修改</button><button className="danger-button" disabled={busy} onClick={() => { if (window.confirm("将用已保存的 README 与证据重写正文并覆盖为新的草稿版本，不重新采集、不新建草稿。继续吗？")) void rewrite(); }}>重写文案</button><button className="danger-button" disabled={busy} onClick={() => { if (window.confirm("废弃后将保留来源和审核记录，确定废弃吗？")) void review("discard"); }}>废弃文案</button></>} {selectedDraft.status === "ready_to_publish" ? <button className="danger-button" disabled={busy} onClick={() => { if (window.confirm("撤销审核将使文案重新进入可编辑状态，尚未投递的图片会保留。继续吗？")) void review("revoke"); }}>撤销审核</button> : <button className="primary-button" disabled={busy || !canReview} onClick={() => void review("approve")}><Check size={17} /> 审核通过</button>}</div></section> : <section className="empty">选择一条生成记录开始查看</section>}
+      {selectedRun ? <section className="review-editor generation-detail"><div className="draft-meta"><span className="pill">{selectedRun.status === "running" ? selectedRunTextLabel || "正在生成" : "生成失败"}</span><span className="pill subdued">{selectedRun.session_title || "当前会话"}</span></div><h2>{selectedRun.request_text || "生成资讯草稿"}</h2><p className="muted">阶段信息来自后台运行审计，不包含模型原始思维链。</p>{selectedRun.status === "failed" && <p className="notice">失败原因：{(selectedRun.summary || selectedRun.error_message || "任务未完成，请查看执行记录。").replace(/^生成失败：/, "")}</p>}<GenerationStageCards stages={selectedRunStages} /><section className="illustration-record"><div className="panel-heading"><b>图片任务</b><span>{selectedRun.image_jobs?.length || 0}</span></div>{selectedRun.image_jobs?.length ? selectedRun.image_jobs.map((job) => <article className="run-event" key={job.id}><b>{job.purpose === "cover" ? "封面图" : `正文插图（第 ${job.placement_after_paragraph} 段后）`} · {job.status}</b><p>任务 ID：{job.id}{job.error_message ? `；${job.error_message}` : ""}</p><small>{job.status === "running" ? "后台生成中，最长 20 分钟。" : `创建：${new Date(job.created_at).toLocaleString()}`}</small></article>) : <p className="muted">尚未创建图片任务。</p>}</section><section className="illustration-record"><div className="panel-heading"><b>执行记录</b><span>{selectedRun.events.length}</span></div>{selectedRun.events.length ? [...selectedRun.events].reverse().map((event) => <article className="run-event" key={event.id}><b>{event.title}</b><p>{event.detail}</p><small>{new Date(event.created_at).toLocaleString()}</small></article>) : <p className="muted">暂无执行记录。</p>}</section></section> : selectedDraft ? <section className="review-editor"><div className="draft-meta"><span className="pill">{selectedDraft.category}</span><span className="pill subdued">版本 {selectedDraft.version}</span><a href={selectedDraft.source_url} target="_blank" rel="noreferrer">查看信息来源 ↗</a></div><h2>{selectedDraft.title_options[0]}</h2>{cover && <img className="record-cover" src={cover.asset.download_url} alt="生成的封面图" />}<label>中文摘要<textarea value={summary} disabled={!canReview} onChange={(event) => setSummary(event.target.value)} /></label><label>正文<textarea className="body-input" disabled={!canReview} value={body} onChange={(event) => setBody(event.target.value)} /></label><div className="tags">{selectedDraft.tags.map((tag) => <span key={tag}>#{tag}</span>)}</div><GeneratedIllustrationList illustrations={illustrations} busy={busy} paragraphCount={body.split(/\n\s*\n/).filter(Boolean).length} onMove={(item, placement) => void moveIllustration(item, placement)} onRemove={(item) => void removeIllustration(item)} /><section className="illustration-record"><div className="panel-heading"><b>自动审核</b><span>{autoReviews.length}</span></div>{!hasCurrentVersionAutoReview && autoReviews.length > 0 && <p className="muted">当前版本尚未自动审核；以下为版本更新前的历史审核记录。</p>}{autoReviews.length ? autoReviews.map((item, index) => <article className="review-result" key={item.id}><b>{index === 0 && hasCurrentVersionAutoReview ? "当前版本 · " : "历史记录 · "}{autoReviewStatusLabel(item.status)}</b><AutoReviewFeedback item={item} />{item.error_message && <p>{item.error_message}</p>}<small>{new Date(item.created_at).toLocaleString()}</small></article>) : <p className="muted">当前版本尚未自动审核。</p>}</section>{sourceRegenerations.length > 0 && <section className="illustration-record"><div className="panel-heading"><b>来源重新生成版本</b><span>{sourceRegenerations.length}</span></div>{sourceRegenerations.map((revision) => <article className="review-result" key={revision.id}><b>版本 {revision.version} · 按来源重新生成</b><small>{new Date(revision.created_at).toLocaleString()}</small></article>)}</section>}{autoRevisions.length > 0 && <section className="illustration-record"><div className="panel-heading"><b>自动改稿版本</b><span>{autoRevisions.length}</span></div>{autoRevisions.map((revision) => <article className="review-result" key={revision.id}><b>版本 {revision.version} · 第 {revision.revision_reason.revision_count || "?"} 次自动改稿</b>{revision.revision_reason.issues?.length ? <ul>{revision.revision_reason.issues.map((issue, index) => <li key={`${revision.id}-${index}`}>{issue}</li>)}</ul> : null}<small>{new Date(revision.created_at).toLocaleString()}</small></article>)}</section>}<DraftEvidenceList evidence={selectedDraft.evidence} /><DraftVersionHistory revisions={revisions} currentVersion={selectedDraft.version} /><div className="review-actions">{canReview && <><button className="ghost-button" disabled={busy} onClick={() => void save()}>保存修改</button><button className="danger-button" disabled={busy} onClick={() => { if (window.confirm("将用已保存的 README 与证据重写正文并覆盖为新的草稿版本，不重新采集、不新建草稿。继续吗？")) void rewrite(); }}>重写文案</button><button className="danger-button" disabled={busy} onClick={() => { if (window.confirm("废弃后将保留来源和审核记录，确定废弃吗？")) void review("discard"); }}>废弃文案</button></>} {selectedDraft.status === "ready_to_publish" ? <button className="danger-button" disabled={busy} onClick={() => { if (window.confirm("撤销审核将使文案重新进入可编辑状态，尚未投递的图片会保留。继续吗？")) void review("revoke"); }}>撤销审核</button> : <button className="primary-button" disabled={busy || !canReview} onClick={() => void review("approve")}><Check size={17} /> 审核通过</button>}</div></section> : <section className="empty">选择一条生成记录开始查看</section>}
     </div>{notice && <p className="notice">{notice}</p>}
   </>;
 }
@@ -894,6 +966,14 @@ function PublishingPage({ onAgentCommand }: { onAgentCommand: (content: string) 
     await onAgentCommand(
       deliver ? `运行自动审核并创建公众号草稿｜draft=${selectedDraft.id}` : `仅运行审核｜draft=${selectedDraft.id}`
     );
+  }
+
+  async function reviseFromReview() {
+    if (!selectedDraft || !["pending_review", "needs_revision"].includes(selectedDraft.status)) return;
+    // 与“仅运行审核”配套：不重新审核，直接按已有的审核意见改一稿（没有审核记录时 Agent 会说明）。
+    if (!window.confirm("将按最近一次审核的意见改写正文并覆盖为新版本（不重新审核、不投递）。继续吗？")) return;
+    setReviewNotice(""); setDeliveryNotice("");
+    await onAgentCommand(`按审核意见改稿｜draft=${selectedDraft.id}`);
   }
 
   async function syncRemoteDrafts() {
