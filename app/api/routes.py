@@ -1764,7 +1764,49 @@ async def generate_draft_illustration(
 
 @router.get("/drafts/{draft_id}/auto-reviews")
 def list_auto_reviews(draft_id: str, session: SessionDependency) -> list[dict[str, Any]]:
-    return [auto_review_to_dict(row) for row in ContentRepository(session).list_auto_review_runs(draft_id)]
+    repository = ContentRepository(session)
+    draft = repository.get_draft(draft_id)
+    rows = repository.list_auto_review_runs(draft_id)
+    return annotate_auto_reviews(rows, current_version=int(draft.version or 0))
+
+
+def annotate_auto_reviews(rows: list[Any], *, current_version: int) -> list[dict[str, Any]]:
+    """给审核记录补上“审的是哪一版、这一版怎么来的、与上一次相比分数差多少”。
+
+    为什么需要（2026-09-14 用户实测）：记录里只显示“审核未通过 · 58 分”，而上一版是 88 分、
+    74 分，看起来像“改稿越改越差”。真实情况是中间那几次不是改稿，而是按来源整篇重写换了一份文字，
+    分数与版本之间缺少可比的说明。这里把版本号、来源、分数差一次性标清楚。
+    """
+    origin_labels = {
+        "source_regeneration": "按来源重写",
+        "review_revision": "按审核意见改稿",
+        "initial": "首次生成",
+        "source_refresh": "只刷新来源",
+    }
+    result: list[dict[str, Any]] = []
+    # list_auto_review_runs 按时间倒序：i 的“上一次”是 i+1。
+    for index, row in enumerate(rows):
+        payload = auto_review_to_dict(row)
+        report = row.model_report_json or {}
+        reviewed_version = report.get("reviewed_version")
+        origin = report.get("version_origin")
+        payload["reviewed_version"] = reviewed_version
+        payload["version_origin"] = origin
+        payload["version_origin_label"] = origin_labels.get(str(origin), "") if origin else ""
+        payload["reviewed_current_version"] = bool(
+            reviewed_version and current_version and int(reviewed_version) == current_version
+        )
+        score = report.get("score")
+        previous = rows[index + 1] if index + 1 < len(rows) else None
+        previous_score = (previous.model_report_json or {}).get("score") if previous else None
+        payload["previous_score"] = previous_score
+        payload["score_delta"] = (
+            int(score) - int(previous_score)
+            if isinstance(score, int) and isinstance(previous_score, int)
+            else None
+        )
+        result.append(payload)
+    return result
 
 
 @router.get("/drafts/{draft_id}/revisions")

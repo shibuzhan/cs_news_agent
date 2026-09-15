@@ -806,6 +806,11 @@ class ContentRepository:
             row.content_plan_json.pop("logical_sections", None)
         row.version += 1
         row.status = ReviewStatus.PENDING_REVIEW.value
+        # 与 regenerate_draft 同口径：这一版是按审核意见改出来的（记录页与下次审核都要知道）。
+        row.content_plan_json = {
+            **(row.content_plan_json or {}),
+            "last_revision_reason": {"kind": "review_revision", **(revision_reason or {})},
+        }
         snapshot = DraftRevisionRow(
             draft_id=row.id,
             auto_review_run_id=review_run_id,
@@ -2067,12 +2072,15 @@ class ContentRepository:
         row.tags_json = [str(tag).strip("# ") for tag in content.tags if str(tag).strip("# ")][:10]
         row.card_script_json = content.card_script
         row.evidence_json = self._merge_regenerated_evidence(row.evidence_json, evidence)
-        row.content_plan_json = content.content_plan
+        row.content_plan_json = dict(content.content_plan or {})
         row.quality_report_json = content.quality_report
         row.claim_citations_json = content.claim_citations
         row.generation_mode = content.generation_mode
         row.version += 1
         row.status = ReviewStatus.PENDING_REVIEW.value
+        # 记下这一版的来源：审核记录据此标注“这一版是按来源整篇重写出来的”，
+        # 否则用户只看到分数在跳，会误以为“改稿越改越差”。
+        row.content_plan_json["last_revision_reason"] = {"kind": "source_regeneration"}
         self.session.add(DraftRevisionRow(
             draft_id=row.id,
             auto_review_run_id=None,

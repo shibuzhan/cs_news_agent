@@ -51,6 +51,9 @@ _PREFIXES: tuple[tuple[str, str, str], ...] = (
     # 只用已存证据重写：不联网重抓，避免换出一份不同的正文。
     ("重新生成正文", "regenerate_draft_body", "重新生成正文"),
     ("按已保存证据重写", "regenerate_draft_body", "重新生成正文"),
+    # 与“仅运行审核”配套的按钮：不重新审核，直接按最近一次审核意见改一稿。
+    ("按审核意见改稿", "apply_revision_issues", "按审核意见改稿"),
+    ("按审核意见修改", "apply_revision_issues", "按审核意见改稿"),
     # 只读：先看队列再决定要不要新建任务（长任务期间最容易做错的就是“又起一个”）。
     ("查任务队列", "list_active_tasks", "查看在跑的任务"),
     ("任务队列", "list_active_tasks", "查看在跑的任务"),

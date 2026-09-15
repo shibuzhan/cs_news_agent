@@ -67,6 +67,52 @@ def _blocking_issue_count(values: object) -> int:
     )
 
 
+def _version_origin(draft) -> str:
+    """这一版正文是怎么来的：按意见改稿 / 按来源重写 / 首次生成。
+
+    记录页要据此标注“版本 N（按来源重写）58 分”——否则用户看到的只是分数在跳，
+    会以为“改稿越改越差”，而实际可能是一次整篇重写换了另一份文字。
+    """
+    plan = getattr(draft, "content_plan_json", None) or {}
+    reason = plan.get("last_revision_reason") if isinstance(plan, dict) else None
+    if isinstance(reason, dict):
+        if reason.get("kind") == "source_regeneration":
+            return "source_regeneration"
+        if reason.get("issues"):
+            return "review_revision"
+    return "initial"
+
+
+def _history_section(repository, draft_id: str, *, current_version: int) -> str:
+    """审核提示词里的“历史参照”：上次评分 + 这一版是怎么来的。
+
+    为什么需要：审核只看当前正文、看不到上一版，于是 88 → 74 → 58 这种跨来源比较会让人误以为
+    “改稿越改越差”。把版本来源（首次生成 / 按意见改稿 / 按来源重写）与上次分数写进提示词，
+    模型才能给出“相对这次输入是否变好”的判断，而不是各打各的分。
+    """
+    try:
+        runs = repository.list_auto_review_runs(draft_id)
+    except Exception:  # 审核不该因为读历史失败而中断
+        return ""
+    if not runs:
+        return "本次是这篇稿子的第一次审核（没有历史参照）。\n"
+    latest = runs[0]
+    report = latest.model_report_json or {}
+    score = report.get("score")
+    reviewed = report.get("reviewed_version")
+    lines = [
+        "**历史参照**：上一次审核"
+        + (f"在第 {reviewed} 版" if reviewed else "")
+        + f"，评分 {score}；当前正文是第 {current_version} 版。"
+    ]
+    if reviewed and current_version and int(reviewed) != int(current_version):
+        lines.append(
+            "两版之间正文被改动过（可能是按意见改稿，也可能是按来源整篇重写）："
+            "请只评价**当前这一版**，不要因为“上一版已经指出过”就重复扣同一处，也不要默认它一定变好或变差。"
+        )
+    return "".join(lines) + "\n"
+
+
 def rule_review(draft, min_body_chars: int = MIN_HARD_BODY_CHARS, max_body_chars: int = 2400) -> dict:
     # 这里不能先调用 normalize_plain_text：它会按设计去除段首空白，
     # 而段首两个全角空格正是本项目需要核验的格式规则。
@@ -205,7 +251,11 @@ class AutoReviewTool:
             "最多 1 到 2 条，只写名称本身（不要写成句子或问题）；没有这类名称时返回空数组。"
             f"评分达到 {self.settings.auto_review_pass_score} 分且没有 critical 才能通过。每一项扣分必须对应 issues 中的明确缺陷；"
             "不要保留下一轮再指出的缺陷，不要输出推理过程。"
-            "打分锚点：事实准确、语气是分享者口吻、语句通顺、可以直接发布＝85 到 89 分；"
+            # 真实问题（2026-09-14）：只有一句“85–89＝可发布”，没有扣分刻度 → 同一篇稿子在不同次审核里
+            # 分数差得很大（88 → 74 → 0 → 58），用户无法判断“改稿到底有没有变好”。这里给出可复算的刻度。
+            "**扣分刻度（必须按它算分）**：从 100 分起算——每条 critical 扣 25 分、每条 major 扣 8 分、每条 minor 扣 2 分，"
+            "最低 20 分；同一处缺陷只扣一次，不要为同一句话既扣语气又扣通顺。"
+            "打分锚点：没有任何缺陷、事实准确、语气是分享者口吻、语句通顺、可以直接发布＝85 到 89 分；"
             "在此基础上只需极小的语气或顺句调整＝90 分以上；"
             "存在读者会误解、或需要回查来源才能确认的表述＝84 分以下。"
             "不要因为风格偏好给出 90 分以上的差异，也不要在没有明确缺陷时给低分。"
@@ -249,6 +299,9 @@ class AutoReviewTool:
             + terminology_guidance() + _preference_rules(self.repository)
             + "来源：" + draft.source_name + "；原文：" + draft.source_url
             + "；标题：" + (draft.title_options_json or [""])[0] + "\n"
+            # 上次审核的分数与这一版的来源：让模型知道“这次是全新生成还是按意见改稿”，
+            # 避免把不同来源的版本当成同一篇在反复挑刺（真实困惑：为什么改稿后分数反而降了）。
+            + _history_section(self.repository, draft_id, current_version=int(getattr(draft, "version", 0) or 0))
             # 审核必须看到与写作**同一份**证据：此前限制 6000 字符，导致 6000 字之后的
             # 事实（密钥、数量、平台细节）全被判成“来源证据中未出现”。
             + _evidence_section(
@@ -283,6 +336,9 @@ class AutoReviewTool:
                     "summary": review_feedback_text(model.summary) or "",
                     # 交给改稿环节联网补充；不改写草稿、不额外增加模型请求。
                     "search_queries": list(model.search_queries),
+                    # 记录这次审的是第几版、这一版是怎么来的：记录页与下一次审核据此给出可比的说明。
+                    "reviewed_version": int(getattr(draft, "version", 0) or 0),
+                    "version_origin": _version_origin(draft),
                 },
             )
         except Exception as exc:

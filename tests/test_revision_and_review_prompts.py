@@ -175,7 +175,9 @@ def test_revision_prompt_states_length_floor_and_forbids_translationese(monkeypa
     prompt = captured["prompt"]
     # 目标 1600–2200，硬区间 1400–2400（目标上下各放宽 200 字）。
     assert "1400" in prompt and "2400" in prompt
-    assert "不得低于下限" in prompt
+    # 长度压力已改为“写到中段、宁短勿凑”：删重后字数下降是允许的，只许补新事实。
+    assert "写到中段就好" in prompt
+    assert "绝不允许靠换个说法重复凑数" in prompt
     # 口径统一后提示词不再说“中文字符”，而是说明数的是去空白后的全部字符。
     assert "1600 到 2200 个字" in prompt
     assert "去掉空白与来源尾注后的全部字符" in prompt
@@ -425,10 +427,11 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "谁做的或来自哪里、它想解决什么麻烦" in instruction
     assert "每个句子都要有明确主语" in instruction
     assert "本地运行后，浏览器中会显示" in instruction
-    # 长度给目标带而不是只给上下限，避免贴着下限写。
+    # 长度：给目标带 + 明确中段目标（旧写法“不要贴着下限写”会被模型当成“往上限写”）。
     assert "1600 到 2200 个字" in instruction
     assert "不得超过 2400 个字" in instruction
-    assert "不要贴着下限写" in instruction
+    assert "写到中段就好（大约 1900 字）" in instruction
+    assert "宁短勿凑" in instruction
     # 禁止每篇同一结构。
     assert "不要每篇都套同一个顺序" in instruction
 

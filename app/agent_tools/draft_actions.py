@@ -1162,9 +1162,45 @@ def build_draft_action_tools(session_id: str, *, chat_run_id: str | None = None)
                 reviews = repository.list_auto_review_runs(draft.id)
                 run = reviews[0] if reviews else None
             if run is None and not extra:
+                # 没有任何审核记录时不留一句冷冰冰的拒绝：告诉用户下一步点哪里。
                 return {
                     "status": "rejected",
-                    "message": "这篇还没有自动审核记录；可以先运行审核，或直接在 extra_issues 里给出要改的点。",
+                    "draft_id": draft.id,
+                    "draft_title": _draft_label(draft),
+                    "message": (
+                        f"《{_draft_label(draft)}》还没有审核记录，没有可依据的意见。"
+                        "先点“仅运行审核（只出意见，不改稿）”拿到意见，再点“仅根据意见改稿”；"
+                        "或者直接把你要求改的点告诉我，我按你说的改。"
+                    ),
+                }
+            # 审核记录里的那一版必须对得上当前正文，否则改稿会基于旧意见改新稿。
+            # 新记录带 reviewed_version（准确）；本轮之前的旧记录没有，退回时间比较——
+            # 注意 `draft.updated_at` 会被“切当前文章”等元数据更新顶掉，所以时间比较只是近似，
+            # 宁可放过也不要误拒：真正可靠的分支是 reviewed_version。
+            reviewed_version = (run.model_report_json or {}).get("reviewed_version") if run is not None else None
+            version_mismatch = bool(
+                reviewed_version and int(reviewed_version) != int(getattr(draft, "version", 0) or 0)
+            )
+            approximate_stale = bool(
+                run is not None
+                and not reviewed_version
+                and getattr(run, "created_at", None) is not None
+                and getattr(draft, "updated_at", None) is not None
+                and run.created_at < draft.updated_at
+            )
+            if version_mismatch or approximate_stale:
+                if reviewed_version:
+                    reason_text = f"最近的审核意见是针对第 {reviewed_version} 版的"
+                else:
+                    reason_text = "最近的审核意见可能来自更早的版本（旧记录没有版本标记）"
+                return {
+                    "status": "rejected",
+                    "draft_id": draft.id,
+                    "draft_title": _draft_label(draft),
+                    "message": (
+                        f"{reason_text}，而当前正文已经是第 {draft.version} 版——"
+                        "版本对不上时按旧意见改稿可能改错地方。先重新审核一次，或直接告诉我这次要改哪里。"
+                    ),
                 }
             chat_run = _task_run(repository, session_id, chat_run_id, ConversationIntent.REGENERATE_DRAFT)
             _announce(repository, session_id, chat_run, f"正在按审核意见重改《{_draft_label(draft)}》…")

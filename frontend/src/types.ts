@@ -118,6 +118,13 @@ export type AutoReviewRun = {
   status: string;
   rule_report: { passed?: boolean; failures?: string[]; body_chars?: number; paragraph_count?: number };
   model_report: { passed?: boolean; score?: number; threshold?: number; blocking_issue_count?: number; issues?: string[]; summary?: string; skipped?: string };
+  // 审的是哪一版、这一版怎么来的、与上次相比分数差多少（后端 annotate_auto_reviews 补上的）。
+  reviewed_version?: number | null;
+  version_origin?: string | null;
+  version_origin_label?: string;
+  reviewed_current_version?: boolean;
+  previous_score?: number | null;
+  score_delta?: number | null;
   wechat_job_id: string | null;
   error_message: string | null;
   created_at: string;
