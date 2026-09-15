@@ -101,14 +101,15 @@ def _review_agent_stub(captured: dict, *, score: int, issues: list[dict], search
     return FakeReviewAgent
 
 
-def test_revision_retries_once_when_trimming_drops_below_the_floor(monkeypatch) -> None:
-    """真实故障：审核说“第 2/3/4 段重复”，模型删重复删过头 → 正文低于硬下限 → 整轮改稿失败。
+def test_revision_retries_once_when_the_body_is_unusably_short(monkeypatch) -> None:
+    """重试只在“短到不成文”（低于绝对底线 400 字）时发生。
 
-    这类失败可修复：带“当前字数不够”的反馈再写一次，而不是把整轮改稿判死。
+    用户口径（2026-09-15）：字数以配置页为准，**不因为字数问题重写**——一次改稿要跑很久，
+    为了几十个字重来不值当；低于配置下限只作为 minor 提示。
     """
     captured: dict = {}
     too_short = json.dumps(
-        {"summary_cn": "摘要", "body": "\n\n".join(["　　太短的正文。" * 8] * 4), "tags": ["开源项目"]},
+        {"summary_cn": "摘要", "body": "\n\n".join(["　　太短。" * 3] * 4), "tags": ["开源项目"]},
         ensure_ascii=False,
     )
     good = json.dumps(
@@ -136,8 +137,8 @@ def test_revision_retries_once_when_trimming_drops_below_the_floor(monkeypatch) 
     )
 
     assert client.calls == 2, "第一次不合格时必须带反馈重试一次"
-    assert "至少需要 1400" in captured["prompt2"], "重试提示词要写清被拒原因"
-    assert "这是第 1 段正文" in result.body and result.article_shape["body_chars"] >= 1400
+    assert "至少需要 400" in captured["prompt2"], "重试提示词要写清被拒原因"
+    assert "这是第 1 段正文" in result.body and result.article_shape["body_chars"] >= 400
 
 
 def test_revision_gives_up_after_the_retry(monkeypatch) -> None:
@@ -173,13 +174,14 @@ def test_revision_prompt_states_length_floor_and_forbids_translationese(monkeypa
     )
 
     prompt = captured["prompt"]
-    # 目标 1600–2200，硬区间 1400–2400（目标上下各放宽 200 字）。
-    assert "1400" in prompt and "2400" in prompt
-    # 长度压力已改为“写到中段、宁短勿凑”：删重后字数下降是允许的，只许补新事实。
-    assert "写到中段就好" in prompt
-    assert "绝不允许靠换个说法重复凑数" in prompt
-    # 口径统一后提示词不再说“中文字符”，而是说明数的是去空白后的全部字符。
+    # 长度以配置页为准（目标 1600–2200），且不因为字数重写（用户口径 2026-09-15）。
     assert "1600 到 2200 个字" in prompt
+    assert "配置页设置的区间" in prompt
+    assert "是硬性的" in prompt
+    assert "不会触发重写" in prompt or "照常保存" in prompt
+    # 凑字数仍然禁止。
+    assert "不许换个说法重复已说过的内容" in prompt
+    # 口径统一后提示词不再说“中文字符”，而是说明数的是去空白后的全部字符。
     assert "去掉空白与来源尾注后的全部字符" in prompt
     assert "4 到 8 个自然段" in prompt
     # 明确禁止翻译腔，避免为了保守而写出生硬句子。
@@ -269,7 +271,7 @@ def test_revision_reports_specific_article_shape_failure(monkeypatch) -> None:
 
     # 失败原因必须指出具体约束，而不是笼统的“不符合结构”。
     assert "正文不符合要求" in str(caught.value)
-    assert "1400" in str(caught.value)
+    assert "400" in str(caught.value), "低于绝对底线时才拒绝，并说明差多少"
 
 
 def test_revision_payload_accepts_string_tags_and_paragraph_array_body() -> None:
@@ -409,7 +411,8 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "4 到 8 个自然段" in instruction
     assert "语境里看" in instruction
     assert "不要用含糊措辞掩盖" in instruction
-    assert "不得少于 1400 个字" in instruction
+    assert "下限 1600 是硬性的" in instruction
+    assert "这个区间来自配置页" in instruction
     assert "去掉空白与来源尾注后的全部字符" in instruction
     # 正向语感锚点：自然开头、允许短段、数字的中文可读写法；不鼓励谈论来源自身的缺失。
     assert "万能开头" in instruction
@@ -427,11 +430,11 @@ def test_generation_instruction_layers_structure_language_and_facts() -> None:
     assert "谁做的或来自哪里、它想解决什么麻烦" in instruction
     assert "每个句子都要有明确主语" in instruction
     assert "本地运行后，浏览器中会显示" in instruction
-    # 长度：给目标带 + 明确中段目标（旧写法“不要贴着下限写”会被模型当成“往上限写”）。
+    # 长度：口径来自配置页，且不因为字数重写（用户口径 2026-09-15）。
     assert "1600 到 2200 个字" in instruction
-    assert "不得超过 2400 个字" in instruction
-    assert "写到中段就好（大约 1900 字）" in instruction
-    assert "宁短勿凑" in instruction
+    assert "这个区间来自配置页" in instruction
+    assert "下限 1600 是硬性的" in instruction
+    assert "不会因此重写" in instruction
     # 禁止每篇同一结构。
     assert "不要每篇都套同一个顺序" in instruction
 

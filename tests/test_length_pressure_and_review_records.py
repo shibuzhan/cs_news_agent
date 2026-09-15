@@ -21,14 +21,13 @@ import pytest
 from app.services.generator import _natural_article_instruction
 
 
-def test_generation_prompt_targets_the_middle_of_the_band() -> None:
+def test_generation_prompt_defers_length_to_the_config_page() -> None:
+    """长度口径已按用户要求改为“以配置页为准，且不因为字数重写”（见 test_length_policy.py）。"""
     instruction = _natural_article_instruction(1600, 2200)
 
-    assert "写到中段就好（大约 1900 字）" in instruction
-    assert "不要往上限凑" in instruction
-    assert "宁短勿凑" in instruction
-    # 旧写法会诱导模型写满上限。
-    assert "不要贴着下限写" not in instruction
+    assert "这个区间来自配置页" in instruction
+    assert "下限 1600 是硬性的" in instruction
+    assert "不会因此重写" in instruction
 
 
 def test_generation_prompt_forbids_rephrasing_the_same_point() -> None:
@@ -38,13 +37,15 @@ def test_generation_prompt_forbids_rephrasing_the_same_point() -> None:
     assert "换一个说法把同一层意思再说一遍" in instruction
 
 
-def test_revision_prompt_allows_the_length_to_drop_when_deleting_duplicates() -> None:
+def test_revision_prompt_follows_the_configured_length_policy() -> None:
     from app.tools import auto_revision
 
     source = inspect.getsource(auto_revision.AutoRevisionTool.invoke)
 
-    assert "写到中段就好" in source
-    assert "只允许补充来源里的新事实" in source
+    assert "配置页设置的区间" in source
+    assert "是硬性的" in source
+    # 字数不会触发重写；重复仍然禁止。
+    assert "照常保存" in source
     assert "同一件事全文只许说一次" in source
 
 

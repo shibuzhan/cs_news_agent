@@ -130,10 +130,22 @@ def rule_review(draft, min_body_chars: int = MIN_HARD_BODY_CHARS, max_body_chars
     if not draft.tags_json:
         failures.append("缺少内容标签")
     body_chars = body_char_count(body)
+    # 长度按配置页的区间判定，但**只作为提示性说明**（minor），不再让它一票否决：
+    # 用户口径（2026-09-15）：字数以配置页为准，但**不因为字数问题重写**——一次生成/改稿要 9–12 分钟。
+    # 因此偏短/偏长会出现在意见里（供改稿参考），但不计入 failures、不影响通过与否。
+    length_note = ""
     if body_without_footer and not (min_body_chars <= body_chars <= max_body_chars):
-        failures.append(
-            f"正文长度 {body_chars} 不在 {min_body_chars} 到 {max_body_chars} 字范围内"
-        )
+        if body_chars < min_body_chars:
+            length_note = (
+                f"minor｜长度：正文 {body_chars} 字，低于配置下限 {min_body_chars} 字——"
+                "能补来源里的新事实就补，**不要为了字数重复已说过的内容**；"
+                "这属于可改可不改，服务端不会因为它重写。"
+            )
+        else:
+            length_note = (
+                f"minor｜长度：正文 {body_chars} 字，超过配置上限 {max_body_chars} 字——"
+                "优先删掉重复和空泛的句子，不要新加内容。"
+            )
     source_kind = str(getattr(getattr(draft, "source_item", None), "source_kind", "")).casefold()
     if source_kind != "github" and body.count("原文标题：") != 1:
         failures.append("原文标题尾注必须且只能出现一次")
@@ -154,6 +166,7 @@ def rule_review(draft, min_body_chars: int = MIN_HARD_BODY_CHARS, max_body_chars
         "passed": not failures,
         "failures": failures,
         "body_chars": body_chars,
+        "length_note": length_note,
         "paragraph_count": len(content_paragraphs),
         "logical_sections": logical_sections,
         "article_shape": article_shape,
@@ -243,6 +256,9 @@ class AutoReviewTool:
             "**本次审核只看两件事**：① **语气**——是不是分享者在讲刚看到的东西，而不是百科词条或研报；"
             "② **通顺**——句子读得下去吗，有没有重复绕圈、指代不清、句子过长或前后不接。"
             "除此之外的具体细节（术语选择、措辞偏好、句序、要不要多补背景、要不要做对比、要不要展开某段）**都不属于本次审核范围**，不要报为缺陷。"
+            # 用户口径（2026-09-15）：字数以配置页为准，但**不因为字数重写**（一次 9–12 分钟）。
+            "**长度只作提示、不作为缺陷**：正文比配置区间短或长时，用一条 minor 说清“偏短/偏长、建议补事实或删重复”，"
+            "并注明“可改可不改”；**不得因为长度给出 major/critical，也不得要求重写整篇**。"
             "返回 JSON：score（0-100 整数）、issues（数组，每项有 type、severity、description）、summary、search_queries。"
             "severity 只能是 critical、major、minor；critical 仅用于缺失来源、无证据事实或可能误导读者的重大问题。"
             "search_queries 供改稿环节联网补充使用：只有当某个外部名称**不解释就读不懂本文主体**时才填，"
@@ -321,6 +337,10 @@ class AutoReviewTool:
             score = _review_score(model.score)
             blocking_issue_count = _blocking_issue_count(raw_issues)
             issues = normalize_review_feedback(raw_issues)
+            # 长度提示（规则层的偏短/偏长）并入意见：它是“可改可不改”的 minor，不参与通过判定。
+            length_note = str(rules.get("length_note") or "")
+            if length_note:
+                issues = [length_note, *issues]
             if score < self.settings.auto_review_pass_score and not issues:
                 issues = [f"审核评分 {score} 分，未达到 {self.settings.auto_review_pass_score} 分通过阈值"]
             passed = score >= self.settings.auto_review_pass_score and blocking_issue_count == 0

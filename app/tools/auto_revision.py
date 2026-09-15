@@ -116,11 +116,11 @@ class AutoRevisionTool:
     def _compose_with_length_repair(
         self, *, client, model: str, prompt: str, minimum_chars: int, draft_id: str
     ) -> tuple[RevisionPayload, str, dict]:
-        """生成改稿正文；只因为“删重复删过头”而不合格时，带反馈重试一次。
+        """生成改稿正文；只有短到不成文（绝对底线）才带反馈重试一次。
 
-        真实故障：审核意见是“第 2/3/4 段重复”，模型把重复删掉后正文掉到 1400 字以下，
-        `compose_natural_article` 直接抛错 → 整轮改稿失败（运行报“按意见改稿这一步失败了”），
-        用户拿到的还是原稿。这类失败是可修复的：告诉它当前字数与下限再写一次。
+        历史行为是“低于配置下限 1400 就重试”，但用户口径（2026-09-15）是：
+        **字数以配置页为准，不因为字数问题重写**——一次改稿要跑很久，为几十个字重来不值当。
+        因此这里只在低于 `MIN_HARD_BODY_CHARS`（绝对底线，短到不成文）时才重试。
         """
         last_error: NaturalArticleError | None = None
         current_prompt = prompt
@@ -142,7 +142,7 @@ class AutoRevisionTool:
                 current_prompt = (
                     f"{prompt}\n\n上一次改稿被拒绝：{exc}。"
                     f"请重写正文：**必须不少于 {minimum_chars} 个字**（去空白与来源尾注后的全部字符），"
-                    "删掉重复表述后要用来源证据里的其他事实补足篇幅，不要靠重复原话凑字数。"
+                    "用来源证据里的其他事实补足篇幅，不要靠重复原话凑字数。"
                 )
                 continue
             return payload, body, article_shape
@@ -178,13 +178,11 @@ class AutoRevisionTool:
             # 审核意见以语气与通顺为主，改稿就按这个优先级处理，不要顺手重写全文。
             "**改写优先级**：先解决审核意见里的语气与通顺问题（这两类占绝大多数），"
             "其余部分尽量保留原文表述，不要为了改细节而重写整篇。"
-            f"正文长度目标是 {target_low} 到 {target_high} 个字——"
-            f"硬性要求：不得少于 {minimum_chars} 个字，也不得超过 {maximum_chars} 个字"
-            "（数的是去掉空白与来源尾注后的全部字符，汉字、英文字母、数字、标点各算一个）。"
-            # 与生成提示词同口径：不往上限凑，删重后不足只许补新事实。
-            f"**写到中段就好（大约 {(target_low + target_high) // 2} 字），不要往上限凑**；"
-            "删掉重复内容后字数可能下降，这是正常的——**只允许补充来源里的新事实，绝不允许靠换个说法重复凑数**；"
-            "字数与信息量冲突时宁短勿凑。"
+            f"正文长度目标是 {target_low} 到 {target_high} 个字（配置页设置的区间，判定用它；"
+            "数的是去掉空白与来源尾注后的全部字符，汉字、英文字母、数字、标点各算一个）。"
+            # 用户口径（2026-09-15）：字数以配置页为准，但**不因为字数重写**（一次改稿很久）。
+            f"**下限 {minimum_chars} 是硬性的**：删掉重复后如果不够，就补充来源里的其他事实、把适用边界讲细；"
+            "但**不许换个说法重复已说过的内容**凑字数。写出来偏短或偏长都不会触发重写，服务端照常保存。"
             "**同一件事全文只许说一次**：审核点名的重复句要真的删掉（不是改写一遍留着），"
             "自己也要检查有没有“先说 A、后又说 A 的另一种说法”这种绕圈。"
             "应自然覆盖背景、技术或过程、价值与边界、后续观察，"
@@ -221,12 +219,8 @@ class AutoRevisionTool:
                 timeout=self.settings.content_llm_timeout_seconds,
             )
             client = wrap_openai(client) if langsmith_enabled(self.settings) else client
-            hard_minimum = max(
-                article_length_band(
-                    self.settings.draft_body_min_chars, self.settings.draft_body_max_chars
-                )[2],
-                MIN_HARD_BODY_CHARS,
-            )
+            # 成形只兜绝对底线：配置下限由提示词与审核负责，**不因为字数重写**（用户口径 2026-09-15）。
+            hard_minimum = MIN_HARD_BODY_CHARS
             payload, body, article_shape = self._compose_with_length_repair(
                 client=client,
                 model=selected_model,

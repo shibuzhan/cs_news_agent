@@ -20,6 +20,7 @@ from app.services.evidence_selector import build_evidence
 from app.services.plain_text import (
     MIN_HARD_BODY_CHARS,
     NATURAL_ARTICLE_MIN_CHARS,
+    NaturalArticleError,
     article_length_band,
     compose_natural_article,
     format_source_body,
@@ -72,8 +73,6 @@ def _natural_article_instruction(target_low: int, target_high: int) -> str:
     段末概括收束句。所以这里**先给身份与口吻**，再给禁用句式与对照示例。
     """
     target_low, target_high, minimum, maximum = article_length_band(target_low, target_high)
-    # 中段目标：模型总爱往上限堆，明确给一个“写到哪就够”的数比只说“别超上限”有效得多。
-    mid = (target_low + target_high) // 2
     return (
         "\n【人设与语气】你是一个每天都在翻技术资讯的分享者，刚从 GitHub／Hacker News／论文里看到这件事，"
         "正讲给一个懂点技术、但还没听说过它的朋友。写作时保持这个视角：直接对读者说话（“你要是……就会用到”），"
@@ -130,29 +129,30 @@ def _natural_article_instruction(target_low: int, target_high: int) -> str:
         "**采集时间、榜单抓取时间、当前日期都不是来源事实**，不要写成文章里的日期或“榜单页面给出的时间”；"
         "**不要描述来源里没有的界面文字**（例如“仓库标题只写了……”“页面上写着……”）；"
         "仓库名、项目名、文件名、清单名一律原样引用，不改写、不翻译、不缩写。"
-        "\n【输出】正文建议控制在 "
-        f"{target_low} 到 {target_high} 个字（硬性要求：不得少于 {minimum} 个字、不得超过 {maximum} 个字；"
-        "这里数的是**去掉空白与来源尾注后的全部字符**：汉字、英文字母、数字、标点各算一个，"
-        "因此英文名与代码片段较多的稿子要相应少写几段）。"
-        # 真因修复（2026-09-14 实测）：提示词只说“别写到接近上限”，模型仍然往上限堆，并且用
-        # “换个说法把同一件事再说一遍”来补足字数 → 审核连报 9 条 major 重复，分数从 88 掉到 58。
-        # 现在明确给出**中段目标**与“宁短勿凑”的取舍：宁可短几行，也不许重复填充。
-        f"**写到中段就好（大约 {mid} 字），不要往上限凑**："
-        f"字数不足 {minimum} 时只允许补充来源里的新事实，**绝不允许靠重复已说过的内容凑数**；"
-        "字数与信息量冲突时，宁短勿凑、宁可少写一段。"
+        "\n【输出】正文目标 "
+        f"{target_low} 到 {target_high} 个字——这个区间来自配置页，就是判定用的区间"
+        "（这里数的是**去掉空白与来源尾注后的全部字符**：汉字、英文字母、数字、标点各算一个）。"
+        # 用户口径（2026-09-15）：①字数以配置页为准；②**不因为字数问题重写**（一次生成 9–12 分钟）。
+        # 上一版写成“写到中段就好、宁短勿凑”，模型直接踩穿下限（1313 字 < 1400）。
+        f"**下限 {target_low} 是硬性的，先保证写够**：证据不足时就把已有事实讲细、讲清适用边界，宁可平实也不要空话；"
+        "但**不许为了凑字数重复已经说过的内容**——超过上限只说明该精简，"
+        "低于下限也只是偏短，服务端都会照常保存，不会因此重写（重写一次要十几分钟）。"
         "每段单独成行，服务端会统一处理段首缩进。"
     )
 
 
 def _hard_body_minimum(settings) -> int:  # noqa: ANN001 - Settings 的测试替身同形
-    """成形与规则审核使用**硬下限**：目标下限再放宽 HARD_BAND_MARGIN 字。
+    """成形阶段真正会拒绝的下限：**只兜绝对底线**，不再用配置页的目标下限。
 
-    正文短于目标带是写作问题（提示词负责），短于硬下限才是硬性不合格。
+    真实故障（2026-09-15 01:33）：只给了 1277 字 README 证据、却按目标下限要求 1400 字，
+    模型写了 1313 字，`compose_natural_article` 直接抛错 → 整条重写失败，7 分钟的模型调用白费，
+    用户看到一句误导的“内容模型输出不符合草稿结构”。
+
+    现在按用户口径处理：**字数以配置页为准，但字数不达标不再让生成失败**——
+    低于配置下限只是“偏短”，照常保存，由审核以 `minor` 反馈；只有短到不成文
+    （`MIN_HARD_BODY_CHARS`，绝对底线）才拒绝。也不因为字数问题重写：一次生成要 9–12 分钟。
     """
-    return article_length_band(
-        getattr(settings, "draft_body_min_chars", NATURAL_ARTICLE_MIN_CHARS),
-        getattr(settings, "draft_body_max_chars", NATURAL_ARTICLE_MIN_CHARS + 600),
-    )[2]
+    return MIN_HARD_BODY_CHARS
 
 
 def _apply_article_body(payload: dict, item: NormalizedItem, min_chars: int = MIN_HARD_BODY_CHARS) -> dict[str, int]:
@@ -292,6 +292,26 @@ class DeterministicDraftGenerator:
         ]
 
 
+def _generation_invalid_reason(exc: Exception) -> str:
+    """把成形失败翻译成用户能直接行动的一句话。
+
+    分三类：长度不足（最常见，说清差多少）、段数不对、其余结构问题。历史文案只有
+    “不符合草稿结构、请检查模型配置”，把长度问题也说成结构问题，排查方向完全错了。
+    """
+    if isinstance(exc, NaturalArticleError):
+        text = str(exc)
+        if "正文至少需要" in text:
+            return f"模型写得太短：{text}。已保留原稿、未覆盖；可以直接重写一次，或把配置里的目标字数下限调低。"
+        if "自然段" in text:
+            return f"模型给出的段落结构不符合要求：{text}。已保留原稿、未覆盖。"
+        return f"模型返回的正文不可用：{text}。已保留原稿、未覆盖。"
+    if isinstance(exc, json.JSONDecodeError):
+        return "模型返回的不是合法 JSON，请重试；已保留原稿、未覆盖。"
+    if isinstance(exc, ValidationError):
+        return "模型返回的字段不完整或类型不对，请重试；已保留原稿、未覆盖。"
+    return "内容模型输出无法解析，请重试或检查模型配置；已保留原稿、未覆盖。"
+
+
 class ResilientDraftGenerator:
     """将模型服务故障转为可审计的生成失败，不伪造文案，也不回显供应商原始响应。"""
 
@@ -410,12 +430,15 @@ class OpenAICompatibleDraftGenerator:
             return draft
         except (ValueError, KeyError, json.JSONDecodeError, ValidationError) as exc:
             logger.warning(
-                "draft_generation_invalid source=%s external_id=%s error_type=%s",
+                "draft_generation_invalid source=%s external_id=%s error_type=%s detail=%s",
                 item.source_kind.value,
                 item.external_id,
                 type(exc).__name__,
+                exc,
             )
-            raise GenerationError("内容模型输出不符合草稿结构，请重试或检查模型配置") from exc
+            # 失败文案必须说清**真正的**原因：历史实现一律写“不符合草稿结构、请检查模型配置”，
+            # 而真实故障（2026-09-15）是“正文 1313 字低于下限 1400”——用户照着那句话排查只会走错方向。
+            raise GenerationError(_generation_invalid_reason(exc)) from exc
 
     def _evidence_pack(self, item: NormalizedItem) -> list[dict]:
         return [
