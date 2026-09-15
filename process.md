@@ -3557,4 +3557,15 @@
 - 未提交 git：`a05d183` 已提交（4 文件，+261/−25）。
 - 授权状态：已确认
 
+### 2026-09-15｜变更 338
+
+- 用户指令（逐字）：“联网搜索内容应该为 codex 插件用法、插件开发方法这样的具体搜索对象，而不是直接搜索 codex，这样只会搜到官网页面”。
+- 核查结论（只读实测）：①该草稿（`b3857275…`）`evidence_json` 里三条 `origin=revision_search` 的证据，检索词是 `Codex`、`Codex`、`Web`；`Codex` 取回的是官网首页 `https://openai.com/codex`，`Web` 取回的是维基百科 World Wide Web 条目 —— 全是噪声，写作用不上；②裸词来自两条路径：审核模型的 `search_queries` 直接给名称，以及兜底路径 `extract_name_queries` 从正文挑出 `Web`（当时不在停用词表里）；③兜底还会挑出**厂商名**：该草稿正文的兜底结果是 `['Codex', 'OpenAI']`，`OpenAI 用法 开发 扩展 文档` 同样只会搜到公司官网；④生成路径（材料不足时的联网补充）用的是来源标题 `openai/plugins`，方向对，但拼接口径与改稿不一致。
+- 影响范围：`app/services/plain_text.py`（新增 `is_generic_query` / `enrich_search_query` / `query_has_no_subject`、`USAGE_QUERY_SUFFIX`、检索方面提示词表、中文通用词表、停用词补入通用词与厂商名，删除只做背景说明的 `BACKGROUND_QUERY_SUFFIX`）、`app/services/generator.py`（材料不足的检索词改走同一补全）、`app/services/auto_delivery.py`（审核后改稿的检索词先去“无主体”再补成具体对象）、`app/tools/auto_review.py`（审核提示词改口径：必须写「名称 + 想了解的方面」，禁止通用词单独作检索词）；新增 `tests/test_search_query_quality.py`（10 项）；更新 `tests/test_footer_illustration_and_review_flow.py` 两处旧断言。
+- 处理结论：①**检索词统一补成具体检索对象**：`Codex` → `Codex 用法 开发 扩展 文档`；已经指明方面（用法/开发/文档/教程…）的检索词原样保留，不再多补；②**没有检索主体的整条丢掉**：`Web`、`插件`、`OpenAI`、`openai wechat` 这类全由通用词/厂商名构成的检索词补后缀也是噪声，直接不搜；③**审核提示词改口径**，让模型一开始就给出「Codex 插件 用法」这种对象，而不是裸名称或“是什么”空问句；④删掉背景问句式后缀，避免退回“搜名称 + 是什么”；⑤兜底检索词**只取一个**（审核没给检索词时）——多取的那条常是顺手提到的别的工具（实测该草稿取到 README 标题里的 `SwiftUI`），联网补充宁少勿杂，与“变更 337”的结论一致。
+- 排错记录：全量套件跑到一半时我改了 `auto_delivery.py`，5 项用 `inspect.getsource` 的断言因 linecache 行号漂移读到了别的函数（报 `_record_review_event` / `apply_revision_from_review` 等源码），不是真实缺陷——代码冻结后单独重跑全绿；`query_has_no_subject` 初版只查拉丁停用词表，中文词 `插件` 判不出来，已补中文通用词表。
+- 验证（单测 + 容器内只读实测，**未跑内容模型、未外呼 Exa**）：后端 **510 项通过、0 失败**（新增 10 项）；app/worker 已重建（重建前在跑任务 0/0，容器内实测 `enrich_search_query` 已生效）；容器内对该草稿实测：审核给的 `Codex` → `Codex 用法 开发 扩展 文档`；正文兜底由 `['Codex', 'OpenAI']` 变为只剩 `Codex`（`Web`、`OpenAI` 均被剔除，第二候选 `SwiftUI` 也因只取一个而不再发出去）；生成路径来源标题 `openai/plugins` → `openai/plugins 用法 开发 扩展 文档`。
+- 未提交 git：`62c1438` 已提交（6 文件，+228/−12）。
+- 授权状态：已确认
+
 -->
