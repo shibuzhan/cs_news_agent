@@ -395,7 +395,7 @@ async def test_passing_review_still_runs_one_revision_with_its_issues(monkeypatc
 
 @pytest.mark.asyncio
 async def test_revision_search_uses_review_queries_and_feeds_the_revision(monkeypatch) -> None:
-    """联网补充搭在改稿上：审核给出的名称用于检索，检索结果进入改稿提示词。"""
+    """联网补充搭在改稿上：审核给出的名称用于检索（并补成具体检索对象），检索结果进入改稿提示词。"""
     revision_calls: list[dict] = []
     search_calls: list[list[str]] = []
 
@@ -445,13 +445,14 @@ async def test_revision_search_uses_review_queries_and_feeds_the_revision(monkey
         deliver=True,
     )
 
-    assert search_calls == [["Antigravity"]]
+    # 光搜「Antigravity」只会命中官网首页，补成「名称 + 想了解的方面」才有可用材料。
+    assert search_calls == [["Antigravity 用法 开发 扩展 文档"]]
     assert revision_calls[0]["search_evidence"][0]["id"] == "exa-search-1"
 
 
 @pytest.mark.asyncio
 async def test_revision_search_falls_back_to_names_in_the_body(monkeypatch) -> None:
-    """审核没给检索词时，用正文里的外部名称兜底，仍不增加模型调用。"""
+    """审核没给检索词时，用正文里的外部名称兜底（补成具体检索对象，且只取一个），仍不增加模型调用。"""
     search_calls: list[list[str]] = []
 
     class FakeReviewTool:
@@ -510,7 +511,8 @@ async def test_revision_search_falls_back_to_names_in_the_body(monkeypatch) -> N
         deliver=True,
     )
 
-    assert search_calls and "Claude Code" in search_calls[0]
+    # 只取出现次数最多的那一个（`affaan-m/ECC`），不把顺手提到的 `Claude Code` 也搜一遍。
+    assert search_calls == [["ECC 用法 开发 扩展 文档"]]
 
 
 @pytest.mark.asyncio

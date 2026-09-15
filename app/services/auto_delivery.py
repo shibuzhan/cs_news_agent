@@ -10,7 +10,12 @@ from fastapi.concurrency import run_in_threadpool
 from app.config import Settings
 from app.domain.models import ReviewCommand
 from app.services.attachments import AttachmentError, PrivateAttachmentStore
-from app.services.plain_text import extract_name_queries, normalize_wechat_description
+from app.services.plain_text import (
+    enrich_search_query,
+    extract_name_queries,
+    normalize_wechat_description,
+    query_has_no_subject,
+)
 from app.services.publication_preferences import load_publication_preferences
 from app.services.source_snapshots import DraftSourceSnapshotStore
 from app.services.runtime_settings import load_runtime_settings
@@ -43,11 +48,23 @@ async def _revision_search_evidence(
     facts: dict = {"searched": False, "queries": [], "entries": 0}
     if not (settings.revision_search_enabled and settings.exa_mcp_enabled):
         return [], facts
-    queries = [str(item) for item in (model_report.get("search_queries") or []) if str(item).strip()][:2]
-    if not queries:
-        queries = extract_name_queries(repository.get_draft(draft_id).body, limit=2)
-    if not queries:
+    draft = repository.get_draft(draft_id)
+    subject = " ".join(str(getattr(draft, "source_name", "") or "").split())[:80] or " ".join(
+        str((draft.title_options_json or [""])[0]).split()
+    )[:80]
+    raw_queries = [str(item) for item in (model_report.get("search_queries") or []) if str(item).strip()][:2]
+    if not raw_queries:
+        # 兜底只取一个名字：它按出现次数取，多取的那条往往是顺手提到的别的工具
+        # （该草稿取到 README 标题里的 `SwiftUI`）——联网补充宁少勿杂（同“变更 337”的结论）。
+        raw_queries = extract_name_queries(draft.body, limit=1)
+    # `Web`、`OpenAI` 这类没有检索主体的词补后缀也搜不到可用材料，直接丢掉（真实反馈 2026-09-15）。
+    raw_queries = [item for item in raw_queries if not query_has_no_subject(item)]
+    if not raw_queries:
         return [], facts
+    # 笼统检索词（`Codex`、`Web`）只会命中官网首页或百科词条：补成具体检索对象
+    # （`Codex 用法 开发 扩展 文档`），否则补充证据是噪声（真实反馈 2026-09-15）。
+    queries = [enrich_search_query(item, subject=subject) for item in raw_queries]
+    queries = [item for item in dict.fromkeys(queries) if item]
     try:
         evidence = await ExaMcpSearchTool(settings).search(queries)
     except ExaMcpSearchError as exc:

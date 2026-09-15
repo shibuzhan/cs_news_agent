@@ -46,11 +46,35 @@ _NAME_STOPWORDS = frozenset(
     {
         "the", "and", "for", "with", "from", "that", "this", "you", "your", "not", "are", "was",
         "json", "api", "sdk", "cli", "url", "http", "https", "html", "css", "sql", "yaml", "toml",
+        # 真实故障（2026-09-15）：兜底检索词挑出了正文里的 “Web”，搜到的是维基百科的
+        # World Wide Web 条目——这类通用词必须排除，否则补充证据是纯噪声。
+        "web", "www", "internet", "online", "app", "apps", "code", "codes", "file", "files",
+        "json file", "marketplace", "plugin", "plugins", "directory", "directories",
         "ai", "llm", "mcp", "gpu", "cpu", "ram", "os", "ui", "ux", "ide", "vscode", "github",
         "git", "npm", "node js", "node", "python", "docker", "linux", "macos", "windows", "readme",
         "mit", "apache", "contributing", "changelog", "trending", "agent", "agents", "skills", "skill",
         "memory", "security", "hooks", "rules", "prompt", "prompts", "token", "tokens", "star", "stars",
         "fork", "forks", "commit", "commits", "pull request", "issue", "issues", "readme md",
+        # 大众已知的厂商/平台名：搜它们只会拿到公司官网与公关稿，读者也不需要靠它读懂正文
+        # （实测兜底检索词挑出 “OpenAI”，补成 “OpenAI 用法 开发 扩展 文档” 仍是噪声）。
+        "openai", "anthropic", "google", "deepmind", "microsoft", "meta", "amazon", "aws", "apple",
+        "nvidia", "tencent", "alibaba", "bytedance", "baidu", "mozilla", "wechat", "weixin",
+    }
+)
+
+# 面向“用法与开发方法”的查询后缀：项目/产品的用法、扩展方式、开发文档都靠它命中。
+# 不再提供“是什么 背景 用途”那类背景后缀：实测它们只命中百科与官网首页（真实反馈 2026-09-15）。
+USAGE_QUERY_SUFFIX = "用法 开发 扩展 文档"
+# 检索词里出现这些词，说明已经指向“想了解什么方面”，不必再补后缀。
+_QUERY_ASPECT_HINTS = (
+    "用法", "开发", "文档", "教程", "扩展", "方法", "入门", "指南", "原理", "实践", "对比",
+    "是什么", "背景", "用途", "怎么", "如何", "为什么",
+)
+# 中文通用词：单独成检索词时同样没有检索主体（`插件`、`接口` 搜回来全是泛泛的科普页）。
+_GENERIC_QUERY_WORDS = frozenset(
+    {
+        "插件", "接口", "文档", "教程", "示例", "代码", "工具", "平台", "框架", "模型", "应用",
+        "网站", "浏览器", "开发", "用法", "功能", "介绍", "是什么", "背景", "用途", "技术",
     }
 )
 
@@ -251,6 +275,56 @@ def extract_name_queries(text: str, limit: int = 2) -> list[str]:
         candidates[phrase] = candidates.get(phrase, 0) + 1
     ordered = sorted(candidates.items(), key=lambda item: (-item[1], text.find(item[0])))
     return [name for name, _count in ordered[: max(limit, 0)]]
+
+
+# 单个通用词做检索词没有价值：搜“Codex”只会命中官网首页，“Web”会命中维基百科。
+# 真实反馈（2026-09-15）：用户要求“联网搜索内容应该是 codex 插件用法、插件开发方法这样的具体对象，
+# 而不是直接搜索 codex，这样只会搜到官网页面”。
+def is_generic_query(query: str) -> bool:
+    """判断检索词是否过于笼统：**单个词（哪怕专有名词），或没有指明“想了解什么方面”**。
+
+    为什么单个专有名词也算笼统：搜 `Codex` 只会命中官网首页、搜 `Web` 命中维基百科词条
+    （2026-09-15 实测），写作拿不到任何可用材料。检索词至少要“名称 + 一个方面”，
+    例如 `Codex 插件 用法`、`Figma 插件 开发`。
+    """
+    value = " ".join(str(query or "").split())
+    if not value:
+        return True
+    if value.casefold() in _NAME_STOPWORDS:
+        return True
+    if len(value.split()) == 1:
+        return True
+    return not any(hint in value for hint in _QUERY_ASPECT_HINTS)
+
+
+def enrich_search_query(query: str, *, suffix: str = USAGE_QUERY_SUFFIX, subject: str = "") -> str:
+    """把笼统的检索词补成**具体检索对象**：`Codex` → `Codex 用法 开发 扩展 文档`。
+
+    为什么必须补：Exa 这类检索对单词查询基本只会返回官网首页或百科条目，
+    正文拿不到任何可用的背景与方法；补上“用法/开发/扩展/文档”才可能命中官方文档与教程。
+    `subject`（通常是项目名）只在检索词为空时用来兜底，避免把来源名重复拼进去。
+    """
+    value = " ".join(str(query or "").split())[:200]
+    subject_text = " ".join(str(subject or "").split())[:80]
+    if not value:
+        return f"{subject_text} {suffix}".strip() if subject_text else ""
+    if is_generic_query(value):
+        return f"{value} {suffix}".strip()
+    return value
+
+
+def query_has_no_subject(query: str) -> bool:
+    """整条检索词都由通用词/平台名构成时没有检索主体：`Web`、`插件`、`OpenAI` 都算。
+
+    与 `is_generic_query` 的区别：那个判“还要不要补后缀”（`Codex` 要补，补完是有效的），
+    这个判“补了也没用”（`Web 用法 开发 扩展 文档`、`OpenAI 用法 开发 扩展 文档` 只会搜到
+    百科词条与公司官网）。带任何一个具体名称的检索词都不算无主体。
+    """
+    tokens = [item.strip("，,、/（）()·") for item in str(query or "").casefold().split()]
+    tokens = [item for item in tokens if item]
+    return bool(tokens) and all(
+        item in _NAME_STOPWORDS or item in _GENERIC_QUERY_WORDS for item in tokens
+    )
 
 
 class LogicalSectionError(ValueError):

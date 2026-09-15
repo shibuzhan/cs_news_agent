@@ -23,6 +23,7 @@ from app.services.plain_text import (
     NaturalArticleError,
     article_length_band,
     compose_natural_article,
+    enrich_search_query,
     format_source_body,
     normalize_wechat_description,
     select_evidence_text,
@@ -401,8 +402,8 @@ class OpenAICompatibleDraftGenerator:
         queries: list[str] = []
         name = " ".join(str(item.title or "").split())[:80]
         if name:
-            # 项目名 + 用途：一次检索就能拿到“这是什么/用来干什么”的背景材料。
-            queries.append(f"{name} 是什么 背景 用途")
+            # 具体检索对象，而不是裸名称：搜“Codex”只会命中官网首页（用户反馈 2026-09-15）。
+            queries.append(enrich_search_query(item.title, subject=name))
         if not queries:
             return []
         try:
